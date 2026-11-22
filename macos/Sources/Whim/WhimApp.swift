@@ -649,6 +649,7 @@ struct MainContentView: View {
     let onToggleWindowPin: (Bool) -> Void
 
     @State private var showSyncPopover: Bool = false
+    @State private var showAboutSheet: Bool = false
     @State private var codeInput: String = ""
     @State private var previewImagePath: String? = nil
     @State private var editingNoteId: String? = nil
@@ -767,6 +768,21 @@ struct MainContentView: View {
                             }
                         }
                     }
+
+                    Divider().opacity(0.25)
+                    Button { showAboutSheet = true } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "info.circle")
+                                .font(.system(size: 12))
+                            Text("关于与更新 · v\(GitHubUpdater.currentVersion)")
+                                .font(.system(size: 12))
+                            Spacer()
+                        }
+                        .foregroundColor(FlomoPalette.textMuted(scheme))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 4)
+                    }
+                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 14)
@@ -841,6 +857,8 @@ struct MainContentView: View {
                             Divider()
                             Button("注入示例数据") { vm.seedSampleNotes() }
                             Button("清除示例数据") { vm.clearSampleNotes() }
+                            Divider()
+                            Button("关于与检查更新...") { showAboutSheet = true }
                         } label: {
                             Image(systemName: "ellipsis")
                                 .font(.system(size: 13))
@@ -949,6 +967,9 @@ struct MainContentView: View {
                         .padding(.bottom, 12)
                 }
             }
+        }
+        .sheet(isPresented: $showAboutSheet) {
+            AboutUpdateView { showAboutSheet = false }
         }
     }
 

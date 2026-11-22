@@ -85,6 +85,8 @@ import com.whim.app.sync.SyncWorker
 import com.whim.app.ui.theme.WhimTheme
 import com.whim.app.ui.theme.WhimThemeProvider
 import com.whim.app.ui.theme.heatmapColor
+import com.whim.app.update.GitHubUpdater
+import com.whim.app.update.ReleaseInfo
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -157,6 +159,11 @@ private fun FlomoMobileApp(
     var searchQuery by remember { mutableStateOf("") }
     var showSearch by remember { mutableStateOf(false) }
     var showSyncCard by remember { mutableStateOf(false) }
+    var showAboutCard by remember { mutableStateOf(false) }
+    var updateStatus by remember { mutableStateOf("当前版本 v${GitHubUpdater.CURRENT_VERSION}，点击检查 GitHub 最新版本") }
+    var availableRelease by remember { mutableStateOf<ReleaseInfo?>(null) }
+    var checkingUpdate by remember { mutableStateOf(false) }
+    var randomSeed by remember { mutableStateOf(0) }
 
     var allNotes by remember { mutableStateOf<List<WhimNote>>(emptyList()) }
     var displayedNotes by remember { mutableStateOf<List<WhimNote>>(emptyList()) }
@@ -205,7 +212,7 @@ private fun FlomoMobileApp(
         }
     }
 
-    LaunchedEffect(activeTab, searchQuery) {
+    LaunchedEffect(activeTab, searchQuery, randomSeed) {
         reload()
     }
 
@@ -268,6 +275,12 @@ private fun FlomoMobileApp(
                     }
                     DrawerNavRow(Icons.Rounded.Sync, "局域网同步 · $pairCode", false) {
                         showSyncCard = true
+                        showAboutCard = false
+                        scope.launch { drawerState.close() }
+                    }
+                    DrawerNavRow(Icons.Rounded.AutoAwesome, "关于与更新 · v${GitHubUpdater.CURRENT_VERSION}", false) {
+                        showAboutCard = true
+                        showSyncCard = false
                         scope.launch { drawerState.close() }
                     }
 
@@ -442,6 +455,81 @@ private fun FlomoMobileApp(
                             ) {
                                 Text("应用", style = t.meta, color = Color.White, fontWeight = FontWeight.Medium)
                             }
+                        }
+                    }
+                }
+
+                if (showAboutCard) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 6.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(c.card)
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("关于 Whim · v${GitHubUpdater.CURRENT_VERSION}", style = t.section, color = c.textPrimary)
+                        Text(updateStatus, style = t.meta, color = c.textSecondary)
+                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(7.dp))
+                                    .background(c.accent)
+                                    .clickable(enabled = !checkingUpdate) {
+                                        checkingUpdate = true
+                                        updateStatus = "正在检查 GitHub Release..."
+                                        scope.launch {
+                                            val res = GitHubUpdater.checkLatest()
+                                            checkingUpdate = false
+                                            updateStatus = res.message
+                                            availableRelease = if (res.hasUpdate) res.release else null
+                                        }
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                            ) {
+                                Text(if (checkingUpdate) "检查中..." else "检查更新", style = t.meta, color = Color.White, fontWeight = FontWeight.Medium)
+                            }
+                            availableRelease?.let { rel ->
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(7.dp))
+                                        .background(c.tagBg)
+                                        .clickable {
+                                            updateStatus = "正在下载 APK..."
+                                            scope.launch {
+                                                updateStatus = GitHubUpdater.downloadAndInstallApk(context, rel)
+                                            }
+                                        }
+                                        .padding(horizontal = 14.dp, vertical = 8.dp)
+                                ) {
+                                    Text("一键下载安装", style = t.meta, color = c.tagText, fontWeight = FontWeight.Medium)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (activeTab == MobileTab.Random) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(c.card)
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("随机重温历史闪念", style = t.meta, color = c.textSecondary)
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(7.dp))
+                                .background(c.accent)
+                                .clickable { randomSeed++ }
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                        ) {
+                            Text("换一批", style = t.meta, color = Color.White, fontWeight = FontWeight.Medium)
                         }
                     }
                 }
@@ -702,14 +790,54 @@ private fun FlomoMobileNoteCard(
             }
         }
 
-        // Note body
-        Text(
-            text = note.content,
-            style = t.body,
-            color = c.textPrimary,
-            maxLines = if (textExpanded || !isLong) Int.MAX_VALUE else 6,
-            overflow = TextOverflow.Ellipsis
-        )
+        // Interleaved inline Text + Image blocks (images stay in their exact document positions!)
+        val blobRegex = remember { Regex("!\\[[^\\]]*\\]\\(whim://blob/([a-fA-F0-9]{64})\\)") }
+        val pathByHash = remember(note.attachments) { note.attachments.associate { it.sha256 to it.localPath } }
+        val matches = remember(note.content) { blobRegex.findAll(note.content).toList() }
+        var cursor = 0
+        val referenced = mutableSetOf<String>()
+
+        matches.forEach { m ->
+            if (m.range.first > cursor) {
+                val seg = note.content.substring(cursor, m.range.first).trim()
+                if (seg.isNotEmpty()) {
+                    Text(
+                        text = seg,
+                        style = t.body,
+                        color = c.textPrimary,
+                        maxLines = if (textExpanded || !isLong) Int.MAX_VALUE else 6,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            val hash = m.groupValues[1]
+            referenced.add(hash)
+            val path = pathByHash[hash].orEmpty()
+            if (path.isNotEmpty()) {
+                AsyncImage(
+                    model = File(path),
+                    contentDescription = "内联图片",
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(180.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                )
+            }
+            cursor = m.range.last + 1
+        }
+        if (cursor < note.content.length) {
+            val tail = note.content.substring(cursor).trim()
+            if (tail.isNotEmpty()) {
+                Text(
+                    text = tail,
+                    style = t.body,
+                    color = c.textPrimary,
+                    maxLines = if (textExpanded || !isLong) Int.MAX_VALUE else 6,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
 
         if (isLong) {
             Text(
@@ -720,20 +848,19 @@ private fun FlomoMobileNoteCard(
             )
         }
 
-        // Image thumbnails
-        if (note.attachments.isNotEmpty()) {
+        // Legacy fallback for any attachment not inline-referenced
+        val trailing = note.attachments.filter { it.sha256 !in referenced && it.localPath.isNotEmpty() }
+        if (trailing.isNotEmpty()) {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(note.attachments) { att ->
-                    if (att.localPath.isNotEmpty()) {
-                        AsyncImage(
-                            model = File(att.localPath),
-                            contentDescription = "图片附件",
-                            contentScale = ContentScale.Crop,
-                            modifier = Modifier
-                                .size(104.dp)
-                                .clip(RoundedCornerShape(8.dp))
-                        )
-                    }
+                items(trailing) { att ->
+                    AsyncImage(
+                        model = File(att.localPath),
+                        contentDescription = "图片附件",
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .size(104.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                    )
                 }
             }
         }

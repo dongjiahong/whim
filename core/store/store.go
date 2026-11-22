@@ -1,0 +1,914 @@
+package store
+
+import (
+	"crypto/sha256"
+	"database/sql"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	_ "modernc.org/sqlite"
+
+	"whim/core/model"
+	"whim/core/tags"
+)
+
+// Store manages the local SQLite database and content-addressed image blobs.
+type Store struct {
+	mu       sync.RWMutex
+	db       *sql.DB
+	dataDir  string
+	blobsDir string
+}
+
+// Open initializes or opens the SQLite database under dataDir/whim.sqlite3.
+func Open(dataDir string) (*Store, error) {
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create dataDir: %w", err)
+	}
+	blobsDir := filepath.Join(dataDir, "blobs")
+	if err := os.MkdirAll(blobsDir, 0o755); err != nil {
+		return nil, fmt.Errorf("create blobsDir: %w", err)
+	}
+
+	dbPath := filepath.Join(dataDir, "whim.sqlite3")
+	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(ON)", dbPath)
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("open sqlite: %w", err)
+	}
+	db.SetMaxOpenConns(1)
+
+	s := &Store{
+		db:       db,
+		dataDir:  dataDir,
+		blobsDir: blobsDir,
+	}
+	if err := s.migrate(); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return s, nil
+}
+
+// Close closes the underlying database.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
+}
+
+// DataDir returns the store's root data directory.
+func (s *Store) DataDir() string {
+	return s.dataDir
+}
+
+func (s *Store) migrate() error {
+	const schema = `
+CREATE TABLE IF NOT EXISTS meta (
+	key   TEXT PRIMARY KEY,
+	value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS notes (
+	id          TEXT PRIMARY KEY,
+	content     TEXT NOT NULL DEFAULT '',
+	pinned      INTEGER NOT NULL DEFAULT 0,
+	archived    INTEGER NOT NULL DEFAULT 0,
+	deleted     INTEGER NOT NULL DEFAULT 0,
+	created_at  INTEGER NOT NULL,
+	updated_at  INTEGER NOT NULL,
+	stamps_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at);
+CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at);
+
+CREATE TABLE IF NOT EXISTS note_tags (
+	note_id  TEXT NOT NULL,
+	tag_path TEXT NOT NULL,
+	PRIMARY KEY (note_id, tag_path)
+);
+CREATE INDEX IF NOT EXISTS idx_note_tags_path ON note_tags(tag_path);
+
+CREATE TABLE IF NOT EXISTS note_attachments (
+	id         TEXT PRIMARY KEY,
+	note_id    TEXT NOT NULL,
+	sha256     TEXT NOT NULL,
+	mime       TEXT NOT NULL,
+	width      INTEGER NOT NULL DEFAULT 0,
+	height     INTEGER NOT NULL DEFAULT 0,
+	size_bytes INTEGER NOT NULL DEFAULT 0,
+	sort_order INTEGER NOT NULL DEFAULT 0,
+	deleted    INTEGER NOT NULL DEFAULT 0,
+	updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_note ON note_attachments(note_id);
+CREATE INDEX IF NOT EXISTS idx_attachments_sha  ON note_attachments(sha256);
+
+CREATE TABLE IF NOT EXISTS sync_peers (
+	peer_id       TEXT PRIMARY KEY,
+	display_name  TEXT NOT NULL DEFAULT '',
+	last_addr     TEXT NOT NULL DEFAULT '',
+	last_heard_at INTEGER NOT NULL DEFAULT 0,
+	last_sync_at  INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
+	note_id UNINDEXED,
+	content,
+	tokenize = 'unicode61'
+);
+`
+	_, err := s.db.Exec(schema)
+	return err
+}
+
+// GetMeta retrieves a local key-value setting.
+func (s *Store) GetMeta(key string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var val string
+	err := s.db.QueryRow(`SELECT value FROM meta WHERE key = ?`, key).Scan(&val)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return val, err
+}
+
+// SetMeta stores a local key-value setting.
+func (s *Store) SetMeta(key, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, key, value)
+	return err
+}
+
+// SaveBlob stores binary image data content-addressed by SHA-256 and returns (sha256, localPath, size).
+func (s *Store) SaveBlob(data []byte, mime string) (string, string, int64, error) {
+	if len(data) == 0 {
+		return "", "", 0, errors.New("empty blob data")
+	}
+	sum := sha256.Sum256(data)
+	hash := hex.EncodeToString(sum[:])
+	ext := extFromMIME(mime)
+	path := filepath.Join(s.blobsDir, hash+ext)
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		tmp := path + ".tmp"
+		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+			return "", "", 0, err
+		}
+		if err := os.Rename(tmp, path); err != nil {
+			_ = os.Remove(tmp)
+			return "", "", 0, err
+		}
+	}
+	return hash, path, int64(len(data)), nil
+}
+
+// BlobPath locates an existing blob file on disk by its SHA-256 hash.
+func (s *Store) BlobPath(hash string) (string, bool) {
+	if len(hash) != 64 {
+		return "", false
+	}
+	matches, err := filepath.Glob(filepath.Join(s.blobsDir, hash+".*"))
+	if err == nil && len(matches) > 0 {
+		return matches[0], true
+	}
+	plain := filepath.Join(s.blobsDir, hash)
+	if _, err := os.Stat(plain); err == nil {
+		return plain, true
+	}
+	return "", false
+}
+
+// ReadBlob returns the raw bytes of a stored blob.
+func (s *Store) ReadBlob(hash string) ([]byte, string, error) {
+	path, ok := s.BlobPath(hash)
+	if !ok {
+		return nil, "", os.ErrNotExist
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil, "", err
+	}
+	return b, mimeFromExt(filepath.Ext(path)), nil
+}
+
+// ListLocalBlobs returns all SHA-256 hashes present in blobsDir.
+func (s *Store) ListLocalBlobs() ([]string, error) {
+	entries, err := os.ReadDir(s.blobsDir)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if e.IsDir() || strings.HasSuffix(e.Name(), ".tmp") {
+			continue
+		}
+		name := e.Name()
+		if dot := strings.IndexByte(name, '.'); dot > 0 {
+			name = name[:dot]
+		}
+		if len(name) == 64 {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+// MissingBlobs returns SHA-256 hashes referenced by active attachments that do not exist locally.
+func (s *Store) MissingBlobs() ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`SELECT DISTINCT sha256 FROM note_attachments WHERE deleted = 0`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var missing []string
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err != nil {
+			return nil, err
+		}
+		if _, ok := s.BlobPath(h); !ok {
+			missing = append(missing, h)
+		}
+	}
+	sort.Strings(missing)
+	return missing, nil
+}
+
+// CreateNote creates a new note with optional pre-saved attachments.
+func (s *Store) CreateNote(content string, attachments []model.Attachment) (*model.Note, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UnixMilli()
+	id := model.NewULIDAt(now)
+	stamps := model.FieldStamps{
+		Content:     now,
+		Pinned:      now,
+		Archived:    now,
+		Deleted:     now,
+		Attachments: now,
+	}
+	note := &model.Note{
+		ID:        id,
+		Content:   content,
+		Tags:      tags.Extract(content),
+		CreatedAt: now,
+		UpdatedAt: now,
+		Stamps:    stamps,
+	}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.upsertNoteTx(tx, note); err != nil {
+		return nil, err
+	}
+	for i := range attachments {
+		att := attachments[i]
+		if att.ID == "" {
+			att.ID = model.NewULIDAt(now)
+		}
+		att.NoteID = id
+		att.SortOrder = i
+		att.UpdatedAt = now
+		if err := s.upsertAttachmentTx(tx, &att); err != nil {
+			return nil, err
+		}
+		if p, ok := s.BlobPath(att.SHA256); ok {
+			att.LocalPath = p
+		}
+		note.Attachments = append(note.Attachments, att)
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return note, nil
+}
+
+// UpdateNote updates mutable fields of an existing note and advances only touched field stamps.
+func (s *Store) UpdateNote(id string, content *string, pinned *bool, archived *bool, deleted *bool) (*model.Note, error) {
+	return s.UpdateNoteWithAttachments(id, content, pinned, archived, deleted, nil)
+}
+
+// UpdateNoteWithAttachments updates mutable fields and optionally appends newly pasted attachments.
+func (s *Store) UpdateNoteWithAttachments(id string, content *string, pinned *bool, archived *bool, deleted *bool, newAttachments []model.Attachment) (*model.Note, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	existing, err := s.getNoteLocked(id)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UnixMilli()
+	if now <= existing.UpdatedAt {
+		now = existing.UpdatedAt + 1
+	}
+
+	if content != nil && *content != existing.Content {
+		existing.Content = *content
+		existing.Stamps.Content = now
+	}
+	if pinned != nil && *pinned != existing.Pinned {
+		existing.Pinned = *pinned
+		existing.Stamps.Pinned = now
+	}
+	if archived != nil && *archived != existing.Archived {
+		existing.Archived = *archived
+		existing.Stamps.Archived = now
+	}
+	if deleted != nil && *deleted != existing.Deleted {
+		existing.Deleted = *deleted
+		existing.Stamps.Deleted = now
+	}
+	if len(newAttachments) > 0 {
+		existing.Stamps.Attachments = now
+	}
+	existing.UpdatedAt = existing.Stamps.Max()
+	existing.Tags = tags.Extract(existing.Content)
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if err := s.upsertNoteTx(tx, existing); err != nil {
+		return nil, err
+	}
+	if len(newAttachments) > 0 {
+		knownSHA := make(map[string]bool)
+		for _, a := range existing.Attachments {
+			knownSHA[a.SHA256] = true
+		}
+		sortIdx := len(existing.Attachments)
+		for _, att := range newAttachments {
+			if att.SHA256 == "" || knownSHA[att.SHA256] {
+				continue
+			}
+			if att.ID == "" {
+				att.ID = model.NewULIDAt(now)
+			}
+			att.NoteID = existing.ID
+			att.SortOrder = sortIdx
+			att.UpdatedAt = now
+			sortIdx++
+			if err := s.upsertAttachmentTx(tx, &att); err != nil {
+				return nil, err
+			}
+			if p, ok := s.BlobPath(att.SHA256); ok {
+				att.LocalPath = p
+			}
+			existing.Attachments = append(existing.Attachments, att)
+			knownSHA[att.SHA256] = true
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return existing, nil
+}
+
+// GetNote fetches a single note by ID.
+func (s *Store) GetNote(id string) (*model.Note, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.getNoteLocked(id)
+}
+
+func (s *Store) getNoteLocked(id string) (*model.Note, error) {
+	var n model.Note
+	var pinned, archived, deleted int
+	var stampsRaw string
+	err := s.db.QueryRow(
+		`SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json FROM notes WHERE id = ?`,
+		id,
+	).Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw)
+	if err != nil {
+		return nil, err
+	}
+	n.Pinned = pinned != 0
+	n.Archived = archived != 0
+	n.Deleted = deleted != 0
+	_ = json.Unmarshal([]byte(stampsRaw), &n.Stamps)
+	n.Tags = tags.Extract(n.Content)
+	atts, err := s.listNoteAttachmentsLocked(n.ID, false)
+	if err != nil {
+		return nil, err
+	}
+	n.Attachments = atts
+	return &n, nil
+}
+
+// ListNotes queries active notes matching the given filter.
+func (s *Store) ListNotes(f model.ListFilter) ([]model.Note, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var where []string
+	var args []any
+	where = append(where, "n.deleted = 0")
+
+	if !f.IncludeArchived {
+		where = append(where, "n.archived = 0")
+	}
+	if f.OnlyPinned {
+		where = append(where, "n.pinned = 1")
+	}
+	if f.DateFromMs > 0 {
+		where = append(where, "n.created_at >= ?")
+		args = append(args, f.DateFromMs)
+	}
+	if f.DateToMs > 0 {
+		where = append(where, "n.created_at <= ?")
+		args = append(args, f.DateToMs)
+	}
+	if tp := tags.Normalize(f.TagPrefix); tp != "" {
+		where = append(where, "EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND (nt.tag_path = ? OR nt.tag_path LIKE ?))")
+		args = append(args, tp, tp+"/%")
+	}
+	if q := strings.TrimSpace(f.Query); q != "" {
+		// Use LIKE fallback for CJK substrings (FTS5 unicode61 splits on spaces, not Chinese characters)
+		where = append(where, "n.content LIKE ?")
+		args = append(args, "%"+q+"%")
+	}
+
+	limit := f.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	offset := f.Offset
+	if offset < 0 {
+		offset = 0
+	}
+
+	query := fmt.Sprintf(`
+		SELECT n.id, n.content, n.pinned, n.archived, n.deleted, n.created_at, n.updated_at, n.stamps_json
+		FROM notes n
+		WHERE %s
+		ORDER BY n.pinned DESC, n.created_at DESC
+		LIMIT ? OFFSET ?`, strings.Join(where, " AND "))
+	args = append(args, limit, offset)
+
+	rows, err := s.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var notes []model.Note
+	for rows.Next() {
+		var n model.Note
+		var pinned, archived, deleted int
+		var stampsRaw string
+		if err := rows.Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
+			return nil, err
+		}
+		n.Pinned = pinned != 0
+		n.Archived = archived != 0
+		n.Deleted = deleted != 0
+		_ = json.Unmarshal([]byte(stampsRaw), &n.Stamps)
+		n.Tags = tags.Extract(n.Content)
+		notes = append(notes, n)
+	}
+
+	for i := range notes {
+		atts, err := s.listNoteAttachmentsLocked(notes[i].ID, false)
+		if err != nil {
+			return nil, err
+		}
+		notes[i].Attachments = atts
+	}
+	return notes, nil
+}
+
+// CountNotesInRange counts non-deleted notes created within [fromMs, toMs].
+func (s *Store) CountNotesInRange(fromMs, toMs int64) (int, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var cnt int
+	err := s.db.QueryRow(
+		`SELECT COUNT(1) FROM notes WHERE deleted = 0 AND created_at >= ? AND created_at <= ?`,
+		fromMs, toMs,
+	).Scan(&cnt)
+	return cnt, err
+}
+
+// ListTagTree returns the hierarchical tag tree for all active notes.
+func (s *Store) ListTagTree() ([]model.TagNode, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT nt.tag_path, COUNT(DISTINCT nt.note_id)
+		FROM note_tags nt
+		JOIN notes n ON n.id = nt.note_id
+		WHERE n.deleted = 0 AND n.archived = 0
+		GROUP BY nt.tag_path`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	counts := make(map[string]int)
+	for rows.Next() {
+		var p string
+		var c int
+		if err := rows.Scan(&p, &c); err != nil {
+			return nil, err
+		}
+		counts[p] = c
+	}
+	return tags.BuildTree(counts), nil
+}
+
+// ListChangesSince returns all notes (including tombstones) and attachments modified at or after sinceMs.
+func (s *Store) ListChangesSince(sinceMs int64) ([]model.Note, []model.Attachment, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	nRows, err := s.db.Query(`
+		SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
+		FROM notes WHERE updated_at >= ? ORDER BY updated_at ASC`, sinceMs)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer nRows.Close()
+
+	var notes []model.Note
+	for nRows.Next() {
+		var n model.Note
+		var pinned, archived, deleted int
+		var stampsRaw string
+		if err := nRows.Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
+			return nil, nil, err
+		}
+		n.Pinned = pinned != 0
+		n.Archived = archived != 0
+		n.Deleted = deleted != 0
+		_ = json.Unmarshal([]byte(stampsRaw), &n.Stamps)
+		notes = append(notes, n)
+	}
+
+	aRows, err := s.db.Query(`
+		SELECT id, note_id, sha256, mime, width, height, size_bytes, sort_order, deleted, updated_at
+		FROM note_attachments WHERE updated_at >= ? ORDER BY updated_at ASC`, sinceMs)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer aRows.Close()
+
+	var atts []model.Attachment
+	for aRows.Next() {
+		var a model.Attachment
+		var del int
+		if err := aRows.Scan(&a.ID, &a.NoteID, &a.SHA256, &a.MIME, &a.Width, &a.Height, &a.SizeBytes, &a.SortOrder, &del, &a.UpdatedAt); err != nil {
+			return nil, nil, err
+		}
+		a.Deleted = del != 0
+		atts = append(atts, a)
+	}
+	return notes, atts, nil
+}
+
+// MergeRemote applies incoming notes and attachments using field-level LWW merge.
+// Returns the number of notes inserted or changed.
+func (s *Store) MergeRemote(remoteNotes []model.Note, remoteAtts []model.Attachment) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	mergedCount := 0
+	for _, rn := range remoteNotes {
+		if rn.ID == "" {
+			continue
+		}
+		if rn.Stamps.Max() == 0 {
+			rn.Stamps = model.FieldStamps{
+				Content:     rn.UpdatedAt,
+				Pinned:      rn.UpdatedAt,
+				Archived:    rn.UpdatedAt,
+				Deleted:     rn.UpdatedAt,
+				Attachments: rn.UpdatedAt,
+			}
+		}
+
+		local, err := s.getNoteTx(tx, rn.ID)
+		if errors.Is(err, sql.ErrNoRows) {
+			rn.UpdatedAt = rn.Stamps.Max()
+			rn.Tags = tags.Extract(rn.Content)
+			if err := s.upsertNoteTx(tx, &rn); err != nil {
+				return 0, err
+			}
+			mergedCount++
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+
+		merged, changed := mergeNoteFields(*local, rn)
+		if changed {
+			merged.Tags = tags.Extract(merged.Content)
+			if err := s.upsertNoteTx(tx, &merged); err != nil {
+				return 0, err
+			}
+			mergedCount++
+		}
+	}
+
+	for _, ra := range remoteAtts {
+		if ra.ID == "" || ra.NoteID == "" || ra.SHA256 == "" {
+			continue
+		}
+		var localUpdated int64
+		var localDeleted int
+		err := tx.QueryRow(`SELECT updated_at, deleted FROM note_attachments WHERE id = ?`, ra.ID).Scan(&localUpdated, &localDeleted)
+		if errors.Is(err, sql.ErrNoRows) || (err == nil && (ra.UpdatedAt > localUpdated || (ra.UpdatedAt == localUpdated && ra.Deleted && localDeleted == 0))) {
+			if err := s.upsertAttachmentTx(tx, &ra); err != nil {
+				return 0, err
+			}
+		} else if err != nil {
+			return 0, err
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, err
+	}
+	return mergedCount, nil
+}
+
+// mergeNoteFields merges two versions of the same note field-by-field using LWW + deterministic tie-breaker.
+func mergeNoteFields(local, remote model.Note) (model.Note, bool) {
+	out := local
+	changed := false
+
+	if remote.CreatedAt > 0 && (out.CreatedAt == 0 || remote.CreatedAt < out.CreatedAt) {
+		out.CreatedAt = remote.CreatedAt
+		changed = true
+	}
+
+	if remote.Stamps.Content > out.Stamps.Content ||
+		(remote.Stamps.Content == out.Stamps.Content && remote.Content > out.Content) {
+		out.Content = remote.Content
+		out.Stamps.Content = remote.Stamps.Content
+		changed = true
+	}
+
+	if remote.Stamps.Pinned > out.Stamps.Pinned ||
+		(remote.Stamps.Pinned == out.Stamps.Pinned && remote.Pinned && !out.Pinned) {
+		out.Pinned = remote.Pinned
+		out.Stamps.Pinned = remote.Stamps.Pinned
+		changed = true
+	}
+
+	if remote.Stamps.Archived > out.Stamps.Archived ||
+		(remote.Stamps.Archived == out.Stamps.Archived && remote.Archived && !out.Archived) {
+		out.Archived = remote.Archived
+		out.Stamps.Archived = remote.Stamps.Archived
+		changed = true
+	}
+
+	if remote.Stamps.Deleted > out.Stamps.Deleted ||
+		(remote.Stamps.Deleted == out.Stamps.Deleted && remote.Deleted && !out.Deleted) {
+		out.Deleted = remote.Deleted
+		out.Stamps.Deleted = remote.Stamps.Deleted
+		changed = true
+	}
+
+	if remote.Stamps.Attachments > out.Stamps.Attachments {
+		out.Stamps.Attachments = remote.Stamps.Attachments
+		changed = true
+	}
+
+	newUpdated := out.Stamps.Max()
+	if newUpdated != out.UpdatedAt {
+		out.UpdatedAt = newUpdated
+		changed = true
+	}
+	return out, changed
+}
+
+// UpsertSyncPeer updates local watermark for a peer.
+func (s *Store) UpsertSyncPeer(p model.SyncPeer) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`
+		INSERT INTO sync_peers(peer_id, display_name, last_addr, last_heard_at, last_sync_at)
+		VALUES(?, ?, ?, ?, ?)
+		ON CONFLICT(peer_id) DO UPDATE SET
+			display_name  = CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE sync_peers.display_name END,
+			last_addr     = CASE WHEN excluded.last_addr <> '' THEN excluded.last_addr ELSE sync_peers.last_addr END,
+			last_heard_at = MAX(sync_peers.last_heard_at, excluded.last_heard_at),
+			last_sync_at  = MAX(sync_peers.last_sync_at, excluded.last_sync_at)`,
+		p.PeerID, p.DisplayName, p.LastAddr, p.LastHeardAt, p.LastSyncAt)
+	return err
+}
+
+// GetSyncPeer fetches a peer's stored watermark.
+func (s *Store) GetSyncPeer(peerID string) (*model.SyncPeer, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var p model.SyncPeer
+	err := s.db.QueryRow(`SELECT peer_id, display_name, last_addr, last_heard_at, last_sync_at FROM sync_peers WHERE peer_id = ?`, peerID).
+		Scan(&p.PeerID, &p.DisplayName, &p.LastAddr, &p.LastHeardAt, &p.LastSyncAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return &p, err
+}
+
+// ListSyncPeers lists all known sync peers.
+func (s *Store) ListSyncPeers() ([]model.SyncPeer, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`SELECT peer_id, display_name, last_addr, last_heard_at, last_sync_at FROM sync_peers ORDER BY last_sync_at DESC`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []model.SyncPeer
+	for rows.Next() {
+		var p model.SyncPeer
+		if err := rows.Scan(&p.PeerID, &p.DisplayName, &p.LastAddr, &p.LastHeardAt, &p.LastSyncAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+func (s *Store) getNoteTx(tx *sql.Tx, id string) (*model.Note, error) {
+	var n model.Note
+	var pinned, archived, deleted int
+	var stampsRaw string
+	err := tx.QueryRow(
+		`SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json FROM notes WHERE id = ?`,
+		id,
+	).Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw)
+	if err != nil {
+		return nil, err
+	}
+	n.Pinned = pinned != 0
+	n.Archived = archived != 0
+	n.Deleted = deleted != 0
+	_ = json.Unmarshal([]byte(stampsRaw), &n.Stamps)
+	return &n, nil
+}
+
+func (s *Store) upsertNoteTx(tx *sql.Tx, n *model.Note) error {
+	stampsBytes, err := json.Marshal(n.Stamps)
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(`
+		INSERT INTO notes(id, content, pinned, archived, deleted, created_at, updated_at, stamps_json)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			content     = excluded.content,
+			pinned      = excluded.pinned,
+			archived    = excluded.archived,
+			deleted     = excluded.deleted,
+			created_at  = excluded.created_at,
+			updated_at  = excluded.updated_at,
+			stamps_json = excluded.stamps_json`,
+		n.ID, n.Content, boolInt(n.Pinned), boolInt(n.Archived), boolInt(n.Deleted),
+		n.CreatedAt, n.UpdatedAt, string(stampsBytes))
+	if err != nil {
+		return err
+	}
+
+	if _, err := tx.Exec(`DELETE FROM note_tags WHERE note_id = ?`, n.ID); err != nil {
+		return err
+	}
+	if !n.Deleted {
+		for _, t := range tags.Extract(n.Content) {
+			if _, err := tx.Exec(`INSERT OR IGNORE INTO note_tags(note_id, tag_path) VALUES(?, ?)`, n.ID, t); err != nil {
+				return err
+			}
+		}
+	}
+
+	if _, err := tx.Exec(`DELETE FROM notes_fts WHERE note_id = ?`, n.ID); err != nil {
+		return err
+	}
+	if !n.Deleted {
+		if _, err := tx.Exec(`INSERT INTO notes_fts(note_id, content) VALUES(?, ?)`, n.ID, n.Content); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *Store) upsertAttachmentTx(tx *sql.Tx, a *model.Attachment) error {
+	_, err := tx.Exec(`
+		INSERT INTO note_attachments(id, note_id, sha256, mime, width, height, size_bytes, sort_order, deleted, updated_at)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO UPDATE SET
+			note_id    = excluded.note_id,
+			sha256     = excluded.sha256,
+			mime       = excluded.mime,
+			width      = excluded.width,
+			height     = excluded.height,
+			size_bytes = excluded.size_bytes,
+			sort_order = excluded.sort_order,
+			deleted    = excluded.deleted,
+			updated_at = excluded.updated_at`,
+		a.ID, a.NoteID, a.SHA256, a.MIME, a.Width, a.Height, a.SizeBytes, a.SortOrder, boolInt(a.Deleted), a.UpdatedAt)
+	return err
+}
+
+func (s *Store) listNoteAttachmentsLocked(noteID string, includeDeleted bool) ([]model.Attachment, error) {
+	q := `SELECT id, note_id, sha256, mime, width, height, size_bytes, sort_order, deleted, updated_at
+	      FROM note_attachments WHERE note_id = ?`
+	if !includeDeleted {
+		q += ` AND deleted = 0`
+	}
+	q += ` ORDER BY sort_order ASC, id ASC`
+
+	rows, err := s.db.Query(q, noteID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var atts []model.Attachment
+	for rows.Next() {
+		var a model.Attachment
+		var del int
+		if err := rows.Scan(&a.ID, &a.NoteID, &a.SHA256, &a.MIME, &a.Width, &a.Height, &a.SizeBytes, &a.SortOrder, &del, &a.UpdatedAt); err != nil {
+			return nil, err
+		}
+		a.Deleted = del != 0
+		if p, ok := s.BlobPath(a.SHA256); ok {
+			a.LocalPath = p
+		}
+		atts = append(atts, a)
+	}
+	return atts, nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+func extFromMIME(mime string) string {
+	switch strings.ToLower(strings.TrimSpace(mime)) {
+	case "image/png":
+		return ".png"
+	case "image/jpeg", "image/jpg":
+		return ".jpg"
+	case "image/webp":
+		return ".webp"
+	case "image/gif":
+		return ".gif"
+	case "image/heic":
+		return ".heic"
+	default:
+		return ".bin"
+	}
+}
+
+func mimeFromExt(ext string) string {
+	switch strings.ToLower(ext) {
+	case ".png":
+		return "image/png"
+	case ".jpg", ".jpeg":
+		return "image/jpeg"
+	case ".webp":
+		return "image/webp"
+	case ".gif":
+		return "image/gif"
+	case ".heic":
+		return "image/heic"
+	default:
+		return "application/octet-stream"
+	}
+}

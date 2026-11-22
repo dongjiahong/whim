@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Run Go core tests
+        run: cd core && go test ./... -v
+      - name: Build Whim.app and whim-mcp
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/build-macos.sh
+          ./scripts/build-mcp.sh
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent Whim.app Whim-macOS.zip
+          tar -czf whim-mcp-macos-arm64.tar.gz whim-mcp
+      - name: Upload macOS release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-artifacts
+          path: |
+            dist/Whim-macOS.zip
+            dist/whim-mcp-macos-arm64.tar.gz
+
+  build-android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - name: Install Android NDK & gomobile
+        run: |
+          sdkmanager "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          gomobile init
+          mkdir -p android/app/libs
+          cd core && gomobile bind -target=android -androidapi 26 -o ../android/app/libs/whimcore.aar ./mobile
+      - name: Build Android APK
+        uses: gradle/actions/setup-gradle@v4
+      - run: |
+          cd android
+          gradle assembleDebug
+          cp app/build/outputs/apk/debug/app-debug.apk ../Whim-Android.apk
+      - name: Upload Android artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-artifacts
+          path: Whim-Android.apk
+
+  publish:
+    needs: [build-macos, build-android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-files
+          merge-multiple: true
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            release-files/Whim-macOS.zip
+            release-files/whim-mcp-macos-arm64.tar.gz
+            release-files/Whim-Android.apk

@@ -1,0 +1,17 @@
+.DS_Store
+dist/
+*.log
+
+# Go / macOS C-Archive build outputs
+macos/Sources/CWhimCore/libwhimcore.a
+macos/Sources/CWhimCore/libwhimcore.h
+macos/.build/
+macos/.swiftpm/
+
+# Android Gradle & gomobile outputs
+android/.gradle/
+android/local.properties
+android/app/build/
+android/build/
+android/app/libs/*.aar
+android/app/libs/*.jar

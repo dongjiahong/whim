@@ -1,0 +1,5 @@
+module CWhimCore {
+    header "libwhimcore.h"
+    link "whimcore"
+    export *
+}

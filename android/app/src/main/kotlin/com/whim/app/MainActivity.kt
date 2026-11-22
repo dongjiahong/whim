@@ -1,0 +1,741 @@
+package com.whim.app
+
+import android.Manifest
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import android.content.Intent
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.GridView
+import androidx.compose.material.icons.rounded.Menu
+import androidx.compose.material.icons.rounded.MoreHoriz
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Shuffle
+import androidx.compose.material.icons.rounded.Sync
+import androidx.compose.material3.DrawerValue
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.Icon
+import androidx.compose.material3.ModalDrawerSheet
+import androidx.compose.material3.ModalNavigationDrawer
+import androidx.compose.material3.Text
+import androidx.compose.material3.rememberDrawerState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import coil.compose.AsyncImage
+import com.whim.app.capture.QuickCaptureActivity
+import com.whim.app.capture.WhimWidgetProvider
+import com.whim.app.core.WhimCoreBridge
+import com.whim.app.core.WhimListFilter
+import com.whim.app.core.WhimNote
+import com.whim.app.core.WhimTagNode
+import com.whim.app.sync.SyncWorker
+import com.whim.app.ui.theme.WhimTheme
+import com.whim.app.ui.theme.WhimThemeProvider
+import com.whim.app.ui.theme.heatmapColor
+import kotlinx.coroutines.launch
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
+
+private sealed class MobileTab {
+    data object All : MobileTab()
+    data object Review : MobileTab()
+    data object Random : MobileTab()
+    data class Tag(val path: String) : MobileTab()
+}
+
+class MainActivity : ComponentActivity() {
+    companion object {
+        const val EXTRA_OPEN_REVIEW = "open_review"
+    }
+
+    private val notifPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { }
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
+        WhimCoreBridge.ensureInit(this)
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val initialReview = intent?.getBooleanExtra(EXTRA_OPEN_REVIEW, false) == true
+
+        setContent {
+            WhimThemeProvider(darkTheme = true) {
+                FlomoMobileApp(
+                    initialReviewMode = initialReview,
+                    onOpenQuickCapture = {
+                        startActivity(Intent(this, QuickCaptureActivity::class.java))
+                    }
+                )
+            }
+        }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        runCatching { WhimCoreBridge.startPeerServer(8788) }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        WhimCoreBridge.stopPeerServer()
+    }
+}
+
+@Composable
+private fun FlomoMobileApp(
+    initialReviewMode: Boolean,
+    onOpenQuickCapture: () -> Unit
+) {
+    val c = WhimTheme.colors
+    val t = WhimTheme.typography
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+
+    var activeTab by remember { mutableStateOf<MobileTab>(if (initialReviewMode) MobileTab.Review else MobileTab.All) }
+    var searchQuery by remember { mutableStateOf("") }
+    var showSearch by remember { mutableStateOf(false) }
+    var showSyncCard by remember { mutableStateOf(false) }
+
+    var allNotes by remember { mutableStateOf<List<WhimNote>>(emptyList()) }
+    var displayedNotes by remember { mutableStateOf<List<WhimNote>>(emptyList()) }
+    var tagTree by remember { mutableStateOf<List<WhimTagNode>>(emptyList()) }
+    var pairCode by remember { mutableStateOf("") }
+    var syncStatus by remember { mutableStateOf("") }
+    var codeOrAddrInput by remember { mutableStateOf("") }
+
+    val dayFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()) }
+
+    val dailyCounts = remember(allNotes) {
+        val map = mutableMapOf<String, Int>()
+        for (n in allNotes) {
+            if (n.createdAt > 0) {
+                val key = dayFmt.format(Date(n.createdAt))
+                map[key] = (map[key] ?: 0) + 1
+            }
+        }
+        map
+    }
+    val uniqueTagCount = remember(allNotes) { allNotes.flatMap { it.tags }.toSet().size }
+    val activeDayCount = remember(allNotes) {
+        val earliest = allNotes.minOfOrNull { it.createdAt } ?: System.currentTimeMillis()
+        val diffDays = ((System.currentTimeMillis() - earliest) / (24L * 3600L * 1000L)).toInt() + 1
+        diffDays.coerceAtLeast(1)
+    }
+
+    fun reload() {
+        scope.launch {
+            runCatching {
+                val full = WhimCoreBridge.listNotes(WhimListFilter(limit = 500))
+                allNotes = full
+                tagTree = WhimCoreBridge.listTagTree()
+                pairCode = WhimCoreBridge.getPairCode()
+
+                displayedNotes = when (val tab = activeTab) {
+                    MobileTab.All -> if (searchQuery.isEmpty()) full else WhimCoreBridge.listNotes(WhimListFilter(query = searchQuery))
+                    MobileTab.Review -> {
+                        val today = WhimCoreBridge.listTodayNotes()
+                        if (searchQuery.isEmpty()) today else today.filter { it.content.contains(searchQuery, ignoreCase = true) }
+                    }
+                    MobileTab.Random -> full.shuffled().take(12)
+                    is MobileTab.Tag -> WhimCoreBridge.listNotes(WhimListFilter(query = searchQuery, tagPrefix = tab.path))
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(activeTab, searchQuery) {
+        reload()
+    }
+
+    ModalNavigationDrawer(
+        drawerState = drawerState,
+        drawerContent = {
+            ModalDrawerSheet(
+                drawerContainerColor = c.sidebar,
+                modifier = Modifier.width(292.dp)
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxHeight()
+                        .verticalScroll(rememberScrollState())
+                        .statusBarsPadding()
+                        .padding(horizontal = 18.dp, vertical = 14.dp)
+                ) {
+                    // Header: Whim + LOCAL pill
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Whim", style = t.title, color = c.textPrimary)
+                        Box(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(4.dp))
+                                .background(c.border)
+                                .padding(horizontal = 5.dp, vertical = 2.dp)
+                        ) {
+                            Text("LOCAL", fontSize = 10.sp, fontWeight = FontWeight.Bold, color = c.textPrimary)
+                        }
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+
+                    // 3-Column Stats (笔记 / 标签 / 天)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        StatBlock("${allNotes.size}", "笔记")
+                        StatBlock("$uniqueTagCount", "标签")
+                        StatBlock("$activeDayCount", "天")
+                        Spacer(Modifier.width(12.dp))
+                    }
+
+                    Spacer(Modifier.height(14.dp))
+
+                    // 12-week Activity Heatmap
+                    MobileHeatmap(dailyCounts = dailyCounts)
+
+                    Spacer(Modifier.height(16.dp))
+
+                    // Primary Flomo Navigation Pills
+                    DrawerNavRow(Icons.Rounded.GridView, "全部笔记", activeTab == MobileTab.All) {
+                        activeTab = MobileTab.All
+                        scope.launch { drawerState.close() }
+                    }
+                    DrawerNavRow(Icons.Rounded.AutoAwesome, "每日回顾", activeTab == MobileTab.Review) {
+                        activeTab = MobileTab.Review
+                        scope.launch { drawerState.close() }
+                    }
+                    DrawerNavRow(Icons.Rounded.Shuffle, "随机漫步", activeTab == MobileTab.Random) {
+                        activeTab = MobileTab.Random
+                        scope.launch { drawerState.close() }
+                    }
+                    DrawerNavRow(Icons.Rounded.Sync, "局域网同步 · $pairCode", false) {
+                        showSyncCard = true
+                        scope.launch { drawerState.close() }
+                    }
+
+                    Spacer(Modifier.height(16.dp))
+                    Text("全部标签", style = t.meta, color = c.textMuted, modifier = Modifier.padding(start = 6.dp, bottom = 6.dp))
+
+                    if (tagTree.isEmpty()) {
+                        Text("输入 #工作/架构 自动生成标签树", style = t.meta, color = c.textMuted, modifier = Modifier.padding(start = 6.dp))
+                    } else {
+                        DrawerTagTree(
+                            nodes = tagTree,
+                            depth = 0,
+                            activeTab = activeTab,
+                            onSelect = { path ->
+                                activeTab = MobileTab.Tag(path)
+                                scope.launch { drawerState.close() }
+                            }
+                        )
+                    }
+                }
+            }
+        }
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(c.canvas)
+                .statusBarsPadding()
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                // Top Header Bar
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        Icon(
+                            Icons.Rounded.Menu,
+                            contentDescription = "菜单",
+                            tint = c.textPrimary,
+                            modifier = Modifier
+                                .size(24.dp)
+                                .clickable { scope.launch { drawerState.open() } }
+                        )
+                        Text(
+                            text = when (val tab = activeTab) {
+                                MobileTab.All -> "全部笔记"
+                                MobileTab.Review -> "每日回顾"
+                                MobileTab.Random -> "随机漫步"
+                                is MobileTab.Tag -> "#${tab.path}"
+                            },
+                            style = t.title,
+                            color = c.textPrimary,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+
+                    Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(
+                            Icons.Rounded.Search,
+                            contentDescription = "搜索",
+                            tint = c.textSecondary,
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clickable { showSearch = !showSearch }
+                        )
+                        Icon(
+                            Icons.Rounded.Sync,
+                            contentDescription = "同步",
+                            tint = c.textSecondary,
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clickable {
+                                    showSyncCard = !showSyncCard
+                                    scope.launch {
+                                        syncStatus = "正在局域网同步..."
+                                        val res = WhimCoreBridge.syncOnce()
+                                        syncStatus = if (res.peersSynced > 0) {
+                                            "已同步 ${res.peersSynced} 台设备 · 合并 ${res.notesMerged} 条"
+                                        } else {
+                                            "局域网暂未发现对端"
+                                        }
+                                        reload()
+                                        WhimWidgetProvider.refreshAll(context)
+                                    }
+                                }
+                        )
+                    }
+                }
+
+                if (showSearch) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.searchBg)
+                            .padding(horizontal = 12.dp, vertical = 9.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(Icons.Rounded.Search, contentDescription = null, tint = c.textMuted, modifier = Modifier.size(16.dp))
+                        Spacer(Modifier.width(8.dp))
+                        BasicTextField(
+                            value = searchQuery,
+                            onValueChange = { searchQuery = it },
+                            singleLine = true,
+                            textStyle = t.body.copy(color = c.textPrimary),
+                            cursorBrush = SolidColor(c.accent),
+                            modifier = Modifier.fillMaxWidth(),
+                            decorationBox = { inner ->
+                                if (searchQuery.isEmpty()) Text("搜索笔记或 #标签...", style = t.body, color = c.textMuted)
+                                inner()
+                            }
+                        )
+                    }
+                }
+
+                if (showSyncCard) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 6.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(c.card)
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("局域网对等同步 · 配对码 $pairCode", style = t.section, color = c.textPrimary)
+                        if (syncStatus.isNotEmpty()) {
+                            Text(syncStatus, style = t.meta, color = c.textSecondary)
+                        }
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .clip(RoundedCornerShape(7.dp))
+                                    .background(c.canvas)
+                                    .padding(horizontal = 10.dp, vertical = 8.dp)
+                            ) {
+                                BasicTextField(
+                                    value = codeOrAddrInput,
+                                    onValueChange = { codeOrAddrInput = it },
+                                    singleLine = true,
+                                    textStyle = t.body.copy(color = c.textPrimary),
+                                    cursorBrush = SolidColor(c.accent),
+                                    decorationBox = { inner ->
+                                        if (codeOrAddrInput.isEmpty()) Text("输入6位配对码或Mac IP:8788", style = t.meta, color = c.textMuted)
+                                        inner()
+                                    }
+                                )
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(7.dp))
+                                    .background(c.accent)
+                                    .clickable {
+                                        val v = codeOrAddrInput.trim()
+                                        if (v.length == 6 && v.all { it.isDigit() }) {
+                                            pairCode = WhimCoreBridge.setPairCode(v)
+                                            syncStatus = "配对码已更新为 $pairCode"
+                                        } else if (v.contains(":")) {
+                                            WhimCoreBridge.setManualPeers(listOf(v))
+                                            syncStatus = "已添加兜底对端 $v"
+                                        }
+                                        codeOrAddrInput = ""
+                                    }
+                                    .padding(horizontal = 14.dp, vertical = 8.dp)
+                            ) {
+                                Text("应用", style = t.meta, color = Color.White, fontWeight = FontWeight.Medium)
+                            }
+                        }
+                    }
+                }
+
+                // Flomo Note Card Feed
+                LazyColumn(
+                    modifier = Modifier.fillMaxSize(),
+                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    if (displayedNotes.isEmpty()) {
+                        item {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(top = 80.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text("暂无笔记，点击右下角记下第一个想法", style = t.body, color = c.textMuted)
+                            }
+                        }
+                    } else {
+                        items(displayedNotes, key = { it.id }) { note ->
+                            FlomoMobileNoteCard(
+                                note = note,
+                                onTapTag = { path -> activeTab = MobileTab.Tag(path) },
+                                onTogglePin = {
+                                    scope.launch {
+                                        WhimCoreBridge.updateNote(note.id, pinned = !note.pinned)
+                                        reload()
+                                        SyncWorker.enqueueImmediate(context)
+                                    }
+                                },
+                                onCopy = {
+                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                    cm.setPrimaryClip(ClipData.newPlainText("whim", note.content))
+                                },
+                                onDelete = {
+                                    scope.launch {
+                                        WhimCoreBridge.updateNote(note.id, deleted = true)
+                                        reload()
+                                        SyncWorker.enqueueImmediate(context)
+                                    }
+                                }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Sage-green floating capture button (flomo mobile style)
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(end = 20.dp, bottom = 28.dp)
+                    .size(54.dp)
+                    .clip(CircleShape)
+                    .background(c.accent)
+                    .clickable(onClick = onOpenQuickCapture),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(Icons.Rounded.Add, contentDescription = "新建笔记", tint = Color.White, modifier = Modifier.size(26.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatBlock(value: String, label: String) {
+    val c = WhimTheme.colors
+    val t = WhimTheme.typography
+    Column {
+        Text(value, style = t.statNumber, color = c.textPrimary)
+        Text(label, style = t.meta, color = c.textMuted)
+    }
+}
+
+@Composable
+private fun MobileHeatmap(dailyCounts: Map<String, Int>) {
+    val c = WhimTheme.colors
+    val dayFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()) }
+    val todayKey = remember { dayFmt.format(Date()) }
+    val cols = 12
+    val rows = 7
+    val dates = remember {
+        val cal = Calendar.getInstance()
+        cal.add(Calendar.DAY_OF_YEAR, -(cols * rows - 1))
+        List(cols) {
+            List(rows) {
+                val k = dayFmt.format(cal.time)
+                cal.add(Calendar.DAY_OF_YEAR, 1)
+                k
+            }
+        }
+    }
+
+    Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        dates.forEach { col ->
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                col.forEach { key ->
+                    val cnt = dailyCounts[key] ?: 0
+                    val isToday = key == todayKey
+                    Box(
+                        modifier = Modifier
+                            .size(14.dp)
+                            .clip(RoundedCornerShape(3.dp))
+                            .background(c.heatmapColor(cnt))
+                            .then(
+                                if (isToday) Modifier.border(1.dp, c.textSecondary, RoundedCornerShape(3.dp))
+                                else Modifier
+                            )
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DrawerNavRow(icon: ImageVector, title: String, active: Boolean, onClick: () -> Unit) {
+    val c = WhimTheme.colors
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(if (active) c.accent else Color.Transparent)
+            .clickable(onClick = onClick)
+            .padding(horizontal = 12.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Icon(icon, contentDescription = null, tint = if (active) Color.White else c.textSecondary, modifier = Modifier.size(18.dp))
+        Text(
+            text = title,
+            fontSize = 14.sp,
+            fontWeight = if (active) FontWeight.Medium else FontWeight.Normal,
+            color = if (active) Color.White else c.textPrimary
+        )
+    }
+}
+
+@Composable
+private fun DrawerTagTree(
+    nodes: List<WhimTagNode>,
+    depth: Int,
+    activeTab: MobileTab,
+    onSelect: (String) -> Unit
+) {
+    val c = WhimTheme.colors
+    Column {
+        for (node in nodes) {
+            val selected = activeTab is MobileTab.Tag && activeTab.path == node.fullPath
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(7.dp))
+                    .background(if (selected) c.accent else Color.Transparent)
+                    .clickable { onSelect(node.fullPath) }
+                    .padding(start = (depth * 14 + 10).dp, end = 10.dp, top = 7.dp, bottom = 7.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("#", fontSize = 14.sp, color = if (selected) Color.White else c.textMuted)
+                    Text(node.name, fontSize = 14.sp, color = if (selected) Color.White else c.textPrimary)
+                }
+                Text("${node.count}", fontSize = 12.sp, color = if (selected) Color.White.copy(alpha = 0.8f) else c.textMuted)
+            }
+            if (node.children.isNotEmpty()) {
+                DrawerTagTree(node.children, depth + 1, activeTab, onSelect)
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun FlomoMobileNoteCard(
+    note: WhimNote,
+    onTapTag: (String) -> Unit,
+    onTogglePin: () -> Unit,
+    onCopy: () -> Unit,
+    onDelete: () -> Unit
+) {
+    val c = WhimTheme.colors
+    val t = WhimTheme.typography
+    var menuExpanded by remember { mutableStateOf(false) }
+    var textExpanded by remember { mutableStateOf(false) }
+    val isLong = note.content.length > 220 || note.content.lines().size > 6
+
+    val timeStr = remember(note.createdAt) {
+        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(note.createdAt))
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(10.dp))
+            .background(c.card)
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(9.dp)
+    ) {
+        // Header: 置顶 · YYYY-MM-DD HH:mm + ···
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = if (note.pinned) "置顶 · $timeStr" else timeStr,
+                style = t.meta,
+                color = c.textSecondary
+            )
+            Box {
+                Icon(
+                    Icons.Rounded.MoreHoriz,
+                    contentDescription = "更多",
+                    tint = c.textMuted,
+                    modifier = Modifier
+                        .size(20.dp)
+                        .clickable { menuExpanded = true }
+                )
+                DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                    DropdownMenuItem(
+                        text = { Text(if (note.pinned) "取消置顶" else "置顶") },
+                        onClick = { menuExpanded = false; onTogglePin() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("复制内容") },
+                        onClick = { menuExpanded = false; onCopy() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text("删除") },
+                        onClick = { menuExpanded = false; onDelete() }
+                    )
+                }
+            }
+        }
+
+        // Cool blue tag pills right below timestamp
+        if (note.tags.isNotEmpty()) {
+            FlowRow(
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalArrangement = Arrangement.spacedBy(6.dp)
+            ) {
+                note.tags.forEach { tag ->
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(5.dp))
+                            .background(c.tagBg)
+                            .clickable { onTapTag(tag) }
+                            .padding(horizontal = 8.dp, vertical = 3.dp)
+                    ) {
+                        Text(text = "#$tag", style = t.meta, color = c.tagText)
+                    }
+                }
+            }
+        }
+
+        // Note body
+        Text(
+            text = note.content,
+            style = t.body,
+            color = c.textPrimary,
+            maxLines = if (textExpanded || !isLong) Int.MAX_VALUE else 6,
+            overflow = TextOverflow.Ellipsis
+        )
+
+        if (isLong) {
+            Text(
+                text = if (textExpanded) "收起" else "展开",
+                style = t.meta,
+                color = c.tagText,
+                modifier = Modifier.clickable { textExpanded = !textExpanded }
+            )
+        }
+
+        // Image thumbnails
+        if (note.attachments.isNotEmpty()) {
+            LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                items(note.attachments) { att ->
+                    if (att.localPath.isNotEmpty()) {
+                        AsyncImage(
+                            model = File(att.localPath),
+                            contentDescription = "图片附件",
+                            contentScale = ContentScale.Crop,
+                            modifier = Modifier
+                                .size(104.dp)
+                                .clip(RoundedCornerShape(8.dp))
+                        )
+                    }
+                }
+            }
+        }
+    }
+}

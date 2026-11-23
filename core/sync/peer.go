@@ -317,9 +317,13 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 
 	summary.PeersFound = len(byAddr)
 	seenPeerIDs := make(map[string]bool)
+	seenAddrs := make(map[string]bool)
 	for _, t := range byAddr {
 		if t.peerID != "" {
 			seenPeerIDs[t.peerID] = true
+		}
+		if t.addr != "" {
+			seenAddrs[t.addr] = true
 		}
 		if len(NormalizeCode(code)) != 6 {
 			summary.Peers = append(summary.Peers, model.PeerSyncStatus{
@@ -379,10 +383,13 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 		p.sseMu.Unlock()
 
 		for _, sp := range savedPeers {
-			if sp.PeerID == "" || sp.PeerID == p.peerID || seenPeerIDs[sp.PeerID] {
+			if sp.PeerID == "" || sp.PeerID == p.peerID || seenPeerIDs[sp.PeerID] || (sp.LastAddr != "" && seenAddrs[sp.LastAddr]) {
 				continue
 			}
 			seenPeerIDs[sp.PeerID] = true
+			if sp.LastAddr != "" {
+				seenAddrs[sp.LastAddr] = true
+			}
 			summary.PeersFound++
 			_, sseOnline := activeCopy[sp.PeerID]
 			recentlySynced := sp.LastSyncAt > 0 && (nowMs-sp.LastSyncAt) < 90_000

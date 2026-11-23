@@ -2,6 +2,7 @@ package sync_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"testing"
@@ -11,7 +12,7 @@ import (
 	whimsync "whim/core/sync"
 )
 
-func TestPerDevicePairingBidirectionalSyncAndBlobs(t *testing.T) {
+func TestSingleLibraryCodeBidirectionalSyncAndBlobs(t *testing.T) {
 	stMac, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -24,11 +25,10 @@ func TestPerDevicePairingBidirectionalSyncAndBlobs(t *testing.T) {
 	}
 	defer stAndroid.Close()
 
-	// Each device has its OWN independent 6-digit code!
-	const macCode = "328287"
-	const androidCode = "814502"
-	peerMac := whimsync.NewPeer(stMac, "peer-mac", "MacBook", macCode)
-	peerAndroid := whimsync.NewPeer(stAndroid, "peer-android", "Android", androidCode)
+	// Both devices share the same library code (second device adopts the first device's 6-digit code)
+	const sharedCode = "614284"
+	peerMac := whimsync.NewPeer(stMac, "peer-mac", "MacBook", sharedCode)
+	peerAndroid := whimsync.NewPeer(stAndroid, "peer-android", "Android", "999111")
 
 	port, err := peerMac.StartServer(0, false)
 	if err != nil {
@@ -36,8 +36,16 @@ func TestPerDevicePairingBidirectionalSyncAndBlobs(t *testing.T) {
 	}
 	defer peerMac.StopServer()
 	macAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	rawManual, _ := json.Marshal([]string{macAddr})
+	_ = stAndroid.SetMeta("whim.manual_addrs", string(rawManual))
 
-	// 1. Mac creates a note with an image
+	// 1. Before adopting Mac's code, SyncOnce reports wrong_code status for Mac
+	wrongSum := peerAndroid.SyncOnce(context.Background())
+	if wrongSum.PeersFound != 1 || wrongSum.PeersSynced != 0 || len(wrongSum.Peers) != 1 || wrongSum.Peers[0].Status != "wrong_code" {
+		t.Fatalf("expected wrong_code status before adopting code, got %+v", wrongSum)
+	}
+
+	// 2. Mac & Android each create a note with an inline image
 	macImg := []byte("\x89PNG\r\n\x1a\nmac-image-payload")
 	macHash, _, macSize, err := stMac.SaveBlob(macImg, "image/png")
 	if err != nil {
@@ -50,7 +58,6 @@ func TestPerDevicePairingBidirectionalSyncAndBlobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 2. Android creates a note with its own image
 	andImg := []byte("\x89PNG\r\n\x1a\nandroid-image-payload")
 	andHash, _, andSize, err := stAndroid.SaveBlob(andImg, "image/png")
 	if err != nil {
@@ -63,22 +70,14 @@ func TestPerDevicePairingBidirectionalSyncAndBlobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 3. Android pairs with Mac using Mac's code (328287); Android's OWN code (814502) stays untouched!
-	sum, err := peerAndroid.PairAndSync(context.Background(), macAddr, macCode)
-	if err != nil {
-		t.Fatalf("pair and sync failed: %v", err)
+	// 3. Android adopts Mac's 6-digit code and runs SyncOnce -> automatic bidirectional sync!
+	peerAndroid.SetPairCode(sharedCode)
+	sum := peerAndroid.SyncOnce(context.Background())
+	if sum.PeersSynced != 1 || sum.NotesMerged != 1 || sum.BlobsDownloaded != 1 || sum.BlobsUploaded != 1 {
+		t.Fatalf("unexpected sync summary: %+v", sum)
 	}
-	if sum.NotesMerged != 1 || sum.BlobsDownloaded != 1 || sum.BlobsUploaded != 1 {
-		t.Fatalf("unexpected summary: %+v", sum)
-	}
-	if peerAndroid.PairCode() != androidCode {
-		t.Fatalf("android local code should remain %s, got %s", androidCode, peerAndroid.PairCode())
-	}
-
-	// Verify paired peer is saved on Android so subsequent SyncOnce works without re-typing code
-	paired, _ := stAndroid.ListSyncPeers()
-	if len(paired) != 1 || paired[0].PeerID != "peer-mac" || paired[0].PairCode != macCode {
-		t.Fatalf("expected peer-mac saved in sync_peers, got %+v", paired)
+	if len(sum.Peers) != 1 || sum.Peers[0].Status != "synced" {
+		t.Fatalf("expected synced peer status, got %+v", sum.Peers)
 	}
 
 	// 4. Concurrent field-level edits: Mac edits content, Android pins the SAME note
@@ -91,12 +90,7 @@ func TestPerDevicePairingBidirectionalSyncAndBlobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Subsequent SyncOnce automatically uses the saved per-peer code!
-	sum2 := peerAndroid.SyncOnce(context.Background())
-	if sum2.PeersSynced != 1 {
-		t.Fatalf("expected SyncOnce to sync saved peer, got %+v", sum2)
-	}
-
+	peerAndroid.SyncOnce(context.Background())
 	gotMac, _ := stMac.GetNote(noteOnMac.ID)
 	gotAnd, _ := stAndroid.GetNote(noteOnMac.ID)
 	if gotMac.Content != newContent || !gotMac.Pinned {
@@ -125,7 +119,7 @@ func TestPairingCodeLockoutAfterFiveFailures(t *testing.T) {
 	defer stBad.Close()
 
 	peerMac := whimsync.NewPeer(stMac, "peer-mac", "Mac", "123456")
-	peerBad := whimsync.NewPeer(stBad, "peer-bad", "Intruder", "999999")
+	peerBad := whimsync.NewPeer(stBad, "peer-bad", "Intruder", "000000")
 
 	port, err := peerMac.StartServer(0, false)
 	if err != nil {
@@ -133,15 +127,17 @@ func TestPairingCodeLockoutAfterFiveFailures(t *testing.T) {
 	}
 	defer peerMac.StopServer()
 	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	rawManual, _ := json.Marshal([]string{addr})
+	_ = stBad.SetMeta("whim.manual_addrs", string(rawManual))
 
-	var lastErr error
+	var last model.SyncSummary
 	for i := 0; i < 5; i++ {
-		_, lastErr = peerBad.PairAndSync(context.Background(), addr, "000000")
-		if lastErr == nil {
+		last = peerBad.SyncOnce(context.Background())
+		if last.PeersSynced != 0 {
 			t.Fatalf("attempt %d should have failed", i+1)
 		}
 	}
-	if !strings.Contains(lastErr.Error(), "locked") {
-		t.Fatalf("expected lockout on 5th failed attempt, got: %v", lastErr)
+	if len(last.Peers) != 1 || last.Peers[0].Status != "locked" || !strings.Contains(last.Peers[0].Message, "尝试太多次") {
+		t.Fatalf("expected lockout on 5th failed attempt, got: %+v", last.Peers)
 	}
 }

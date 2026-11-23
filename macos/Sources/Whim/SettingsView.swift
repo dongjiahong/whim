@@ -270,138 +270,148 @@ struct SettingsModalView: View {
         }
     }
 
-    // MARK: - LAN Sync (Per-Device Code + Discovered Peers + Paired Devices)
+    // MARK: - LAN Sync (Navigator-style Zero-IP UDP Discovery + Single Library Code)
 
     private var syncTab: some View {
-        VStack(spacing: 14) {
-            // Card 1: THIS device's own read-only code
+        VStack(spacing: 16) {
             settingsCard {
-                VStack(alignment: .leading, spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("本机同步码")
-                            .font(.system(size: 13.5, weight: .medium))
+                VStack(spacing: 14) {
+                    // Big centered 6-digit code
+                    Button {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(vm.pairCode, forType: .string)
+                        copiedLocalCode = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copiedLocalCode = false }
+                    } label: {
+                        Text(formatSixDigit(vm.pairCode))
+                            .font(.system(size: 36, weight: .bold, design: .monospaced))
+                            .tracking(4)
                             .foregroundColor(FlomoPalette.textPrimary(scheme))
-                        Text("其他设备连接这台 Mac 时输入此码；你在下方输入其他设备的码不会改动本机码")
+                    }
+                    .buttonStyle(.plain)
+                    .help(copiedLocalCode ? "已复制配对码" : "点击复制 6 位配对码")
+
+                    Text(copiedLocalCode ? "已复制到剪贴板" : "在手机或另一台 Mac 的同步设置里输入这 6 位数字。同一份笔记库只需要一个码。")
+                        .font(.system(size: 12.5))
+                        .foregroundColor(copiedLocalCode ? FlomoPalette.accent(scheme) : FlomoPalette.textSecondary(scheme))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: .infinity)
+
+                    rowDivider
+
+                    // Auto-discovered UDP devices list
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("设备")
+                                .font(.system(size: 12.5, weight: .medium))
+                                .foregroundColor(FlomoPalette.textSecondary(scheme))
+                            Spacer()
+                            Button(vm.isSyncing ? "扫描中..." : "刷新") {
+                                vm.syncNow()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 12))
+                            .foregroundColor(FlomoPalette.tagText(scheme))
+                            .disabled(vm.isSyncing)
+                        }
+
+                        if vm.peerStatuses.isEmpty {
+                            Text(vm.isSyncing ? "正在通过 UDP 自动发现同局域网设备..." : "暂未发现同一 Wi-Fi 下的其他 Whim 设备")
+                                .font(.system(size: 12.5))
+                                .foregroundColor(FlomoPalette.textMuted(scheme))
+                                .padding(.vertical, 4)
+                        } else {
+                            ForEach(vm.peerStatuses) { peer in
+                                HStack {
+                                    Text(peer.displayName.isEmpty ? peer.addr : "\(peer.displayName) · \(peer.addr)")
+                                        .font(.system(size: 13, design: .monospaced))
+                                        .foregroundColor(FlomoPalette.textPrimary(scheme))
+                                    Spacer()
+                                    Text(peer.message)
+                                        .font(.system(size: 12.5, weight: .medium))
+                                        .foregroundColor(peer.status == "synced" ? FlomoPalette.accent(scheme) : Color(red: 0.78, green: 0.25, blue: 0.25))
+                                }
+                                .padding(.vertical, 3)
+                            }
+                        }
+                    }
+
+                    rowDivider
+
+                    // Single clean input row: enter another device's 6-digit code
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("第二台设备输入第一台上的 6 位码，两边就自动连在同一份笔记库上，无需填写 IP。")
+                            .font(.system(size: 12.5))
+                            .foregroundColor(FlomoPalette.textSecondary(scheme))
+
+                        HStack(spacing: 10) {
+                            TextField("另一台设备的码", text: $remoteCodeInput)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 15, design: .monospaced))
+                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 8)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                        .fill(FlomoPalette.canvas(scheme))
+                                )
+                                .onSubmit {
+                                    if remoteCodeInput.filter(\.isNumber).count == 6 {
+                                        vm.useOtherDeviceCode(remoteCodeInput)
+                                        remoteCodeInput = ""
+                                    }
+                                }
+
+                            Button("使用") {
+                                vm.useOtherDeviceCode(remoteCodeInput)
+                                remoteCodeInput = ""
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .tint(FlomoPalette.accent(scheme))
+                            .disabled(remoteCodeInput.filter(\.isNumber).count != 6 || vm.isSyncing)
+                        }
+
+                        if !vm.syncMessage.isEmpty {
+                            Text(vm.syncMessage)
+                                .font(.system(size: 12))
+                                .foregroundColor(FlomoPalette.textSecondary(scheme))
+                        }
+                    }
+
+                    Button("重新生成") {
+                        vm.regeneratePairCode()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 13, weight: .medium))
+                    .foregroundColor(FlomoPalette.textSecondary(scheme))
+                    .padding(.top, 4)
+                }
+            }
+
+            // Collapsed fallback ONLY if a router/company Wi-Fi blocks UDP broadcast
+            settingsCard {
+                DisclosureGroup("无法自动发现？手动添加地址（可选）") {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("仅在公司网络或路由器禁用 UDP 广播时使用，正常家用 Wi-Fi 无需填写。")
                             .font(.system(size: 11.5))
                             .foregroundColor(FlomoPalette.textSecondary(scheme))
-                    }
-
-                    HStack(spacing: 12) {
-                        Text(formatSixDigit(vm.pairCode))
-                            .font(.system(size: 24, weight: .bold, design: .monospaced))
-                            .foregroundColor(FlomoPalette.accent(scheme))
-                        Spacer()
-                        Button(copiedLocalCode ? "已复制" : "复制") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(vm.pairCode, forType: .string)
-                            copiedLocalCode = true
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { copiedLocalCode = false }
-                        }
-                        Button("重新生成") { vm.regeneratePairCode() }
-                    }
-                    Text(vm.syncMessage)
-                        .font(.system(size: 12))
-                        .foregroundColor(FlomoPalette.textSecondary(scheme))
-                }
-            }
-
-            // Card 2: Discover & Pair a New Device
-            settingsCard {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Text("连接其他设备")
-                            .font(.system(size: 13.5, weight: .medium))
-                            .foregroundColor(FlomoPalette.textPrimary(scheme))
-                        Spacer()
-                        Button("扫描局域网") { vm.scanLAN() }
-                    }
-
-                    if !vm.discoveredPeers.isEmpty {
-                        VStack(spacing: 6) {
-                            ForEach(vm.discoveredPeers) { peer in
-                                HStack {
-                                    VStack(alignment: .leading, spacing: 1) {
-                                        Text(peer.displayName)
-                                            .font(.system(size: 13, weight: .medium))
-                                            .foregroundColor(FlomoPalette.textPrimary(scheme))
-                                        Text(peer.addr)
-                                            .font(.system(size: 11.5, design: .monospaced))
-                                            .foregroundColor(FlomoPalette.textMuted(scheme))
-                                    }
-                                    Spacer()
-                                    if peer.paired {
-                                        Text("已配对")
-                                            .font(.system(size: 11.5))
-                                            .foregroundColor(FlomoPalette.accent(scheme))
-                                    } else {
-                                        Button("选择") {
-                                            remoteAddrInput = peer.addr
-                                        }
-                                    }
-                                }
-                                .padding(8)
-                                .background(RoundedRectangle(cornerRadius: 7).fill(FlomoPalette.canvas(scheme)))
+                        HStack(spacing: 8) {
+                            TextField("例如 192.168.5.111:8788", text: $remoteAddrInput)
+                                .textFieldStyle(.roundedBorder)
+                            Button("保存并同步") {
+                                vm.saveManualFallbackAddr(remoteAddrInput)
                             }
+                            .disabled(remoteAddrInput.trimmingCharacters(in: .whitespaces).isEmpty)
                         }
                     }
-
-                    HStack(spacing: 8) {
-                        TextField("对方地址 (如 192.168.1.23:8788)", text: $remoteAddrInput)
-                            .textFieldStyle(.roundedBorder)
-                        TextField("对方 6 位同步码", text: $remoteCodeInput)
-                            .textFieldStyle(.roundedBorder)
-                            .frame(width: 130)
-                        Button("配对并同步") {
-                            vm.pairWithRemote(addr: remoteAddrInput, remoteCode: remoteCodeInput)
-                            remoteCodeInput = ""
-                        }
-                        .buttonStyle(.borderedProminent)
-                        .tint(FlomoPalette.accent(scheme))
-                        .disabled(remoteAddrInput.trimmingCharacters(in: .whitespaces).isEmpty || remoteCodeInput.filter(\.isNumber).count != 6)
-                    }
+                    .padding(.top, 8)
                 }
+                .font(.system(size: 12.5))
+                .foregroundColor(FlomoPalette.textSecondary(scheme))
             }
-
-            // Card 3: Already Paired Devices List
-            settingsCard {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack {
-                        Text("已配对设备 (\(vm.pairedPeers.count))")
-                            .font(.system(size: 13.5, weight: .medium))
-                            .foregroundColor(FlomoPalette.textPrimary(scheme))
-                        Spacer()
-                        Button("全部立即同步") { vm.syncNow() }
-                            .disabled(vm.pairedPeers.isEmpty || vm.isSyncing)
-                    }
-
-                    if vm.pairedPeers.isEmpty {
-                        Text("尚未配对任何设备。每台设备都有各自的本机同步码；在这里配对一次后会自动记住对方验证码，后续自动后台同步。")
-                            .font(.system(size: 12))
-                            .foregroundColor(FlomoPalette.textSecondary(scheme))
-                    } else {
-                        ForEach(vm.pairedPeers) { peer in
-                            HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(peer.displayName.isEmpty ? peer.peerId : peer.displayName)
-                                        .font(.system(size: 13, weight: .medium))
-                                        .foregroundColor(FlomoPalette.textPrimary(scheme))
-                                    Text("\(peer.lastAddr) · 对方码 \(formatSixDigit(peer.pairCode ?? ""))")
-                                        .font(.system(size: 11.5, design: .monospaced))
-                                        .foregroundColor(FlomoPalette.textMuted(scheme))
-                                }
-                                Spacer()
-                                Button("移除") {
-                                    vm.removePairedPeer(peer.peerId)
-                                }
-                                .foregroundColor(.red.opacity(0.85))
-                                .buttonStyle(.plain)
-                            }
-                            .padding(8)
-                            .background(RoundedRectangle(cornerRadius: 7).fill(FlomoPalette.canvas(scheme)))
-                        }
-                    }
-                }
-            }
+        }
+        .onAppear {
+            vm.syncNow()
         }
     }
 

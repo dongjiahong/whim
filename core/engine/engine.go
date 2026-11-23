@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -130,14 +131,38 @@ func (e *Engine) ListTodayNotes() ([]model.Note, error) {
 	})
 }
 
-// RegeneratePairCode generates a fresh random 6-digit sync code for THIS device.
-func (e *Engine) RegeneratePairCode() (string, error) {
-	norm := whimsync.GenerateCode()
+// SetPairCode adopts the 6-digit pairing code of your note library (so all devices share one code).
+func (e *Engine) SetPairCode(code string) (string, error) {
+	norm := whimsync.NormalizeCode(code)
+	if len(norm) != 6 {
+		return "", errors.New("配对码必须是 6 位数字")
+	}
 	if err := e.Store.SetMeta(metaPairCode, norm); err != nil {
 		return "", err
 	}
 	e.Peer.SetPairCode(norm)
 	return norm, nil
+}
+
+// RegeneratePairCode generates a fresh random 6-digit sync code for THIS device.
+func (e *Engine) RegeneratePairCode() (string, error) {
+	return e.SetPairCode(whimsync.GenerateCode())
+}
+
+// SetManualPeers persists optional fallback host:port addresses when UDP broadcast is blocked.
+func (e *Engine) SetManualPeers(addrs []string) error {
+	clean := make([]string, 0, len(addrs))
+	for _, a := range addrs {
+		a = strings.TrimSpace(a)
+		if a != "" {
+			clean = append(clean, a)
+		}
+	}
+	b, err := json.Marshal(clean)
+	if err != nil {
+		return err
+	}
+	return e.Store.SetMeta("whim.manual_addrs", string(b))
 }
 
 // DiscoverLAN scans the local network for nearby Whim devices.

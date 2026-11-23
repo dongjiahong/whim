@@ -33,6 +33,9 @@ swiftc -O -parse-as-library \
   -o "$APP/Contents/MacOS/Whim"
 
 cp "$MAC_DIR/Resources/Info.plist" "$APP/Contents/Info.plist"
+if [ -f "$MAC_DIR/Resources/AppIcon.icns" ]; then
+  cp "$MAC_DIR/Resources/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+fi
 if [ -d "$MAC_DIR/Resources/Fonts" ]; then
   cp -R "$MAC_DIR/Resources/Fonts" "$APP/Contents/Resources/Fonts"
 fi

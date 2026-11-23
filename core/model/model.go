@@ -120,14 +120,24 @@ type SyncExchangeResponse struct {
 	WantBlobs   []string     `json:"want_blobs,omitempty"`
 }
 
+// PeerSyncStatus reports the latest sync outcome for one discovered LAN peer.
+type PeerSyncStatus struct {
+	PeerID      string `json:"peer_id"`
+	DisplayName string `json:"display_name"`
+	Addr        string `json:"addr"`
+	Status      string `json:"status"` // "synced" | "wrong_code" | "locked" | "error"
+	Message     string `json:"message,omitempty"`
+}
+
 // SyncSummary summarizes a SyncOnce execution.
 type SyncSummary struct {
-	PeersFound       int      `json:"peers_found"`
-	PeersSynced      int      `json:"peers_synced"`
-	NotesMerged      int      `json:"notes_merged"`
-	BlobsDownloaded  int      `json:"blobs_downloaded"`
-	BlobsUploaded    int      `json:"blobs_uploaded"`
-	Errors           []string `json:"errors,omitempty"`
+	PeersFound      int              `json:"peers_found"`
+	PeersSynced     int              `json:"peers_synced"`
+	NotesMerged     int              `json:"notes_merged"`
+	BlobsDownloaded int              `json:"blobs_downloaded"`
+	BlobsUploaded   int              `json:"blobs_uploaded"`
+	Peers           []PeerSyncStatus `json:"peers,omitempty"`
+	Errors          []string         `json:"errors,omitempty"`
 }
 
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"

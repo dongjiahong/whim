@@ -168,6 +168,15 @@ func WhimGetPairCode() *C.char {
 	return okString(code)
 }
 
+//export WhimSetPairCode
+func WhimSetPairCode(code *C.char) *C.char {
+	updated, err := mobile.SetPairCode(C.GoString(code))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okString(updated)
+}
+
 //export WhimRegeneratePairCode
 func WhimRegeneratePairCode() *C.char {
 	code, err := mobile.RegeneratePairCode()
@@ -175,6 +184,14 @@ func WhimRegeneratePairCode() *C.char {
 		return errJSON(err)
 	}
 	return okString(code)
+}
+
+//export WhimSetManualPeers
+func WhimSetManualPeers(addrsJSON *C.char) *C.char {
+	if err := mobile.SetManualPeers(C.GoString(addrsJSON)); err != nil {
+		return errJSON(err)
+	}
+	return okString("saved")
 }
 
 //export WhimDiscoverLAN

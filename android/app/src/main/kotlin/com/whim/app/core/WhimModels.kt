@@ -48,12 +48,22 @@ data class WhimListFilter(
 )
 
 @Serializable
+data class WhimPeerSyncStatus(
+    @SerialName("peer_id") val peerId: String = "",
+    @SerialName("display_name") val displayName: String = "",
+    val addr: String = "",
+    val status: String = "",
+    val message: String = ""
+)
+
+@Serializable
 data class WhimSyncSummary(
     @SerialName("peers_found") val peersFound: Int = 0,
     @SerialName("peers_synced") val peersSynced: Int = 0,
     @SerialName("notes_merged") val notesMerged: Int = 0,
     @SerialName("blobs_downloaded") val blobsDownloaded: Int = 0,
     @SerialName("blobs_uploaded") val blobsUploaded: Int = 0,
+    val peers: List<WhimPeerSyncStatus> = emptyList(),
     val errors: List<String> = emptyList()
 )
 

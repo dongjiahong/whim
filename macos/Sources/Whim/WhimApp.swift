@@ -20,10 +20,9 @@ final class WhimStoreVM: ObservableObject {
     @Published var activeTab: SidebarTab = .all
     @Published var reviewDate: Date = Calendar.current.startOfDay(for: Date())
     @Published var pairCode: String = ""
-    @Published var syncMessage: String = "局域网对等监听已开启"
+    @Published var syncMessage: String = ""
     @Published var isSyncing: Bool = false
-    @Published var discoveredPeers: [WhimDiscoveredPeer] = []
-    @Published var pairedPeers: [WhimSyncPeer] = []
+    @Published var peerStatuses: [WhimPeerSyncStatus] = []
     @Published var dailyReviewEnabled: Bool = UserDefaults.standard.object(forKey: "whim.review.enabled") as? Bool ?? true
     @Published var reviewHour: Int = UserDefaults.standard.object(forKey: "whim.review.hour") as? Int ?? 21
     @Published var reviewMinute: Int = UserDefaults.standard.object(forKey: "whim.review.minute") as? Int ?? 30
@@ -209,17 +208,20 @@ final class WhimStoreVM: ObservableObject {
     func syncNow() {
         guard !isSyncing else { return }
         isSyncing = true
-        syncMessage = "正在同步..."
+        syncMessage = ""
         DispatchQueue.global(qos: .userInitiated).async {
             let res = try? CoreBridge.shared.syncOnce(timeoutSec: 6)
             DispatchQueue.main.async {
                 self.isSyncing = false
                 if let res {
-                    self.syncMessage = res.peersSynced > 0
-                        ? "已同步 \(res.peersSynced) 台已配对设备 · 合并 \(res.notesMerged) 条"
-                        : (self.pairedPeers.isEmpty ? "尚未配对设备，请在设置 → 局域网同步中添加" : "已配对设备当前不在线")
-                } else {
-                    self.syncMessage = "同步完成"
+                    self.peerStatuses = res.peers ?? []
+                    if res.peersSynced > 0 {
+                        self.syncMessage = "已同步 \(res.peersSynced) 台设备" + (res.notesMerged > 0 ? " · 合并 \(res.notesMerged) 条" : "")
+                    } else if let firstErr = self.peerStatuses.first(where: { $0.status != "synced" }) {
+                        self.syncMessage = firstErr.message
+                    } else {
+                        self.syncMessage = ""
+                    }
                 }
                 self.refreshSyncState()
                 self.reload()
@@ -229,49 +231,31 @@ final class WhimStoreVM: ObservableObject {
 
     func refreshSyncState() {
         pairCode = (try? CoreBridge.shared.getPairCode()) ?? pairCode
-        pairedPeers = (try? CoreBridge.shared.listPairedPeers()) ?? []
     }
 
-    func scanLAN() {
-        syncMessage = "正在扫描同 Wi-Fi 下的 Whim 设备..."
-        DispatchQueue.global(qos: .userInitiated).async {
-            let found = (try? CoreBridge.shared.discoverLAN()) ?? []
-            DispatchQueue.main.async {
-                self.discoveredPeers = found
-                self.pairedPeers = (try? CoreBridge.shared.listPairedPeers()) ?? []
-                self.syncMessage = found.isEmpty ? "暂未发现附近在线设备（也可手动填 IP:8788）" : "发现 \(found.count) 台局域网设备"
-            }
+    func useOtherDeviceCode(_ code: String) {
+        do {
+            let updated = try CoreBridge.shared.setPairCode(code)
+            pairCode = updated
+            syncMessage = "已切换到新配对码，正在自动发现并同步..."
+            syncNow()
+        } catch {
+            syncMessage = error.localizedDescription
         }
     }
 
-    func pairWithRemote(addr: String, remoteCode: String) {
-        syncMessage = "正在验证对方同步码并同步..."
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let res = try CoreBridge.shared.pairAndSync(addr: addr, remoteCode: remoteCode)
-                DispatchQueue.main.async {
-                    self.syncMessage = "配对成功！已合并 \(res.notesMerged) 条笔记"
-                    self.refreshSyncState()
-                    self.reload()
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    self.syncMessage = "配对失败：\(error.localizedDescription)"
-                }
-            }
-        }
-    }
-
-    func removePairedPeer(_ peerId: String) {
-        try? CoreBridge.shared.removePairedPeer(peerId: peerId)
-        refreshSyncState()
-        syncMessage = "已移除该配对设备"
+    func saveManualFallbackAddr(_ addr: String) {
+        let trimmed = addr.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        try? CoreBridge.shared.setManualPeers([trimmed])
+        syncNow()
     }
 
     func regeneratePairCode() {
         if let updated = try? CoreBridge.shared.regeneratePairCode() {
             pairCode = updated
-            syncMessage = "本机同步码已重新生成，已连此 Mac 的设备需用新码重新配对"
+            syncMessage = "已重新生成配对码"
+            syncNow()
         }
     }
 
@@ -759,10 +743,6 @@ struct MainContentView: View {
                         navRow(icon: "archivebox", title: "已归档", active: vm.activeTab == .archived) {
                             vm.activeTab = .archived
                             vm.applyFilter()
-                        }
-                        navRow(icon: "arrow.triangle.2.circlepath", title: "局域网同步", active: false, badge: vm.pairedPeers.isEmpty ? nil : "\(vm.pairedPeers.count)台") {
-                            settingsInitialSection = .sync
-                            showSettingsSheet = true
                         }
                     }
 

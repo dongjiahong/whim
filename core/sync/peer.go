@@ -207,7 +207,8 @@ func (p *Peer) PairAndSync(ctx context.Context, addr, remoteCode string) (model.
 	}, nil
 }
 
-// SyncOnce discovers online LAN peers and syncs with every already-paired peer using each peer's saved code.
+// SyncOnce discovers all online LAN peers via UDP (plus optional manual fallback addrs)
+// and performs bidirectional sync with every discovered peer using the library's 6-digit code.
 func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 	var summary model.SyncSummary
 
@@ -215,40 +216,73 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 	discPort := p.discoveryPort
 	p.mu.Unlock()
 
-	pairedList, err := p.store.ListSyncPeers()
-	if err != nil || len(pairedList) == 0 {
-		return summary
+	code := p.auth.Code()
+	discovered, _ := DiscoverPeers(ctx, discPort, p.peerID, 700*time.Millisecond)
+
+	// Merge optional manual fallback addresses if UDP broadcast is blocked on a network
+	type targetPeer struct {
+		peerID      string
+		displayName string
+		addr        string
+	}
+	byAddr := make(map[string]targetPeer)
+	for _, dp := range discovered {
+		byAddr[dp.Addr] = targetPeer{peerID: dp.PeerID, displayName: dp.DisplayName, addr: dp.Addr}
+	}
+	if rawManual, _ := p.store.GetMeta("whim.manual_addrs"); rawManual != "" {
+		var addrs []string
+		if json.Unmarshal([]byte(rawManual), &addrs) == nil {
+			for _, a := range addrs {
+				a = strings.TrimSpace(a)
+				if a == "" {
+					continue
+				}
+				if !strings.Contains(a, ":") {
+					a = fmt.Sprintf("%s:%d", a, DefaultHTTPPort)
+				}
+				if _, exists := byAddr[a]; !exists {
+					byAddr[a] = targetPeer{displayName: "手动设备", addr: a}
+				}
+			}
+		}
 	}
 
-	// Map fresh LAN addresses by peerID (handles DHCP IP changes automatically)
-	liveAddrByID := make(map[string]string)
-	if discovered, derr := DiscoverPeers(ctx, discPort, p.peerID, 700*time.Millisecond); derr == nil {
-		for _, dp := range discovered {
-			liveAddrByID[dp.PeerID] = dp.Addr
-		}
-	}
-
-	for _, sp := range pairedList {
-		if sp.PairCode == "" {
-			continue
-		}
-		addr := liveAddrByID[sp.PeerID]
-		if addr == "" {
-			addr = sp.LastAddr
-		}
-		if addr == "" {
-			continue
-		}
-		summary.PeersFound++
-		merged, dl, ul, serr := p.SyncWithAddr(ctx, addr, sp.PeerID, sp.PairCode)
+	summary.PeersFound = len(byAddr)
+	for _, t := range byAddr {
+		merged, dl, ul, serr := p.SyncWithAddr(ctx, t.addr, t.peerID, code)
 		if serr != nil {
-			summary.Errors = append(summary.Errors, fmt.Sprintf("%s (%s): %v", sp.DisplayName, addr, serr))
+			errStr := serr.Error()
+			status := "error"
+			msg := errStr
+			switch {
+			case strings.Contains(errStr, "配对码不正确") || strings.Contains(errStr, "unauthorized"):
+				status = "wrong_code"
+				msg = "配对码不对"
+			case strings.Contains(errStr, "locked"):
+				status = "locked"
+				msg = "尝试太多次，稍后再试"
+			}
+			summary.Peers = append(summary.Peers, model.PeerSyncStatus{
+				PeerID:      t.peerID,
+				DisplayName: t.displayName,
+				Addr:        t.addr,
+				Status:      status,
+				Message:     msg,
+			})
+			summary.Errors = append(summary.Errors, fmt.Sprintf("%s: %s", t.addr, msg))
 			continue
 		}
 		summary.PeersSynced++
 		summary.NotesMerged += merged
 		summary.BlobsDownloaded += dl
 		summary.BlobsUploaded += ul
+		summary.Peers = append(summary.Peers, model.PeerSyncStatus{
+			PeerID:      t.peerID,
+			DisplayName: t.displayName,
+			Addr:        t.addr,
+			Status:      "synced",
+			Message:     "已同步",
+		})
 	}
 	return summary
 }

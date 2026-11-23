@@ -214,7 +214,7 @@ func SyncOnce(timeoutSec int) (string, error) {
 	return string(b), err
 }
 
-// GetPairCode returns THIS device's own 6-digit sync code (never overwritten by pairing with other devices).
+// GetPairCode returns the 6-digit pairing code of this library.
 func GetPairCode() (string, error) {
 	e, err := requireEngine()
 	if err != nil {
@@ -223,13 +223,37 @@ func GetPairCode() (string, error) {
 	return e.Peer.PairCode(), nil
 }
 
-// RegeneratePairCode generates a fresh random 6-digit sync code for THIS device.
+// SetPairCode adopts another device's 6-digit pairing code so both devices share the same note library.
+func SetPairCode(code string) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	return e.SetPairCode(code)
+}
+
+// RegeneratePairCode generates a fresh random 6-digit pairing code.
 func RegeneratePairCode() (string, error) {
 	e, err := requireEngine()
 	if err != nil {
 		return "", err
 	}
 	return e.RegeneratePairCode()
+}
+
+// SetManualPeers stores optional fallback host:port addresses when UDP broadcast is blocked.
+func SetManualPeers(addrsJSON string) error {
+	e, err := requireEngine()
+	if err != nil {
+		return err
+	}
+	var addrs []string
+	if addrsJSON != "" {
+		if err := json.Unmarshal([]byte(addrsJSON), &addrs); err != nil {
+			return err
+		}
+	}
+	return e.SetManualPeers(addrs)
 }
 
 // DiscoverLAN scans the local Wi-Fi network and returns JSON array of DiscoveredPeerInfo.

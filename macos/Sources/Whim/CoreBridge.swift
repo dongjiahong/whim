@@ -58,12 +58,28 @@ struct WhimTagNode: Codable, Identifiable, Equatable {
     }
 }
 
+struct WhimPeerSyncStatus: Codable, Identifiable, Equatable {
+    var id: String { addr.isEmpty ? peerId : addr }
+    let peerId: String
+    let displayName: String
+    let addr: String
+    let status: String // "synced" | "wrong_code" | "locked" | "error"
+    let message: String
+
+    enum CodingKeys: String, CodingKey {
+        case peerId = "peer_id"
+        case displayName = "display_name"
+        case addr, status, message
+    }
+}
+
 struct WhimSyncSummary: Codable {
     let peersFound: Int
     let peersSynced: Int
     let notesMerged: Int
     let blobsDownloaded: Int
     let blobsUploaded: Int
+    let peers: [WhimPeerSyncStatus]?
     let errors: [String]?
 
     enum CodingKeys: String, CodingKey {
@@ -72,7 +88,7 @@ struct WhimSyncSummary: Codable {
         case notesMerged = "notes_merged"
         case blobsDownloaded = "blobs_downloaded"
         case blobsUploaded = "blobs_uploaded"
-        case errors
+        case peers, errors
     }
 }
 
@@ -276,8 +292,22 @@ final class CoreBridge {
         try decodeCString(WhimGetPairCode(), as: String.self)
     }
 
+    func setPairCode(_ code: String) throws -> String {
+        try code.withCString { cCode in
+            try decodeCString(WhimSetPairCode(UnsafeMutablePointer(mutating: cCode)), as: String.self)
+        }
+    }
+
     func regeneratePairCode() throws -> String {
         try decodeCString(WhimRegeneratePairCode(), as: String.self)
+    }
+
+    func setManualPeers(_ addrs: [String]) throws {
+        let data = try encoder.encode(addrs)
+        let str = String(data: data, encoding: .utf8) ?? "[]"
+        _ = try str.withCString { cAddrs in
+            try decodeCString(WhimSetManualPeers(UnsafeMutablePointer(mutating: cAddrs)), as: String.self)
+        }
     }
 
     func discoverLAN() throws -> [WhimDiscoveredPeer] {

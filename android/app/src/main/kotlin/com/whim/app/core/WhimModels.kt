@@ -1,8 +1,10 @@
 package com.whim.app.core
 
+import androidx.compose.runtime.Immutable
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 
+@Immutable
 @Serializable
 data class WhimAttachment(
     val id: String = "",
@@ -18,6 +20,7 @@ data class WhimAttachment(
     @SerialName("local_path") val localPath: String = ""
 )
 
+@Immutable
 @Serializable
 data class WhimNote(
     val id: String,
@@ -31,6 +34,7 @@ data class WhimNote(
     @SerialName("updated_at") val updatedAt: Long = 0
 )
 
+@Immutable
 @Serializable
 data class WhimTagNode(
     val name: String,
@@ -39,6 +43,7 @@ data class WhimTagNode(
     val children: List<WhimTagNode> = emptyList()
 )
 
+@Immutable
 @Serializable
 data class WhimNoteCursor(
     val pinned: Boolean = false,
@@ -46,6 +51,7 @@ data class WhimNoteCursor(
     val id: String = ""
 )
 
+@Immutable
 @Serializable
 data class WhimNotePage(
     val notes: List<WhimNote> = emptyList(),
@@ -53,6 +59,7 @@ data class WhimNotePage(
     @SerialName("next_cursor") val nextCursor: WhimNoteCursor? = null
 )
 
+@Immutable
 @Serializable
 data class WhimStats(
     @SerialName("total_notes") val totalNotes: Int = 0,
@@ -61,6 +68,7 @@ data class WhimStats(
     @SerialName("daily_counts") val dailyCounts: Map<String, Int> = emptyMap()
 )
 
+@Immutable
 @Serializable
 data class WhimListFilter(
     val query: String = "",
@@ -73,6 +81,7 @@ data class WhimListFilter(
     val cursor: WhimNoteCursor? = null
 )
 
+@Immutable
 @Serializable
 data class WhimPeerSyncStatus(
     @SerialName("peer_id") val peerId: String = "",
@@ -82,6 +91,7 @@ data class WhimPeerSyncStatus(
     val message: String = ""
 )
 
+@Immutable
 @Serializable
 data class WhimSyncSummary(
     @SerialName("peers_found") val peersFound: Int = 0,
@@ -93,6 +103,7 @@ data class WhimSyncSummary(
     val errors: List<String> = emptyList()
 )
 
+@Immutable
 @Serializable
 data class WhimSyncPeer(
     @SerialName("peer_id") val peerId: String,
@@ -103,6 +114,7 @@ data class WhimSyncPeer(
     @SerialName("last_sync_at") val lastSyncAt: Long = 0
 )
 
+@Immutable
 @Serializable
 data class WhimDiscoveredPeer(
     @SerialName("peer_id") val peerId: String,
@@ -111,6 +123,7 @@ data class WhimDiscoveredPeer(
     val paired: Boolean = false
 )
 
+@Immutable
 @Serializable
 data class SavedBlob(
     val sha256: String,

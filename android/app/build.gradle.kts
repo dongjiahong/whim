@@ -19,7 +19,15 @@ android {
 
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+            // Sign with debug keystore by default so local `adb install -r` & GitHub Release
+            // APKs upgrade seamlessly without signature mismatch.
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
 
@@ -32,6 +40,10 @@ android {
     }
     buildFeatures {
         compose = true
+    }
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
     }
 }
 

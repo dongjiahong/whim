@@ -9,8 +9,8 @@ APP="$ROOT_DIR/dist/Whim.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-echo "==> Building macOS SwiftUI app via swiftc..."
-swiftc -O -parse-as-library \
+echo "==> Building macOS SwiftUI app (Release WMO) via swiftc..."
+swiftc -O -whole-module-optimization -parse-as-library \
   -target arm64-apple-macosx14.0 \
   -I "$MAC_DIR/Sources/CWhimCore" \
   -L "$MAC_DIR/Sources/CWhimCore" \

@@ -7,10 +7,14 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Bundle
+import android.util.LruCache
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -35,7 +39,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -50,6 +53,7 @@ import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.GridView
+import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.MoreHoriz
 import androidx.compose.material.icons.rounded.Search
@@ -58,19 +62,24 @@ import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material3.DrawerValue
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
+import androidx.compose.material3.pulltorefresh.PullToRefreshBox
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -79,6 +88,7 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
@@ -95,8 +105,11 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.size.Precision
 import com.whim.app.capture.QuickCaptureActivity
 import com.whim.app.capture.WhimWidgetProvider
+import com.whim.app.core.WhimAttachment
 import com.whim.app.core.WhimCoreBridge
 import com.whim.app.core.WhimListFilter
 import com.whim.app.core.WhimNote
@@ -111,10 +124,14 @@ import com.whim.app.update.GitHubUpdater
 import com.whim.app.update.ReleaseInfo
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
@@ -224,6 +241,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FlomoMobileApp(
     initialReviewMode: Boolean,
@@ -239,6 +257,8 @@ private fun FlomoMobileApp(
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val listState = rememberLazyListState()
     var previousTopNoteId by remember { mutableStateOf<String?>(null) }
+    var isPullRefreshing by remember { mutableStateOf(false) }
+    val showScrollToTop by remember { derivedStateOf { listState.firstVisibleItemIndex >= 4 } }
 
     var activeTab by remember { mutableStateOf<MobileTab>(if (initialReviewMode) MobileTab.Review else MobileTab.All) }
     var reviewOffsetDays by remember { mutableStateOf(0) }
@@ -392,6 +412,21 @@ private fun FlomoMobileApp(
             delay(180L)
         }
         loadFirstPage()
+        if (listState.firstVisibleItemIndex > 0) {
+            listState.scrollToItem(0)
+        }
+    }
+
+    // Single snapshotFlow observer for pagination instead of per-item LaunchedEffect
+    LaunchedEffect(listState, hasMore, isLoadingMore, displayedNotes.size) {
+        if (!hasMore || isLoadingMore || displayedNotes.isEmpty()) return@LaunchedEffect
+        snapshotFlow { listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1 }
+            .distinctUntilChanged()
+            .collect { lastVisible ->
+                if (lastVisible >= displayedNotes.size - 6 && hasMore && !isLoadingMore) {
+                    loadMore()
+                }
+            }
     }
 
     // Auto-scroll to top when a newly synced note arrives at index 0
@@ -909,101 +944,119 @@ private fun FlomoMobileApp(
                     }
                 }
 
-                // Flomo Note Card Feed
-                LazyColumn(
-                    state = listState,
-                    modifier = Modifier.fillMaxSize(),
-                    contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
-                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                // Flomo Note Card Feed with Pull-to-Refresh LAN sync
+                PullToRefreshBox(
+                    isRefreshing = isPullRefreshing,
+                    onRefresh = {
+                        scope.launch {
+                            isPullRefreshing = true
+                            runCatching {
+                                val res = WhimCoreBridge.syncOnce(timeoutSec = 4)
+                                peerStatuses = res.peers
+                            }
+                            refreshMetadata()
+                            loadFirstPage()
+                            WhimWidgetProvider.refreshAll(context)
+                            isPullRefreshing = false
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize()
                 ) {
-                    if (displayedNotes.isEmpty()) {
-                        item {
-                            Column(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(top = 80.dp),
-                                horizontalAlignment = Alignment.CenterHorizontally,
-                                verticalArrangement = Arrangement.spacedBy(10.dp)
-                            ) {
-                                Text(
-                                    if (searchQuery.isEmpty()) "暂无笔记，点击右下角记下第一个想法" else "未找到匹配“$searchQuery”的笔记",
-                                    style = t.body,
-                                    color = c.textMuted
-                                )
-                                if (searchQuery.isNotEmpty()) {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        if (displayedNotes.isEmpty()) {
+                            item(key = "__empty__", contentType = "empty") {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(top = 80.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
                                     Text(
-                                        "清除搜索",
-                                        style = t.meta,
-                                        color = c.tagText,
-                                        modifier = Modifier.clickable { searchQuery = "" }
+                                        if (searchQuery.isEmpty()) "暂无笔记，点击右下角记下第一个想法" else "未找到匹配“$searchQuery”的笔记",
+                                        style = t.body,
+                                        color = c.textMuted
                                     )
+                                    if (searchQuery.isNotEmpty()) {
+                                        Text(
+                                            "清除搜索",
+                                            style = t.meta,
+                                            color = c.tagText,
+                                            modifier = Modifier.clickable { searchQuery = "" }
+                                        )
+                                    }
                                 }
                             }
-                        }
-                    } else {
-                        itemsIndexed(displayedNotes, key = { _, note -> note.id }) { idx, note ->
-                            LaunchedEffect(idx, displayedNotes.size, hasMore) {
-                                if (idx >= displayedNotes.size - 5 && hasMore && !isLoadingMore) {
-                                    loadMore()
-                                }
-                            }
-                            FlomoMobileNoteCard(
-                                note = note,
-                                onTapTag = { path -> activeTab = MobileTab.Tag(path) },
-                                onTapImage = { path -> previewImagePath = path },
-                                onEdit = { onEditNote(note) },
-                                onTogglePin = {
-                                    scope.launch {
-                                        WhimCoreBridge.updateNote(note.id, pinned = !note.pinned)
-                                        reload()
-                                        runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
-                                        SyncWorker.enqueueImmediate(context)
-                                    }
-                                },
-                                onToggleArchive = {
-                                    scope.launch {
-                                        WhimCoreBridge.updateNote(note.id, archived = !note.archived)
-                                        reload()
-                                        runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
-                                        SyncWorker.enqueueImmediate(context)
-                                    }
-                                },
-                                onCopy = {
-                                    val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                                    cm.setPrimaryClip(ClipData.newPlainText("whim", note.content))
-                                },
-                                onDelete = {
-                                    scope.launch {
-                                        WhimCoreBridge.updateNote(note.id, deleted = true)
-                                        reload()
-                                        lastDeletedNoteId = note.id
-                                        undoDismissJob?.cancel()
-                                        undoDismissJob = scope.launch {
-                                            delay(6000L)
-                                            lastDeletedNoteId = null
+                        } else {
+                            items(
+                                items = displayedNotes,
+                                key = { it.id },
+                                contentType = { "note_card" }
+                            ) { note ->
+                                FlomoMobileNoteCard(
+                                    note = note,
+                                    modifier = Modifier.animateItem(),
+                                    onTapTag = { path -> activeTab = MobileTab.Tag(path) },
+                                    onTapImage = { path -> previewImagePath = path },
+                                    onEdit = { onEditNote(note) },
+                                    onTogglePin = {
+                                        scope.launch {
+                                            WhimCoreBridge.updateNote(note.id, pinned = !note.pinned)
+                                            reload()
+                                            runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
+                                            SyncWorker.enqueueImmediate(context)
                                         }
-                                        runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
-                                        SyncWorker.enqueueImmediate(context)
+                                    },
+                                    onToggleArchive = {
+                                        scope.launch {
+                                            WhimCoreBridge.updateNote(note.id, archived = !note.archived)
+                                            reload()
+                                            runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
+                                            SyncWorker.enqueueImmediate(context)
+                                        }
+                                    },
+                                    onCopy = {
+                                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                                        cm.setPrimaryClip(ClipData.newPlainText("whim", note.content))
+                                    },
+                                    onDelete = {
+                                        scope.launch {
+                                            WhimCoreBridge.updateNote(note.id, deleted = true)
+                                            reload()
+                                            lastDeletedNoteId = note.id
+                                            undoDismissJob?.cancel()
+                                            undoDismissJob = scope.launch {
+                                                delay(6000L)
+                                                lastDeletedNoteId = null
+                                            }
+                                            runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
+                                            SyncWorker.enqueueImmediate(context)
+                                        }
                                     }
-                                }
-                            )
-                        }
-                        item(key = "__footer__") {
-                            Box(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 12.dp),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                when {
-                                    isLoadingMore -> Text("正在加载更多...", style = t.meta, color = c.textMuted)
-                                    hasMore -> Text(
-                                        "加载更多",
-                                        style = t.meta,
-                                        color = c.tagText,
-                                        modifier = Modifier.clickable { loadMore() }
-                                    )
-                                    displayedNotes.size >= 20 -> Text("已加载全部 ${displayedNotes.size} 条", style = t.meta, color = c.textMuted)
+                                )
+                            }
+                            item(key = "__footer__", contentType = "footer") {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(vertical = 12.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    when {
+                                        isLoadingMore -> Text("正在加载更多...", style = t.meta, color = c.textMuted)
+                                        hasMore -> Text(
+                                            "加载更多",
+                                            style = t.meta,
+                                            color = c.tagText,
+                                            modifier = Modifier.clickable { loadMore() }
+                                        )
+                                        displayedNotes.size >= 20 -> Text("已加载全部 ${displayedNotes.size} 条", style = t.meta, color = c.textMuted)
+                                    }
                                 }
                             }
                         }
@@ -1044,18 +1097,47 @@ private fun FlomoMobileApp(
                 }
             }
 
-            // Sage-green floating capture button (flomo mobile style)
-            Box(
+            // Floating action column: scroll-to-top + sage-green capture FAB
+            Column(
                 modifier = Modifier
                     .align(Alignment.BottomEnd)
-                    .padding(end = 20.dp, bottom = 28.dp)
-                    .size(54.dp)
-                    .clip(CircleShape)
-                    .background(c.accent)
-                    .clickable(onClick = onOpenQuickCapture),
-                contentAlignment = Alignment.Center
+                    .padding(end = 20.dp, bottom = 28.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Icon(Icons.Rounded.Add, contentDescription = "新建笔记", tint = Color.White, modifier = Modifier.size(26.dp))
+                AnimatedVisibility(
+                    visible = showScrollToTop,
+                    enter = fadeIn(),
+                    exit = fadeOut()
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(CircleShape)
+                            .background(c.card)
+                            .border(1.dp, c.border, CircleShape)
+                            .clickable { scope.launch { listState.animateScrollToItem(0) } },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            Icons.Rounded.KeyboardArrowUp,
+                            contentDescription = "回到顶部",
+                            tint = c.textSecondary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .size(54.dp)
+                        .clip(CircleShape)
+                        .background(c.accent)
+                        .clickable(onClick = onOpenQuickCapture),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Rounded.Add, contentDescription = "新建笔记", tint = Color.White, modifier = Modifier.size(26.dp))
+                }
             }
         }
     }
@@ -1217,10 +1299,282 @@ private fun DrawerTagTree(
     }
 }
 
+private val cardTimeFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
+@Immutable
+private sealed class MobileMdChunk {
+    data class RichText(val text: AnnotatedString) : MobileMdChunk()
+    data class CodeBlock(val lang: String, val code: String) : MobileMdChunk()
+}
+
+@Immutable
+private sealed class MobileCardBlock {
+    data class TextBlock(val chunks: List<MobileMdChunk>) : MobileCardBlock()
+    data class ImageBlock(val path: String) : MobileCardBlock()
+}
+
+@Immutable
+private data class ParsedMobileCard(
+    val timeStr: String,
+    val isLong: Boolean,
+    val blocks: List<MobileCardBlock>,
+    val trailing: List<WhimAttachment>
+)
+
+private object MobileCardParseCache {
+    private val cache = LruCache<String, ParsedMobileCard>(320)
+
+    fun getOrParse(
+        note: WhimNote,
+        collapsed: Boolean,
+        primary: Color,
+        secondary: Color,
+        muted: Color,
+        accent: Color,
+        codeBg: Color,
+        codeFg: Color
+    ): ParsedMobileCard {
+        val key = "${note.id}:${note.updatedAt}:${if (collapsed) 1 else 0}:${primary.value}:${note.attachments.size}"
+        cache.get(key)?.let { return it }
+        val parsed = parse(note, collapsed, primary, secondary, muted, accent, codeBg, codeFg)
+        cache.put(key, parsed)
+        return parsed
+    }
+
+    private fun parse(
+        note: WhimNote,
+        collapsed: Boolean,
+        primary: Color,
+        secondary: Color,
+        muted: Color,
+        accent: Color,
+        codeBg: Color,
+        codeFg: Color
+    ): ParsedMobileCard {
+        val timeStr = Instant.ofEpochMilli(note.createdAt)
+            .atZone(ZoneId.systemDefault())
+            .format(cardTimeFormatter)
+        val lineCount = note.content.count { it == '\n' } + 1
+        val isLong = note.content.length > 220 || lineCount > 6
+
+        val tagSet = note.tags.map { it.trim() }.toSet()
+        val stripped = if (tagSet.isEmpty()) {
+            note.content
+        } else {
+            mobileTagStripRegex.replace(note.content) { m ->
+                val rawTag = m.groupValues[2]
+                val normalized = rawTag.split("/")
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .joinToString("/")
+                if (normalized in tagSet) m.groupValues[1] else m.value
+            }
+        }
+        val displayBody = stripped.lines()
+            .map { line -> if (line.isBlank()) "" else line.trimEnd() }
+            .dropWhile { it.isEmpty() }
+            .dropLastWhile { it.isEmpty() }
+            .joinToString("\n")
+
+        val pathByHash = note.attachments.associate { it.sha256 to it.localPath }
+        val blocks = mutableListOf<MobileCardBlock>()
+        val referenced = HashSet<String>()
+        var cursor = 0
+
+        for (m in mobileBlobRegex.findAll(displayBody)) {
+            if (m.range.first > cursor) {
+                val seg = displayBody.substring(cursor, m.range.first).trim('\n')
+                if (seg.isNotBlank()) {
+                    blocks.add(
+                        MobileCardBlock.TextBlock(
+                            parseMarkdownChunks(seg, collapsed && isLong, primary, secondary, muted, accent, codeBg, codeFg)
+                        )
+                    )
+                }
+            }
+            val hash = m.groupValues[1]
+            referenced.add(hash)
+            val path = pathByHash[hash].orEmpty()
+            if (path.isNotEmpty()) {
+                blocks.add(MobileCardBlock.ImageBlock(path))
+            }
+            cursor = m.range.last + 1
+        }
+        if (cursor < displayBody.length) {
+            val tail = displayBody.substring(cursor).trim('\n')
+            if (tail.isNotBlank()) {
+                blocks.add(
+                    MobileCardBlock.TextBlock(
+                        parseMarkdownChunks(tail, collapsed && isLong, primary, secondary, muted, accent, codeBg, codeFg)
+                    )
+                )
+            }
+        }
+
+        val trailing = note.attachments.filter { it.sha256 !in referenced && it.localPath.isNotEmpty() }
+        return ParsedMobileCard(timeStr = timeStr, isLong = isLong, blocks = blocks, trailing = trailing)
+    }
+
+    private fun parseMarkdownChunks(
+        text: String,
+        collapsed: Boolean,
+        primary: Color,
+        secondary: Color,
+        muted: Color,
+        accent: Color,
+        codeBg: Color,
+        codeFg: Color
+    ): List<MobileMdChunk> {
+        val raw = text.lines()
+        val effective = if (collapsed) raw.take(6) else raw
+        val out = ArrayList<MobileMdChunk>(2)
+        var inCode = false
+        var codeLang = ""
+        val codeBuf = mutableListOf<String>()
+
+        var textBuilder = AnnotatedString.Builder()
+        var hasText = false
+
+        fun flushText() {
+            if (hasText) {
+                out.add(MobileMdChunk.RichText(textBuilder.toAnnotatedString()))
+                textBuilder = AnnotatedString.Builder()
+                hasText = false
+            }
+        }
+
+        fun startNewLine() {
+            if (hasText) textBuilder.append('\n')
+            hasText = true
+        }
+
+        for (line in effective) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith("```")) {
+                if (!inCode) {
+                    flushText()
+                    inCode = true
+                    codeLang = trimmed.drop(3).trim()
+                    codeBuf.clear()
+                } else {
+                    out.add(MobileMdChunk.CodeBlock(codeLang, codeBuf.joinToString("\n")))
+                    inCode = false
+                    codeLang = ""
+                    codeBuf.clear()
+                }
+                continue
+            }
+            if (inCode) {
+                codeBuf.add(line)
+                continue
+            }
+
+            var spaces = 0
+            for (ch in line) {
+                if (ch == ' ') spaces++ else if (ch == '\t') spaces += 2 else break
+            }
+            val level = (spaces / 2).coerceAtMost(6)
+            val indentStr = if (level > 0) "    ".repeat(level) else ""
+            val bulletGlyph = when (level % 3) {
+                0 -> "•"
+                1 -> "◦"
+                else -> "▪"
+            }
+
+            startNewLine()
+            when {
+                trimmed.isEmpty() -> Unit
+                trimmed == "---" || trimmed == "***" || trimmed == "___" -> {
+                    textBuilder.withStyle(SpanStyle(color = muted.copy(alpha = 0.5f), fontSize = 12.sp)) {
+                        append("────────────────────────")
+                    }
+                }
+                trimmed.startsWith("#### ") -> {
+                    textBuilder.withStyle(SpanStyle(color = primary, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold)) {
+                        appendInlineMarkdown(trimmed.drop(5), codeBg, codeFg)
+                    }
+                }
+                trimmed.startsWith("### ") -> {
+                    textBuilder.withStyle(SpanStyle(color = primary, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)) {
+                        appendInlineMarkdown(trimmed.drop(4), codeBg, codeFg)
+                    }
+                }
+                trimmed.startsWith("## ") -> {
+                    textBuilder.withStyle(SpanStyle(color = primary, fontSize = 17.sp, fontWeight = FontWeight.Bold)) {
+                        appendInlineMarkdown(trimmed.drop(3), codeBg, codeFg)
+                    }
+                }
+                trimmed.startsWith("# ") -> {
+                    textBuilder.withStyle(SpanStyle(color = primary, fontSize = 18.5.sp, fontWeight = FontWeight.Bold)) {
+                        appendInlineMarkdown(trimmed.drop(2), codeBg, codeFg)
+                    }
+                }
+                trimmed.startsWith("- [ ] ") || trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ") -> {
+                    val done = !trimmed.startsWith("- [ ] ")
+                    if (indentStr.isNotEmpty()) textBuilder.append(indentStr)
+                    textBuilder.withStyle(SpanStyle(color = if (done) accent else muted)) {
+                        append(if (done) "☑ " else "☐ ")
+                    }
+                    textBuilder.withStyle(
+                        SpanStyle(
+                            color = if (done) secondary else primary,
+                            textDecoration = if (done) TextDecoration.LineThrough else TextDecoration.None
+                        )
+                    ) {
+                        appendInlineMarkdown(trimmed.drop(6), codeBg, codeFg)
+                    }
+                }
+                trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
+                    if (indentStr.isNotEmpty()) textBuilder.append(indentStr)
+                    textBuilder.withStyle(SpanStyle(color = secondary, fontWeight = FontWeight.Bold)) {
+                        append("$bulletGlyph ")
+                    }
+                    textBuilder.withStyle(SpanStyle(color = primary)) {
+                        appendInlineMarkdown(trimmed.drop(2), codeBg, codeFg)
+                    }
+                }
+                trimmed.startsWith("> ") -> {
+                    if (indentStr.isNotEmpty()) textBuilder.append(indentStr)
+                    textBuilder.withStyle(SpanStyle(color = accent.copy(alpha = 0.8f), fontWeight = FontWeight.SemiBold)) {
+                        append("▎ ")
+                    }
+                    textBuilder.withStyle(SpanStyle(color = secondary)) {
+                        appendInlineMarkdown(trimmed.drop(2), codeBg, codeFg)
+                    }
+                }
+                else -> {
+                    val orderedMatch = mobileOrderedListRegex.matchEntire(trimmed)
+                    if (orderedMatch != null) {
+                        if (indentStr.isNotEmpty()) textBuilder.append(indentStr)
+                        textBuilder.withStyle(SpanStyle(color = secondary)) {
+                            append("${orderedMatch.groupValues[1]}. ")
+                        }
+                        textBuilder.withStyle(SpanStyle(color = primary)) {
+                            appendInlineMarkdown(orderedMatch.groupValues[2], codeBg, codeFg)
+                        }
+                    } else {
+                        if (indentStr.isNotEmpty()) textBuilder.append(indentStr)
+                        textBuilder.withStyle(SpanStyle(color = primary)) {
+                            appendInlineMarkdown(trimmed, codeBg, codeFg)
+                        }
+                    }
+                }
+            }
+        }
+        if (inCode && codeBuf.isNotEmpty()) {
+            out.add(MobileMdChunk.CodeBlock(codeLang, codeBuf.joinToString("\n")))
+        } else {
+            flushText()
+        }
+        return out
+    }
+}
+
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun FlomoMobileNoteCard(
     note: WhimNote,
+    modifier: Modifier = Modifier,
     onTapTag: (String) -> Unit,
     onTapImage: (String) -> Unit,
     onEdit: () -> Unit,
@@ -1231,16 +1585,25 @@ private fun FlomoMobileNoteCard(
 ) {
     val c = WhimTheme.colors
     val t = WhimTheme.typography
+    val context = LocalContext.current
     var menuExpanded by remember { mutableStateOf(false) }
-    var textExpanded by remember { mutableStateOf(false) }
-    val isLong = note.content.length > 220 || note.content.lines().size > 6
+    var textExpanded by remember(note.id) { mutableStateOf(false) }
 
-    val timeStr = remember(note.createdAt) {
-        SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault()).format(Date(note.createdAt))
+    val parsed = remember(note.id, note.updatedAt, textExpanded, c.textPrimary) {
+        MobileCardParseCache.getOrParse(
+            note = note,
+            collapsed = !textExpanded,
+            primary = c.textPrimary,
+            secondary = c.textSecondary,
+            muted = c.textMuted,
+            accent = c.accent,
+            codeBg = c.tagBg,
+            codeFg = c.tagText
+        )
     }
 
     Column(
-        modifier = Modifier
+        modifier = modifier
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
             .background(c.card)
@@ -1253,7 +1616,7 @@ private fun FlomoMobileNoteCard(
             verticalAlignment = Alignment.CenterVertically
         ) {
             Text(
-                text = if (note.pinned) "置顶 · $timeStr" else timeStr,
+                text = if (note.pinned) "置顶 · ${parsed.timeStr}" else parsed.timeStr,
                 style = t.meta,
                 color = c.textSecondary
             )
@@ -1310,63 +1673,34 @@ private fun FlomoMobileNoteCard(
             }
         }
 
-        val displayBody = remember(note.content, note.tags) {
-            val tagSet = note.tags.map { it.trim() }.toSet()
-            val stripped = if (tagSet.isEmpty()) {
-                note.content
-            } else {
-                mobileTagStripRegex.replace(note.content) { m ->
-                    val rawTag = m.groupValues[2]
-                    val normalized = rawTag.split("/")
-                        .map { it.trim() }
-                        .filter { it.isNotEmpty() }
-                        .joinToString("/")
-                    if (normalized in tagSet) m.groupValues[1] else m.value
+        parsed.blocks.forEach { block ->
+            when (block) {
+                is MobileCardBlock.TextBlock -> MobileMarkdownChunksView(chunks = block.chunks)
+                is MobileCardBlock.ImageBlock -> {
+                    val req = remember(block.path) {
+                        ImageRequest.Builder(context)
+                            .data(File(block.path))
+                            .size(960, 960)
+                            .precision(Precision.INEXACT)
+                            .crossfade(160)
+                            .build()
+                    }
+                    AsyncImage(
+                        model = req,
+                        contentDescription = "内联图片",
+                        contentScale = ContentScale.FillWidth,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(min = 120.dp, max = 280.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.canvas)
+                            .clickable { onTapImage(block.path) }
+                    )
                 }
-            }
-            stripped.lines()
-                .map { line -> if (line.isBlank()) "" else line.trimEnd() }
-                .dropWhile { it.isEmpty() }
-                .dropLastWhile { it.isEmpty() }
-                .joinToString("\n")
-        }
-        val pathByHash = remember(note.attachments) { note.attachments.associate { it.sha256 to it.localPath } }
-        val matches = remember(displayBody) { mobileBlobRegex.findAll(displayBody).toList() }
-        var cursor = 0
-        val referenced = mutableSetOf<String>()
-
-        matches.forEach { m ->
-            if (m.range.first > cursor) {
-                val seg = displayBody.substring(cursor, m.range.first).trim('\n')
-                if (seg.isNotBlank()) {
-                    MobileMarkdownBlock(text = seg, collapsed = !textExpanded && isLong)
-                }
-            }
-            val hash = m.groupValues[1]
-            referenced.add(hash)
-            val path = pathByHash[hash].orEmpty()
-            if (path.isNotEmpty()) {
-                AsyncImage(
-                    model = File(path),
-                    contentDescription = "内联图片",
-                    contentScale = ContentScale.FillWidth,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(max = 280.dp)
-                        .clip(RoundedCornerShape(8.dp))
-                        .clickable { onTapImage(path) }
-                )
-            }
-            cursor = m.range.last + 1
-        }
-        if (cursor < displayBody.length) {
-            val tail = displayBody.substring(cursor).trim('\n')
-            if (tail.isNotBlank()) {
-                MobileMarkdownBlock(text = tail, collapsed = !textExpanded && isLong)
             }
         }
 
-        if (isLong) {
+        if (parsed.isLong) {
             Text(
                 text = if (textExpanded) "收起" else "展开",
                 style = t.meta,
@@ -1375,17 +1709,25 @@ private fun FlomoMobileNoteCard(
             )
         }
 
-        val trailing = note.attachments.filter { it.sha256 !in referenced && it.localPath.isNotEmpty() }
-        if (trailing.isNotEmpty()) {
+        if (parsed.trailing.isNotEmpty()) {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                items(trailing) { att ->
+                items(parsed.trailing, key = { it.sha256 }) { att ->
+                    val req = remember(att.localPath) {
+                        ImageRequest.Builder(context)
+                            .data(File(att.localPath))
+                            .size(320, 320)
+                            .precision(Precision.INEXACT)
+                            .crossfade(160)
+                            .build()
+                    }
                     AsyncImage(
-                        model = File(att.localPath),
+                        model = req,
                         contentDescription = "图片附件",
                         contentScale = ContentScale.Crop,
                         modifier = Modifier
                             .size(104.dp)
                             .clip(RoundedCornerShape(8.dp))
+                            .background(c.canvas)
                             .clickable { onTapImage(att.localPath) }
                     )
                 }
@@ -1394,49 +1736,22 @@ private fun FlomoMobileNoteCard(
     }
 }
 
-private sealed class MobileMdSegment {
-    data class Line(val text: String) : MobileMdSegment()
-    data class CodeBlock(val lang: String, val code: String) : MobileMdSegment()
-}
-
 @Composable
-private fun MobileMarkdownBlock(text: String, collapsed: Boolean) {
+private fun MobileMarkdownChunksView(chunks: List<MobileMdChunk>) {
     val c = WhimTheme.colors
     val t = WhimTheme.typography
-    val segments = remember(text, collapsed) {
-        val raw = text.lines()
-        val effective = if (collapsed) raw.take(6) else raw
-        val out = mutableListOf<MobileMdSegment>()
-        var inCode = false
-        var codeLang = ""
-        val buf = mutableListOf<String>()
-        for (line in effective) {
-            val trimmed = line.trim()
-            if (trimmed.startsWith("```")) {
-                if (!inCode) {
-                    inCode = true
-                    codeLang = trimmed.drop(3).trim()
-                    buf.clear()
-                } else {
-                    out.add(MobileMdSegment.CodeBlock(codeLang, buf.joinToString("\n")))
-                    inCode = false
-                    codeLang = ""
-                    buf.clear()
-                }
-                continue
-            }
-            if (inCode) buf.add(line) else out.add(MobileMdSegment.Line(line))
-        }
-        if (inCode && buf.isNotEmpty()) {
-            out.add(MobileMdSegment.CodeBlock(codeLang, buf.joinToString("\n")))
-        }
-        out
-    }
 
-    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        segments.forEach { seg ->
-            when (seg) {
-                is MobileMdSegment.CodeBlock -> {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        chunks.forEach { chunk ->
+            when (chunk) {
+                is MobileMdChunk.RichText -> {
+                    Text(
+                        text = chunk.text,
+                        style = t.body,
+                        color = c.textPrimary
+                    )
+                }
+                is MobileMdChunk.CodeBlock -> {
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1446,97 +1761,15 @@ private fun MobileMarkdownBlock(text: String, collapsed: Boolean) {
                             .padding(horizontal = 10.dp, vertical = 8.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp)
                     ) {
-                        if (seg.lang.isNotEmpty()) {
-                            Text(seg.lang, fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = c.textMuted)
+                        if (chunk.lang.isNotEmpty()) {
+                            Text(chunk.lang, fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = c.textMuted)
                         }
                         Text(
-                            text = seg.code,
+                            text = chunk.code,
                             fontSize = 12.5.sp,
                             fontFamily = FontFamily.Monospace,
                             color = c.textPrimary,
                             modifier = Modifier.horizontalScroll(rememberScrollState())
-                        )
-                    }
-                }
-                is MobileMdSegment.Line -> {
-                    val line = seg.text
-                    var spaces = 0
-                    for (ch in line) {
-                        if (ch == ' ') spaces++ else if (ch == '\t') spaces += 2 else break
-                    }
-                    val level = (spaces / 2).coerceAtMost(6)
-                    val indentDp = (level * 18).dp
-                    val trimmed = line.trim()
-                    val bulletGlyph = when (level % 3) {
-                        0 -> "•"
-                        1 -> "◦"
-                        else -> "▪"
-                    }
-
-                    when {
-                        trimmed.isEmpty() -> Spacer(Modifier.height(4.dp))
-                        trimmed == "---" || trimmed == "***" || trimmed == "___" -> Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(vertical = 4.dp)
-                                .height(1.dp)
-                                .background(c.border)
-                        )
-                        trimmed.startsWith("#### ") -> Text(
-                            text = parseInlineMarkdown(trimmed.drop(5), c.tagBg, c.tagText),
-                            style = t.body.copy(fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold),
-                            color = c.textPrimary
-                        )
-                        trimmed.startsWith("### ") -> Text(
-                            text = parseInlineMarkdown(trimmed.drop(4), c.tagBg, c.tagText),
-                            style = t.body.copy(fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold),
-                            color = c.textPrimary
-                        )
-                        trimmed.startsWith("## ") -> Text(
-                            text = parseInlineMarkdown(trimmed.drop(3), c.tagBg, c.tagText),
-                            style = t.body.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold),
-                            color = c.textPrimary
-                        )
-                        trimmed.startsWith("# ") -> Text(
-                            text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText),
-                            style = t.body.copy(fontSize = 18.5.sp, fontWeight = FontWeight.Bold),
-                            color = c.textPrimary
-                        )
-                        trimmed.startsWith("- [ ] ") || trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ") -> {
-                            val done = !trimmed.startsWith("- [ ] ")
-                            Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text(if (done) "☑" else "☐", style = t.body, color = if (done) c.accent else c.textMuted)
-                                Text(
-                                    text = parseInlineMarkdown(trimmed.drop(6), c.tagBg, c.tagText),
-                                    style = t.body.copy(textDecoration = if (done) TextDecoration.LineThrough else TextDecoration.None),
-                                    color = if (done) c.textSecondary else c.textPrimary
-                                )
-                            }
-                        }
-                        trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
-                            Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                                Text(bulletGlyph, style = t.body.copy(fontWeight = FontWeight.Bold), color = c.textSecondary)
-                                Text(text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText), style = t.body, color = c.textPrimary)
-                            }
-                        }
-                        mobileOrderedListRegex.matches(trimmed) -> {
-                            val m = mobileOrderedListRegex.matchEntire(trimmed)!!
-                            Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                Text("${m.groupValues[1]}.", style = t.body, color = c.textSecondary)
-                                Text(text = parseInlineMarkdown(m.groupValues[2], c.tagBg, c.tagText), style = t.body, color = c.textPrimary)
-                            }
-                        }
-                        trimmed.startsWith("> ") -> {
-                            Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                Box(modifier = Modifier.width(3.dp).height(18.dp).clip(RoundedCornerShape(2.dp)).background(c.accent.copy(alpha = 0.75f)))
-                                Text(text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText), style = t.body, color = c.textSecondary)
-                            }
-                        }
-                        else -> Text(
-                            text = parseInlineMarkdown(trimmed, c.tagBg, c.tagText),
-                            style = t.body,
-                            color = c.textPrimary,
-                            modifier = Modifier.padding(start = indentDp)
                         )
                     }
                 }
@@ -1545,7 +1778,11 @@ private fun MobileMarkdownBlock(text: String, collapsed: Boolean) {
     }
 }
 
-private fun parseInlineMarkdown(raw: String, codeBg: Color, codeFg: Color) = buildAnnotatedString {
+private fun AnnotatedString.Builder.appendInlineMarkdown(raw: String, codeBg: Color, codeFg: Color) {
+    if ('*' !in raw && '~' !in raw && '`' !in raw) {
+        append(raw)
+        return
+    }
     var idx = 0
     for (m in inlineMdTokenRegex.findAll(raw)) {
         if (m.range.first > idx) append(raw.substring(idx, m.range.first))

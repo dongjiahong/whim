@@ -19,12 +19,12 @@ cd "$ROOT_DIR/core"
 echo "==> Building whimcore.aar via gomobile bind..."
 gomobile bind -target=android -androidapi 26 -o "$ROOT_DIR/android/app/libs/whimcore.aar" ./mobile
 
-echo "==> Building Android Debug APK via Gradle CLI..."
+echo "==> Building Android Release APK via Gradle CLI..."
 cd "$ROOT_DIR/android"
 if [ -x "./gradlew" ]; then
-  ./gradlew assembleDebug
+  ./gradlew assembleRelease
 else
-  gradle assembleDebug
+  gradle assembleRelease
 fi
 
-echo "APK ready at: $ROOT_DIR/android/app/build/outputs/apk/debug/app-debug.apk"
+echo "APK ready at: $ROOT_DIR/android/app/build/outputs/apk/release/app-release.apk"

@@ -1,4 +1,5 @@
 import AppKit
+import ImageIO
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -15,6 +16,11 @@ enum NoteContentBlock: Identifiable, Equatable {
     }
 }
 
+private final class CachedBlocksBox: NSObject {
+    let blocks: [NoteContentBlock]
+    init(_ blocks: [NoteContentBlock]) { self.blocks = blocks }
+}
+
 /// Parses markdown content containing `![...](whim://blob/<sha256>)` tokens into
 /// interleaved text and inline image blocks so every pasted image stays in its exact position.
 enum NoteContentParser {
@@ -22,6 +28,22 @@ enum NoteContentParser {
         pattern: #"!\[[^\]]*\]\(whim://blob/([a-fA-F0-9]{64})\)"#,
         options: []
     )
+
+    private static let cache: NSCache<NSString, CachedBlocksBox> = {
+        let c = NSCache<NSString, CachedBlocksBox>()
+        c.countLimit = 400
+        return c
+    }()
+
+    static func parseCached(cacheKey: String, content: String, attachments: [WhimAttachment]?, stripTags: [String] = []) -> [NoteContentBlock] {
+        let key = cacheKey as NSString
+        if let hit = cache.object(forKey: key) {
+            return hit.blocks
+        }
+        let parsed = parse(content: content, attachments: attachments, stripTags: stripTags)
+        cache.setObject(CachedBlocksBox(parsed), forKey: key)
+        return parsed
+    }
 
     static func parse(content: String, attachments: [WhimAttachment]?, stripTags: [String] = []) -> [NoteContentBlock] {
         var pathByHash: [String: String] = [:]
@@ -139,23 +161,81 @@ enum NoteContentParser {
     }
 }
 
-/// Bounded in-memory cache of decoded card images to avoid repeated synchronous disk I/O during scrolling.
+/// Asynchronous, downsampled in-memory image cache using ImageIO so scrolling never blocks the main thread.
 final class ThumbnailCache {
     static let shared = ThumbnailCache()
     private let cache: NSCache<NSString, NSImage> = {
         let c = NSCache<NSString, NSImage>()
-        c.countLimit = 120
+        c.countLimit = 160
+        c.totalCostLimit = 80 * 1024 * 1024 // ~80 MB cap
         return c
     }()
+    private let decodeQueue = DispatchQueue(label: "whim.thumbnail.decode", qos: .userInitiated, attributes: .concurrent)
+    private let lock = NSLock()
+    private var inFlight: [String: [(NSImage?) -> Void]] = [:]
+
+    func cachedImage(forPath path: String) -> NSImage? {
+        cache.object(forKey: path as NSString)
+    }
+
+    func loadImage(forPath path: String, maxPixelSize: CGFloat = 960, completion: @escaping (NSImage?) -> Void) {
+        if let hit = cachedImage(forPath: path) {
+            completion(hit)
+            return
+        }
+        lock.lock()
+        if inFlight[path] != nil {
+            inFlight[path]?.append(completion)
+            lock.unlock()
+            return
+        }
+        inFlight[path] = [completion]
+        lock.unlock()
+
+        decodeQueue.async { [weak self] in
+            guard let self else { return }
+            let decoded = Self.decodeDownsampled(path: path, maxPixelSize: maxPixelSize)
+            if let decoded {
+                let cost = Int(decoded.size.width * decoded.size.height * 4)
+                self.cache.setObject(decoded, forKey: path as NSString, cost: max(cost, 1))
+            }
+            self.lock.lock()
+            let callbacks = self.inFlight.removeValue(forKey: path) ?? []
+            self.lock.unlock()
+            DispatchQueue.main.async {
+                for cb in callbacks {
+                    cb(decoded)
+                }
+            }
+        }
+    }
 
     func image(forPath path: String) -> NSImage? {
-        let key = path as NSString
-        if let hit = cache.object(forKey: key) {
+        if let hit = cachedImage(forPath: path) {
             return hit
         }
-        guard let img = NSImage(contentsOfFile: path) else { return nil }
-        cache.setObject(img, forKey: key)
-        return img
+        guard let decoded = Self.decodeDownsampled(path: path, maxPixelSize: 960) else { return nil }
+        let cost = Int(decoded.size.width * decoded.size.height * 4)
+        cache.setObject(decoded, forKey: path as NSString, cost: max(cost, 1))
+        return decoded
+    }
+
+    private static func decodeDownsampled(path: String, maxPixelSize: CGFloat) -> NSImage? {
+        let url = URL(fileURLWithPath: path)
+        let sourceOpts: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, sourceOpts as CFDictionary) else {
+            return NSImage(contentsOfFile: path)
+        }
+        let thumbOpts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true
+        ]
+        if let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary) {
+            return NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+        }
+        return NSImage(contentsOfFile: path)
     }
 }
 

@@ -55,12 +55,12 @@ jobs:
           gomobile init
           mkdir -p android/app/libs
           cd core && gomobile bind -target=android -androidapi 26 -o ../android/app/libs/whimcore.aar ./mobile
-      - name: Build Android APK
+      - name: Build Android Release APK
         uses: gradle/actions/setup-gradle@v4
       - run: |
           cd android
-          gradle assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk ../Whim-Android.apk
+          gradle assembleRelease
+          cp app/build/outputs/apk/release/app-release.apk ../Whim-Android.apk
       - name: Upload Android artifact
         uses: actions/upload-artifact@v4
         with:

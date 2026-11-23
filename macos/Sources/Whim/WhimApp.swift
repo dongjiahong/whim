@@ -566,60 +566,74 @@ final class WhimStoreVM: ObservableObject {
 
 // MARK: - Activity Heatmap (12 weeks x 7 days, clickable to filter by day)
 
+private enum HeatmapCalendarCache {
+    private static let dayFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }()
+    private static let monthFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "zh_CN")
+        f.dateFormat = "MMM"
+        return f
+    }()
+
+    private static var cachedTodayKey: String = ""
+    private static var cachedGridKeys: [[String]] = []
+    private static var cachedMonths: [String] = []
+
+    static func snapshot() -> (todayKey: String, gridKeys: [[String]], monthLabels: [String]) {
+        let now = Date()
+        let todayKey = dayFmt.string(from: now)
+        if todayKey == cachedTodayKey, !cachedGridKeys.isEmpty {
+            return (todayKey, cachedGridKeys, cachedMonths)
+        }
+        let cal = Calendar.current
+        let today = cal.startOfDay(for: now)
+        let columns = 12
+        let rows = 7
+        let totalDays = columns * rows
+        var cols: [[String]] = []
+        if let start = cal.date(byAdding: .day, value: -(totalDays - 1), to: today) {
+            cols.reserveCapacity(columns)
+            for c in 0..<columns {
+                var col: [String] = []
+                col.reserveCapacity(rows)
+                for r in 0..<rows {
+                    if let d = cal.date(byAdding: .day, value: c * rows + r, to: start) {
+                        col.append(dayFmt.string(from: d))
+                    }
+                }
+                cols.append(col)
+            }
+        }
+        let months = [-2, -1, 0].compactMap { offset in
+            cal.date(byAdding: .month, value: offset, to: now).map { monthFmt.string(from: $0) }
+        }
+        cachedTodayKey = todayKey
+        cachedGridKeys = cols
+        cachedMonths = months
+        return (todayKey, cols, months)
+    }
+}
+
 struct ActivityHeatmapView: View {
     @Environment(\.colorScheme) private var scheme
     let dailyCounts: [String: Int]
     let selectedDay: String?
     let onSelectDay: (String) -> Void
 
-    private let columns = 12
-    private let rows = 7
-    private let dayFmt: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd"
-        return f
-    }()
-
-    private var gridDates: [[Date]] {
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
-        let totalDays = columns * rows
-        guard let start = cal.date(byAdding: .day, value: -(totalDays - 1), to: today) else { return [] }
-        var cols: [[Date]] = []
-        for c in 0..<columns {
-            var col: [Date] = []
-            for r in 0..<rows {
-                if let d = cal.date(byAdding: .day, value: c * rows + r, to: start) {
-                    col.append(d)
-                }
-            }
-            cols.append(col)
-        }
-        return cols
-    }
-
-    private var monthLabels: [String] {
-        let cal = Calendar.current
-        let today = Date()
-        let f = DateFormatter()
-        f.locale = Locale(identifier: "zh_CN")
-        f.dateFormat = "MMM"
-        return [-2, -1, 0].compactMap { offset in
-            cal.date(byAdding: .month, value: offset, to: today).map { f.string(from: $0) }
-        }
-    }
-
     var body: some View {
-        let todayKey = dayFmt.string(from: Date())
+        let snap = HeatmapCalendarCache.snapshot()
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 4) {
-                ForEach(0..<gridDates.count, id: \.self) { colIdx in
+                ForEach(0..<snap.gridKeys.count, id: \.self) { colIdx in
                     VStack(spacing: 4) {
-                        ForEach(0..<gridDates[colIdx].count, id: \.self) { rowIdx in
-                            let date = gridDates[colIdx][rowIdx]
-                            let key = dayFmt.string(from: date)
+                        ForEach(0..<snap.gridKeys[colIdx].count, id: \.self) { rowIdx in
+                            let key = snap.gridKeys[colIdx][rowIdx]
                             let cnt = dailyCounts[key] ?? 0
-                            let isToday = key == todayKey
+                            let isToday = key == snap.todayKey
                             let isSelected = key == selectedDay
                             RoundedRectangle(cornerRadius: 3, style: .continuous)
                                 .fill(FlomoPalette.heatmapCell(cnt, scheme: scheme))
@@ -638,11 +652,11 @@ struct ActivityHeatmapView: View {
                 }
             }
             HStack {
-                ForEach(monthLabels, id: \.self) { m in
+                ForEach(snap.monthLabels, id: \.self) { m in
                     Text(m)
                         .font(.system(size: 10.5))
                         .foregroundColor(FlomoPalette.textMuted(scheme))
-                    if m != monthLabels.last { Spacer() }
+                    if m != snap.monthLabels.last { Spacer() }
                 }
             }
             .padding(.trailing, 18)
@@ -1039,9 +1053,16 @@ struct MainContentView: View {
                         FlomoComposerView(vm: vm)
                     }
 
-                    // Note Card Feed
-                    ScrollView(showsIndicators: false) {
-                        LazyVStack(spacing: 12) {
+                    // Note Card Feed (NSTableView-backed List for true cell recycling & 120Hz scrolling)
+                    ScrollViewReader { scrollProxy in
+                        List {
+                            Color.clear
+                                .frame(height: 0)
+                                .id("__feed_top__")
+                                .listRowSeparator(.hidden)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets())
+
                             if vm.displayedNotes.isEmpty {
                                 VStack(spacing: 8) {
                                     Text(vm.searchQuery.isEmpty ? "暂无记录" : "未找到匹配“\(vm.searchQuery)”的笔记")
@@ -1063,8 +1084,15 @@ struct MainContentView: View {
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding(.top, 56)
+                                .listRowSeparator(.hidden)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets())
                             } else {
-                                ForEach(Array(vm.displayedNotes.enumerated()), id: \.element.id) { idx, note in
+                                let notes = vm.displayedNotes
+                                let prefetchIdx = max(0, notes.count - 5)
+                                let prefetchId = notes.indices.contains(prefetchIdx) ? notes[prefetchIdx].id : nil
+
+                                ForEach(notes) { note in
                                     Group {
                                         if editingNoteId == note.id {
                                             FlomoComposerView(vm: vm, editingNote: note) {
@@ -1085,36 +1113,51 @@ struct MainContentView: View {
                                             )
                                         }
                                     }
+                                    .listRowSeparator(.hidden)
+                                    .listRowBackground(Color.clear)
+                                    .listRowInsets(EdgeInsets(top: 6, leading: 0, bottom: 6, trailing: 4))
                                     .onAppear {
-                                        if idx >= vm.displayedNotes.count - 5 {
+                                        if vm.hasMore && note.id == prefetchId {
                                             vm.loadMore()
                                         }
                                     }
                                 }
 
-                                if vm.isLoadingMore {
-                                    HStack(spacing: 8) {
-                                        ProgressView().controlSize(.small)
-                                        Text("正在加载更多...")
-                                            .font(.system(size: 12))
+                                Group {
+                                    if vm.isLoadingMore {
+                                        HStack(spacing: 8) {
+                                            ProgressView().controlSize(.small)
+                                            Text("正在加载更多...")
+                                                .font(.system(size: 12))
+                                                .foregroundColor(FlomoPalette.textMuted(scheme))
+                                        }
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 12)
+                                    } else if vm.hasMore {
+                                        Button("加载更多") { vm.loadMore() }
+                                            .buttonStyle(.plain)
+                                            .font(.system(size: 12.5))
+                                            .foregroundColor(FlomoPalette.tagText(scheme))
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 10)
+                                    } else if notes.count >= 20 {
+                                        Text("已加载全部 \(notes.count) 条")
+                                            .font(.system(size: 11.5))
                                             .foregroundColor(FlomoPalette.textMuted(scheme))
+                                            .frame(maxWidth: .infinity)
+                                            .padding(.vertical, 10)
                                     }
-                                    .padding(.vertical, 12)
-                                } else if vm.hasMore {
-                                    Button("加载更多") { vm.loadMore() }
-                                        .buttonStyle(.plain)
-                                        .font(.system(size: 12.5))
-                                        .foregroundColor(FlomoPalette.tagText(scheme))
-                                        .padding(.vertical, 10)
-                                } else if vm.displayedNotes.count >= 20 {
-                                    Text("已加载全部 \(vm.displayedNotes.count) 条")
-                                        .font(.system(size: 11.5))
-                                        .foregroundColor(FlomoPalette.textMuted(scheme))
-                                        .padding(.vertical, 10)
                                 }
+                                .listRowSeparator(.hidden)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 32, trailing: 0))
                             }
                         }
-                        .padding(.bottom, 42)
+                        .listStyle(.plain)
+                        .scrollContentBackground(.hidden)
+                        .onChange(of: vm.activeTab) { _, _ in
+                            scrollProxy.scrollTo("__feed_top__", anchor: .top)
+                        }
                     }
                 }
                 .padding(.horizontal, 22)
@@ -1416,79 +1459,131 @@ private struct TagFlowLayout: Layout {
     }
 }
 
-private struct FlomoNoteCard: View {
+private struct AsyncCardImage: View {
     @Environment(\.colorScheme) private var scheme
-    let note: WhimNote
-    let onTapTag: (String) -> Void
-    let onTapImage: (String) -> Void
+    let path: String
+    let onTap: (String) -> Void
+
+    @State private var image: NSImage?
+
+    init(path: String, onTap: @escaping (String) -> Void) {
+        self.path = path
+        self.onTap = onTap
+        _image = State(initialValue: ThumbnailCache.shared.cachedImage(forPath: path))
+    }
+
+    var body: some View {
+        Group {
+            if let img = image {
+                Image(nsImage: img)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(maxWidth: 460, maxHeight: 280, alignment: .leading)
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .onTapGesture { onTap(path) }
+            } else {
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .fill(FlomoPalette.canvas(scheme))
+                    .frame(width: 240, height: 150)
+                    .onAppear {
+                        ThumbnailCache.shared.loadImage(forPath: path) { loaded in
+                            if let loaded {
+                                image = loaded
+                            }
+                        }
+                    }
+            }
+        }
+    }
+}
+
+private struct CardHeaderActions: View {
+    @Environment(\.colorScheme) private var scheme
+    let pinned: Bool
+    let archived: Bool
+    let content: String
     let onEdit: () -> Void
     let onPin: () -> Void
     let onArchive: () -> Void
     let onDelete: () -> Void
 
-    @State private var expanded: Bool = false
-    @State private var isHovering: Bool = false
+    @State private var editHovered: Bool = false
+    @State private var menuHovered: Bool = false
 
-    private static let cardTimeFmt: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm"
-        return f
-    }()
+    var body: some View {
+        HStack(spacing: 4) {
+            Button(action: onEdit) {
+                Image(systemName: "pencil")
+                    .font(.system(size: 12))
+                    .foregroundColor(editHovered ? FlomoPalette.textPrimary(scheme) : FlomoPalette.textMuted(scheme))
+                    .frame(width: 24, height: 22)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(editHovered ? FlomoPalette.border(scheme) : .clear)
+                    )
+            }
+            .buttonStyle(.plain)
+            .onHover { editHovered = $0 }
+            .help("编辑笔记")
 
-    private var formattedTime: String {
-        let d = Date(timeIntervalSince1970: TimeInterval(note.createdAt) / 1000.0)
-        return Self.cardTimeFmt.string(from: d)
+            Menu {
+                Button("编辑", action: onEdit)
+                Button(pinned ? "取消置顶" : "置顶笔记", action: onPin)
+                Button(archived ? "取消归档" : "归档", action: onArchive)
+                Button("复制正文") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(content, forType: .string)
+                }
+                Divider()
+                Button("删除", role: .destructive, action: onDelete)
+            } label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 13))
+                    .foregroundColor(menuHovered ? FlomoPalette.textPrimary(scheme) : FlomoPalette.textMuted(scheme))
+                    .frame(width: 24, height: 22)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                            .fill(menuHovered ? FlomoPalette.border(scheme) : .clear)
+                    )
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: 24)
+            .onHover { menuHovered = $0 }
+        }
     }
+}
 
-    private var blocks: [NoteContentBlock] {
-        NoteContentParser.parse(content: note.content, attachments: note.attachments, stripTags: note.tags ?? [])
-    }
+private struct FlomoNoteCardBody: View, Equatable {
+    @Environment(\.colorScheme) private var scheme
+    let noteId: String
+    let updatedAt: Int64
+    let content: String
+    let tags: [String]
+    let attachments: [WhimAttachment]
+    let collapsed: Bool
+    let onTapTag: (String) -> Void
+    let onTapImage: (String) -> Void
 
-    private var isLongNote: Bool {
-        note.content.count > 280 || note.content.components(separatedBy: "\n").count > 7
+    static func == (lhs: FlomoNoteCardBody, rhs: FlomoNoteCardBody) -> Bool {
+        lhs.noteId == rhs.noteId &&
+        lhs.updatedAt == rhs.updatedAt &&
+        lhs.collapsed == rhs.collapsed &&
+        lhs.content == rhs.content &&
+        lhs.tags == rhs.tags &&
+        lhs.attachments == rhs.attachments
     }
 
     var body: some View {
+        let cacheKey = "\(noteId):\(updatedAt):\(tags.count):\(attachments.count)"
+        let blocks = NoteContentParser.parseCached(
+            cacheKey: cacheKey,
+            content: content,
+            attachments: attachments,
+            stripTags: tags
+        )
         VStack(alignment: .leading, spacing: 10) {
-            // Meta header row
-            HStack(spacing: 6) {
-                Text(note.pinned ? "置顶 · \(formattedTime)" : formattedTime)
-                    .font(.system(size: 12).monospacedDigit())
-                    .foregroundColor(FlomoPalette.textSecondary(scheme))
-                Spacer()
-                if isHovering {
-                    Button(action: onEdit) {
-                        Image(systemName: "pencil")
-                            .font(.system(size: 12))
-                            .foregroundColor(FlomoPalette.textSecondary(scheme))
-                            .frame(width: 24, height: 20)
-                    }
-                    .buttonStyle(.plain)
-                    .help("编辑笔记")
-                }
-                Menu {
-                    Button("编辑", action: onEdit)
-                    Button(note.pinned ? "取消置顶" : "置顶笔记", action: onPin)
-                    Button(note.archived ? "取消归档" : "归档", action: onArchive)
-                    Button("复制正文") {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(note.content, forType: .string)
-                    }
-                    Divider()
-                    Button("删除", role: .destructive, action: onDelete)
-                } label: {
-                    Image(systemName: "ellipsis")
-                        .font(.system(size: 13))
-                        .foregroundColor(FlomoPalette.textMuted(scheme))
-                        .frame(width: 24, height: 20)
-                }
-                .menuStyle(.borderlessButton)
-                .menuIndicator(.hidden)
-                .frame(width: 24)
-            }
-
-            // Wrapping blue tag pills right below timestamp
-            if let tags = note.tags, !tags.isEmpty {
+            if !tags.isEmpty {
                 TagFlowLayout(spacing: 6) {
                     ForEach(tags, id: \.self) { tag in
                         Button { onTapTag(tag) } label: {
@@ -1507,24 +1602,78 @@ private struct FlomoNoteCard: View {
                 }
             }
 
-            // Interleaved inline Text + Image blocks (each image stays in its exact document position!)
             VStack(alignment: .leading, spacing: 10) {
                 ForEach(blocks) { block in
                     switch block {
                     case .text(_, let val):
-                        MarkdownBlockView(text: val, collapsed: !expanded && isLongNote)
+                        MarkdownBlockView(text: val, collapsed: collapsed)
+                            .equatable()
                     case .image(_, _, let path):
-                        if let img = ThumbnailCache.shared.image(forPath: path) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(maxWidth: 460, maxHeight: 280, alignment: .leading)
-                                .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
-                                .onTapGesture { onTapImage(path) }
-                        }
+                        AsyncCardImage(path: path, onTap: onTapImage)
                     }
                 }
             }
+        }
+    }
+}
+
+private struct FlomoNoteCard: View {
+    @Environment(\.colorScheme) private var scheme
+    let note: WhimNote
+    let onTapTag: (String) -> Void
+    let onTapImage: (String) -> Void
+    let onEdit: () -> Void
+    let onPin: () -> Void
+    let onArchive: () -> Void
+    let onDelete: () -> Void
+
+    @State private var expanded: Bool = false
+
+    private static let cardTimeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    private var formattedTime: String {
+        let d = Date(timeIntervalSince1970: TimeInterval(note.createdAt) / 1000.0)
+        return Self.cardTimeFmt.string(from: d)
+    }
+
+    private var isLongNote: Bool {
+        note.content.count > 280 || note.content.reduce(0) { $0 + ($1 == "\n" ? 1 : 0) } > 6
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            // Meta header row (fixed positions, zero hover layout jitter)
+            HStack(spacing: 6) {
+                Text(note.pinned ? "置顶 · \(formattedTime)" : formattedTime)
+                    .font(.system(size: 12).monospacedDigit())
+                    .foregroundColor(FlomoPalette.textSecondary(scheme))
+                Spacer()
+                CardHeaderActions(
+                    pinned: note.pinned,
+                    archived: note.archived,
+                    content: note.content,
+                    onEdit: onEdit,
+                    onPin: onPin,
+                    onArchive: onArchive,
+                    onDelete: onDelete
+                )
+            }
+
+            FlomoNoteCardBody(
+                noteId: note.id,
+                updatedAt: note.updatedAt,
+                content: note.content,
+                tags: note.tags ?? [],
+                attachments: note.attachments ?? [],
+                collapsed: !expanded && isLongNote,
+                onTapTag: onTapTag,
+                onTapImage: onTapImage
+            )
+            .equatable()
 
             if isLongNote {
                 Button(expanded ? "收起" : "展开") {
@@ -1540,7 +1689,21 @@ private struct FlomoNoteCard: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(FlomoPalette.card(scheme))
         )
-        .onHover { hovering in isHovering = hovering }
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(FlomoPalette.border(scheme), lineWidth: 0.5)
+        )
+        .contextMenu {
+            Button("编辑", action: onEdit)
+            Button(note.pinned ? "取消置顶" : "置顶笔记", action: onPin)
+            Button(note.archived ? "取消归档" : "归档", action: onArchive)
+            Button("复制正文") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(note.content, forType: .string)
+            }
+            Divider()
+            Button("删除", role: .destructive, action: onDelete)
+        }
     }
 }
 

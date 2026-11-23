@@ -6,7 +6,7 @@ help:
 	@echo "  make macos             编译打包 macOS dist/Whim.app"
 	@echo "  make install-macos     编译并安装到 /Applications/Whim.app 且立即启动"
 	@echo "  make mcp               编译本地 MCP Server (dist/whim-mcp)"
-	@echo "  make android           编译 whimcore.aar 与 Android Debug APK"
+	@echo "  make android           编译 whimcore.aar 与 Android Release APK"
 	@echo "  make install-android   编译并 adb 覆盖安装到已连接 Android 手机"
 	@echo "  make release v=0.1.1   同步双端版本号、跑测试、打 tag 并推送触发 GitHub Release"
 

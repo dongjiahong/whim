@@ -22,7 +22,7 @@ enum NoteContentParser {
         options: []
     )
 
-    static func parse(content: String, attachments: [WhimAttachment]?) -> [NoteContentBlock] {
+    static func parse(content: String, attachments: [WhimAttachment]?, stripTags: [String] = []) -> [NoteContentBlock] {
         var pathByHash: [String: String] = [:]
         for att in attachments ?? [] {
             if let p = att.localPath, !p.isEmpty {
@@ -30,8 +30,9 @@ enum NoteContentParser {
             }
         }
 
-        let ns = content as NSString
-        let matches = regex.matches(in: content, options: [], range: NSRange(location: 0, length: ns.length))
+        let displayContent = stripTags.isEmpty ? content : stripInlineTags(from: content, tags: stripTags)
+        let ns = displayContent as NSString
+        let matches = regex.matches(in: displayContent, options: [], range: NSRange(location: 0, length: ns.length))
         var blocks: [NoteContentBlock] = []
         var referenced = Set<String>()
         var cursor = 0
@@ -70,6 +71,38 @@ enum NoteContentParser {
             }
         }
         return blocks
+    }
+
+    /// Removes `#tag/subtag` tokens that are already shown as top tag pills on the card,
+    /// collapsing any blank lines left behind without mutating the underlying stored content.
+    static func stripInlineTags(from text: String, tags: [String]) -> String {
+        var result = text
+        // Sort longest first so #a/b/c is removed before #a/b
+        let sorted = tags.sorted { $0.count > $1.count }
+        for tag in sorted {
+            let escaped = NSRegularExpression.escapedPattern(for: tag)
+            // Match #tag (including optional spaces around slashes if typed like #新的 /haoshi)
+            let pattern = "#\\s*" + escaped.replacingOccurrences(of: "/", with: "\\s*/\\s*") + "(?=$|[\\s,.;:!?，。；：！？\\)\\]）】」』])"
+            if let re = try? NSRegularExpression(pattern: pattern, options: []) {
+                let range = NSRange(location: 0, length: (result as NSString).length)
+                result = re.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
+            }
+        }
+        // Clean up lines that became whitespace-only and collapse excess leading/trailing newlines
+        let cleanedLines = result
+            .components(separatedBy: "\n")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+        var compact: [String] = []
+        for line in cleanedLines {
+            if line.isEmpty {
+                if !compact.isEmpty && !(compact.last?.isEmpty ?? true) {
+                    compact.append("")
+                }
+            } else {
+                compact.append(line)
+            }
+        }
+        return compact.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func resolveLocalBlobPath(sha256: String) -> String? {
@@ -129,6 +162,7 @@ final class WhimImageAttachment: NSTextAttachment {
 /// Native NSTextView subclass that intercepts Cmd+V image paste and inserts the image
 /// directly at the current caret position (inline inside the document, NOT pooled at bottom).
 final class WhimNSTextView: NSTextView {
+    var isDarkTheme: Bool = true
     var onCommandReturn: (() -> Void)?
     var onEscape: (() -> Void)?
     var onInsertBlob: ((WhimAttachment) -> Void)?
@@ -286,12 +320,27 @@ final class WhimNSTextView: NSTextView {
         setSelectedRange(NSRange(location: result.length, length: 0))
     }
 
+    func applyTheme(isDark: Bool) {
+        guard isDarkTheme != isDark || textStorage?.length == 0 else { return }
+        isDarkTheme = isDark
+        let color = isDark
+            ? NSColor(red: 0.90, green: 0.90, blue: 0.90, alpha: 1.0)
+            : NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0)
+        typingAttributes = defaultTypingAttrs()
+        if let storage = textStorage, storage.length > 0 {
+            storage.addAttribute(.foregroundColor, value: color, range: NSRange(location: 0, length: storage.length))
+        }
+    }
+
     func defaultTypingAttrs() -> [NSAttributedString.Key: Any] {
         let style = NSMutableParagraphStyle()
         style.lineSpacing = 4.5
+        let color = isDarkTheme
+            ? NSColor(red: 0.90, green: 0.90, blue: 0.90, alpha: 1.0)
+            : NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0)
         return [
             .font: NSFont.systemFont(ofSize: 14.5),
-            .foregroundColor: NSColor(red: 0.90, green: 0.90, blue: 0.90, alpha: 1.0),
+            .foregroundColor: color,
             .paragraphStyle: style
         ]
     }
@@ -338,6 +387,7 @@ struct InlineRichEditor: NSViewRepresentable {
     var initialMarkdown: String = ""
     var initialAttachments: [WhimAttachment]? = nil
     var autoFocus: Bool = false
+    var isDark: Bool = true
     var onTextChange: (String, [WhimAttachment]) -> Void
     var onFocusChange: (Bool) -> Void
     var onSubmit: () -> Void
@@ -353,6 +403,7 @@ struct InlineRichEditor: NSViewRepresentable {
         scroll.borderType = .noBorder
 
         let tv = WhimNSTextView(frame: .zero)
+        tv.isDarkTheme = isDark
         tv.drawsBackground = false
         tv.isRichText = true
         tv.importsGraphics = false
@@ -395,6 +446,7 @@ struct InlineRichEditor: NSViewRepresentable {
     func updateNSView(_ nsView: NSScrollView, context: Context) {
         if let tv = nsView.documentView as? WhimNSTextView {
             controller.textView = tv
+            tv.applyTheme(isDark: isDark)
             tv.onCommandReturn = onSubmit
             tv.onEscape = onEscape
         }

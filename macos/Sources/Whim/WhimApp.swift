@@ -22,6 +22,9 @@ final class WhimStoreVM: ObservableObject {
     @Published var pairCode: String = ""
     @Published var syncMessage: String = "局域网对等监听已开启"
     @Published var isSyncing: Bool = false
+    @Published var dailyReviewEnabled: Bool = UserDefaults.standard.object(forKey: "whim.review.enabled") as? Bool ?? true
+    @Published var reviewHour: Int = UserDefaults.standard.object(forKey: "whim.review.hour") as? Int ?? 21
+    @Published var reviewMinute: Int = UserDefaults.standard.object(forKey: "whim.review.minute") as? Int ?? 30
 
     // Undo delete toast
     @Published var lastDeletedNoteId: String? = nil
@@ -366,9 +369,20 @@ final class WhimStoreVM: ObservableObject {
         return out
     }
 
+    func saveReviewSchedule() {
+        UserDefaults.standard.set(dailyReviewEnabled, forKey: "whim.review.enabled")
+        UserDefaults.standard.set(reviewHour, forKey: "whim.review.hour")
+        UserDefaults.standard.set(reviewMinute, forKey: "whim.review.minute")
+        scheduleDailyReviewNotification()
+    }
+
     private func scheduleDailyReviewNotification() {
         guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()
+        center.removePendingNotificationRequests(withIdentifiers: ["whim.daily.review"])
+        guard dailyReviewEnabled else { return }
+        let hour = reviewHour
+        let minute = reviewMinute
         center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
             guard granted else { return }
             let content = UNMutableNotificationContent()
@@ -376,8 +390,8 @@ final class WhimStoreVM: ObservableObject {
             content.body = "花 2 分钟回顾今天记录的闪念，整理关键想法。"
             content.sound = .default
             var comps = DateComponents()
-            comps.hour = 21
-            comps.minute = 30
+            comps.hour = hour
+            comps.minute = minute
             let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
             let req = UNNotificationRequest(identifier: "whim.daily.review", content: content, trigger: trigger)
             center.add(req)
@@ -516,6 +530,7 @@ struct FlomoComposerView: View {
                     initialMarkdown: editingNote?.content ?? "",
                     initialAttachments: editingNote?.attachments,
                     autoFocus: editingNote != nil,
+                    isDark: scheme == .dark,
                     onTextChange: { md, atts in
                         markdown = md
                         attachments = atts
@@ -648,8 +663,9 @@ struct MainContentView: View {
     let onOpenQuickCapture: () -> Void
     let onToggleWindowPin: (Bool) -> Void
 
+    @AppStorage("whim.themeMode") private var themeModeRaw: String = AppThemeMode.system.rawValue
     @State private var showSyncPopover: Bool = false
-    @State private var showAboutSheet: Bool = false
+    @State private var showSettingsSheet: Bool = false
     @State private var codeInput: String = ""
     @State private var previewImagePath: String? = nil
     @State private var editingNoteId: String? = nil
@@ -770,11 +786,11 @@ struct MainContentView: View {
                     }
 
                     Divider().opacity(0.25)
-                    Button { showAboutSheet = true } label: {
+                    Button { showSettingsSheet = true } label: {
                         HStack(spacing: 8) {
-                            Image(systemName: "info.circle")
+                            Image(systemName: "gearshape")
                                 .font(.system(size: 12))
-                            Text("关于与更新 · v\(GitHubUpdater.currentVersion)")
+                            Text("设置 · v\(GitHubUpdater.currentVersion)")
                                 .font(.system(size: 12))
                             Spacer()
                         }
@@ -858,7 +874,7 @@ struct MainContentView: View {
                             Button("注入示例数据") { vm.seedSampleNotes() }
                             Button("清除示例数据") { vm.clearSampleNotes() }
                             Divider()
-                            Button("关于与检查更新...") { showAboutSheet = true }
+                            Button("偏好设置与更新... (⌘,)") { showSettingsSheet = true }
                         } label: {
                             Image(systemName: "ellipsis")
                                 .font(.system(size: 13))
@@ -947,14 +963,19 @@ struct MainContentView: View {
                 .padding(.bottom, 18)
             }
 
-            // Hidden ⌘K button to focus Search Bar
+            // Hidden ⌘K Search & ⌘, Settings shortcuts
             Button("") { searchFocused = true }
                 .keyboardShortcut("k", modifiers: .command)
+                .opacity(0)
+                .frame(width: 0, height: 0)
+            Button("") { showSettingsSheet = true }
+                .keyboardShortcut(",", modifiers: .command)
                 .opacity(0)
                 .frame(width: 0, height: 0)
         }
         .frame(minWidth: 880, minHeight: 620)
         .background(FlomoPalette.canvas(scheme))
+        .preferredColorScheme((AppThemeMode(rawValue: themeModeRaw) ?? .system).colorScheme)
         .sheet(isPresented: Binding(get: { previewImagePath != nil }, set: { if !$0 { previewImagePath = nil } })) {
             if let path = previewImagePath, let img = NSImage(contentsOfFile: path) {
                 VStack {
@@ -968,8 +989,15 @@ struct MainContentView: View {
                 }
             }
         }
-        .sheet(isPresented: $showAboutSheet) {
-            AboutUpdateView { showAboutSheet = false }
+        .sheet(isPresented: $showSettingsSheet) {
+            SettingsModalView(
+                vm: vm,
+                themeModeRaw: $themeModeRaw,
+                onApplyTheme: { mode in
+                    NSApp.appearance = mode.nsAppearance
+                },
+                onClose: { showSettingsSheet = false }
+            )
         }
     }
 
@@ -1177,7 +1205,7 @@ private struct FlomoNoteCard: View {
     }
 
     private var blocks: [NoteContentBlock] {
-        NoteContentParser.parse(content: note.content, attachments: note.attachments)
+        NoteContentParser.parse(content: note.content, attachments: note.attachments, stripTags: note.tags ?? [])
     }
 
     private var isLongNote: Bool {
@@ -1295,6 +1323,7 @@ final class QuickCapturePanel: NSPanel {
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         center()
 
+        let savedTheme = AppThemeMode(rawValue: UserDefaults.standard.string(forKey: "whim.themeMode") ?? "system") ?? .system
         contentView = NSHostingView(
             rootView: FloatingQuickCaptureView(
                 vm: vm,
@@ -1303,7 +1332,7 @@ final class QuickCapturePanel: NSPanel {
                 },
                 onClose: onClose
             )
-            .preferredColorScheme(.dark)
+            .preferredColorScheme(savedTheme.colorScheme)
         )
     }
 
@@ -1383,6 +1412,7 @@ struct FloatingQuickCaptureView: View {
                 InlineRichEditor(
                     controller: editor,
                     autoFocus: true,
+                    isDark: scheme == .dark,
                     onTextChange: { md, atts in
                         markdown = md
                         attachments = atts
@@ -1535,10 +1565,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             backing: .buffered,
             defer: false
         )
+        let savedTheme = AppThemeMode(rawValue: UserDefaults.standard.string(forKey: "whim.themeMode") ?? "system") ?? .system
+        NSApp.appearance = savedTheme.nsAppearance
         win.titleVisibility = .hidden
         win.titlebarAppearsTransparent = true
-        win.backgroundColor = NSColor(red: 0.078, green: 0.078, blue: 0.078, alpha: 1.0)
-        win.appearance = NSAppearance(named: .darkAqua)
         win.isReleasedWhenClosed = false
         win.center()
         win.contentView = NSHostingView(
@@ -1549,7 +1579,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.mainWindow?.level = pinned ? .floating : .normal
                 }
             )
-            .preferredColorScheme(.dark)
         )
         win.makeKeyAndOrderFront(nil)
         mainWindow = win

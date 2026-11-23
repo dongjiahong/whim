@@ -95,7 +95,15 @@ class QuickCaptureActivity : ComponentActivity() {
         } else null
 
         setContent {
-            WhimThemeProvider(darkTheme = true) {
+            val prefs = remember { getSharedPreferences("whim_ui_prefs", Context.MODE_PRIVATE) }
+            val mode = prefs.getString("theme_mode", "system") ?: "system"
+            val sysDark = androidx.compose.foundation.isSystemInDarkTheme()
+            val useDark = when (mode) {
+                "light" -> false
+                "dark" -> true
+                else -> sysDark
+            }
+            WhimThemeProvider(darkTheme = useDark) {
                 FlomoQuickCaptureSheet(
                     initialText = sharedText,
                     initialImageUri = sharedImageUri,

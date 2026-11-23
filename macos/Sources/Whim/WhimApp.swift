@@ -1525,12 +1525,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var mainWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        setupMainMenu()
         vm.boot()
         setupMenuBar()
         setupMainWindow()
         GlobalHotKeyManager.shared.registerCmdShiftJ { [weak self] in
             self?.toggleQuickCapture()
         }
+    }
+
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        // App menu
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu(title: "Whim")
+        appMenu.addItem(withTitle: "退出 Whim", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appItem.submenu = appMenu
+        mainMenu.addItem(appItem)
+
+        // Edit menu (required by AppKit for Cmd+C/V/X/A/Z in all windows & text fields)
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        editMenu.addItem(withTitle: "重做", action: Selector(("redo:")), keyEquivalent: "Z")
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editItem.submenu = editMenu
+        mainMenu.addItem(editItem)
+
+        // Window menu
+        let winItem = NSMenuItem()
+        let winMenu = NSMenu(title: "窗口")
+        winMenu.addItem(withTitle: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        winItem.submenu = winMenu
+        mainMenu.addItem(winItem)
+
+        NSApp.mainMenu = mainMenu
     }
 
     private func setupMenuBar() {

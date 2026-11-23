@@ -254,11 +254,46 @@ final class WhimNSTextView: NSTextView {
         return false
     }
 
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.type == .keyDown,
+           event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+           let chars = event.charactersIgnoringModifiers?.lowercased() {
+            switch chars {
+            case "v":
+                paste(nil)
+                return true
+            case "c":
+                copy(nil)
+                return true
+            case "x":
+                cut(nil)
+                return true
+            case "a":
+                selectAll(nil)
+                return true
+            case "z":
+                undoManager?.undo()
+                return true
+            default:
+                break
+            }
+        }
+        if event.type == .keyDown,
+           event.modifierFlags.intersection(.deviceIndependentFlagsMask) == [.command, .shift],
+           event.charactersIgnoringModifiers?.lowercased() == "z" {
+            undoManager?.redo()
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+
     override func paste(_ sender: Any?) {
         if tryPasteClipboardImage() {
             return
         }
         super.pasteAsPlainText(sender)
+        highlightTags()
+        onContentChanged?()
     }
 
     @discardableResult

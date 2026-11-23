@@ -122,9 +122,22 @@ class MainActivity : ComponentActivity() {
         val initialReview = intent?.getBooleanExtra(EXTRA_OPEN_REVIEW, false) == true
 
         setContent {
-            WhimThemeProvider(darkTheme = true) {
+            val prefs = remember { getSharedPreferences("whim_ui_prefs", Context.MODE_PRIVATE) }
+            var themeMode by remember { mutableStateOf(prefs.getString("theme_mode", "system") ?: "system") }
+            val sysDark = androidx.compose.foundation.isSystemInDarkTheme()
+            val useDark = when (themeMode) {
+                "light" -> false
+                "dark" -> true
+                else -> sysDark
+            }
+            WhimThemeProvider(darkTheme = useDark) {
                 FlomoMobileApp(
                     initialReviewMode = initialReview,
+                    themeMode = themeMode,
+                    onThemeModeChange = { next ->
+                        themeMode = next
+                        prefs.edit().putString("theme_mode", next).apply()
+                    },
                     onOpenQuickCapture = {
                         startActivity(Intent(this, QuickCaptureActivity::class.java))
                     }
@@ -147,6 +160,8 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun FlomoMobileApp(
     initialReviewMode: Boolean,
+    themeMode: String,
+    onThemeModeChange: (String) -> Unit,
     onOpenQuickCapture: () -> Unit
 ) {
     val c = WhimTheme.colors
@@ -469,7 +484,21 @@ private fun FlomoMobileApp(
                             .padding(14.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text("关于 Whim · v${GitHubUpdater.CURRENT_VERSION}", style = t.section, color = c.textPrimary)
+                        Text("设置与关于 · v${GitHubUpdater.CURRENT_VERSION}", style = t.section, color = c.textPrimary)
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            listOf("system" to "跟随系统", "light" to "浅色", "dark" to "深色").forEach { (key, label) ->
+                                val active = themeMode == key
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(7.dp))
+                                        .background(if (active) c.accent else c.canvas)
+                                        .clickable { onThemeModeChange(key) }
+                                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Text(label, style = t.meta, color = if (active) Color.White else c.textPrimary)
+                                }
+                            }
+                        }
                         Text(updateStatus, style = t.meta, color = c.textSecondary)
                         Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             Box(
@@ -790,16 +819,26 @@ private fun FlomoMobileNoteCard(
             }
         }
 
-        // Interleaved inline Text + Image blocks (images stay in their exact document positions!)
+        // Interleaved inline Text + Image blocks (strip #tags already shown as top pills)
+        val displayBody = remember(note.content, note.tags) {
+            var cleaned = note.content
+            for (tag in note.tags.sortedByDescending { it.length }) {
+                val escaped = Regex.escape(tag).replace("/", "\\s*/\\s*")
+                cleaned = Regex("#\\s*$escaped(?=$|[\\s,.;:!?，。；：！？\\)\\]）】」』])").replace(cleaned, "")
+            }
+            cleaned.lines().map { it.trim() }.filterIndexed { i, line ->
+                line.isNotEmpty() || (i > 0)
+            }.joinToString("\n").trim()
+        }
         val blobRegex = remember { Regex("!\\[[^\\]]*\\]\\(whim://blob/([a-fA-F0-9]{64})\\)") }
         val pathByHash = remember(note.attachments) { note.attachments.associate { it.sha256 to it.localPath } }
-        val matches = remember(note.content) { blobRegex.findAll(note.content).toList() }
+        val matches = remember(displayBody) { blobRegex.findAll(displayBody).toList() }
         var cursor = 0
         val referenced = mutableSetOf<String>()
 
         matches.forEach { m ->
             if (m.range.first > cursor) {
-                val seg = note.content.substring(cursor, m.range.first).trim()
+                val seg = displayBody.substring(cursor, m.range.first).trim()
                 if (seg.isNotEmpty()) {
                     Text(
                         text = seg,
@@ -826,8 +865,8 @@ private fun FlomoMobileNoteCard(
             }
             cursor = m.range.last + 1
         }
-        if (cursor < note.content.length) {
-            val tail = note.content.substring(cursor).trim()
+        if (cursor < displayBody.length) {
+            val tail = displayBody.substring(cursor).trim()
             if (tail.isNotEmpty()) {
                 Text(
                     text = tail,

@@ -185,7 +185,10 @@ private fun FlomoMobileApp(
     var tagTree by remember { mutableStateOf<List<WhimTagNode>>(emptyList()) }
     var pairCode by remember { mutableStateOf("") }
     var syncStatus by remember { mutableStateOf("") }
-    var codeOrAddrInput by remember { mutableStateOf("") }
+    var remoteAddrInput by remember { mutableStateOf("") }
+    var remoteCodeInput by remember { mutableStateOf("") }
+    var discoveredPeers by remember { mutableStateOf<List<com.whim.app.core.WhimDiscoveredPeer>>(emptyList()) }
+    var pairedPeers by remember { mutableStateOf<List<com.whim.app.core.WhimSyncPeer>>(emptyList()) }
 
     val dayFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()) }
 
@@ -213,6 +216,7 @@ private fun FlomoMobileApp(
                 allNotes = full
                 tagTree = WhimCoreBridge.listTagTree()
                 pairCode = WhimCoreBridge.getPairCode()
+                pairedPeers = WhimCoreBridge.listPairedPeers()
 
                 displayedNotes = when (val tab = activeTab) {
                     MobileTab.All -> if (searchQuery.isEmpty()) full else WhimCoreBridge.listNotes(WhimListFilter(query = searchQuery))
@@ -425,50 +429,127 @@ private fun FlomoMobileApp(
                             .clip(RoundedCornerShape(10.dp))
                             .background(c.card)
                             .padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Text("局域网对等同步 · 配对码 $pairCode", style = t.section, color = c.textPrimary)
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                            Column {
+                                Text("本机同步码（不会被配对覆盖）", style = t.meta, color = c.textSecondary)
+                                Text(pairCode.chunked(3).joinToString(" "), style = t.statNumber, color = c.accent)
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Box(
+                                    modifier = Modifier.clip(RoundedCornerShape(7.dp)).background(c.canvas)
+                                        .clickable {
+                                            pairCode = WhimCoreBridge.regeneratePairCode()
+                                            syncStatus = "本机同步码已重新生成"
+                                        }.padding(horizontal = 10.dp, vertical = 6.dp)
+                                ) { Text("重生成", style = t.meta, color = c.textPrimary) }
+                                Box(
+                                    modifier = Modifier.clip(RoundedCornerShape(7.dp)).background(c.canvas)
+                                        .clickable {
+                                            scope.launch {
+                                                syncStatus = "正在扫描局域网..."
+                                                discoveredPeers = runCatching { WhimCoreBridge.discoverLAN() }.getOrDefault(emptyList())
+                                                syncStatus = if (discoveredPeers.isEmpty()) "暂未发现附近设备，可手填 IP:8788" else "发现 ${discoveredPeers.size} 台设备"
+                                            }
+                                        }.padding(horizontal = 10.dp, vertical = 6.dp)
+                                ) { Text("扫描", style = t.meta, color = c.textPrimary) }
+                            }
+                        }
+
                         if (syncStatus.isNotEmpty()) {
                             Text(syncStatus, style = t.meta, color = c.textSecondary)
                         }
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Box(
-                                modifier = Modifier
-                                    .weight(1f)
-                                    .clip(RoundedCornerShape(7.dp))
-                                    .background(c.canvas)
-                                    .padding(horizontal = 10.dp, vertical = 8.dp)
+
+                        discoveredPeers.forEach { peer ->
+                            Row(
+                                modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(7.dp)).background(c.canvas).padding(10.dp),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
                             ) {
+                                Column {
+                                    Text(peer.displayName, style = t.body, color = c.textPrimary)
+                                    Text(peer.addr, style = t.meta, color = c.textMuted)
+                                }
+                                Box(
+                                    modifier = Modifier.clip(RoundedCornerShape(6.dp)).background(c.tagBg)
+                                        .clickable { remoteAddrInput = peer.addr }.padding(horizontal = 10.dp, vertical = 5.dp)
+                                ) { Text(if (peer.paired) "已配对" else "选择", style = t.meta, color = c.tagText) }
+                            }
+                        }
+
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Box(modifier = Modifier.weight(1f).clip(RoundedCornerShape(7.dp)).background(c.canvas).padding(horizontal = 10.dp, vertical = 8.dp)) {
                                 BasicTextField(
-                                    value = codeOrAddrInput,
-                                    onValueChange = { codeOrAddrInput = it },
+                                    value = remoteAddrInput,
+                                    onValueChange = { remoteAddrInput = it },
                                     singleLine = true,
                                     textStyle = t.body.copy(color = c.textPrimary),
                                     cursorBrush = SolidColor(c.accent),
                                     decorationBox = { inner ->
-                                        if (codeOrAddrInput.isEmpty()) Text("输入6位配对码或Mac IP:8788", style = t.meta, color = c.textMuted)
+                                        if (remoteAddrInput.isEmpty()) Text("对方IP:8788", style = t.meta, color = c.textMuted)
+                                        inner()
+                                    }
+                                )
+                            }
+                            Box(modifier = Modifier.width(104.dp).clip(RoundedCornerShape(7.dp)).background(c.canvas).padding(horizontal = 10.dp, vertical = 8.dp)) {
+                                BasicTextField(
+                                    value = remoteCodeInput,
+                                    onValueChange = { remoteCodeInput = it },
+                                    singleLine = true,
+                                    textStyle = t.body.copy(color = c.textPrimary),
+                                    cursorBrush = SolidColor(c.accent),
+                                    decorationBox = { inner ->
+                                        if (remoteCodeInput.isEmpty()) Text("对方6位码", style = t.meta, color = c.textMuted)
                                         inner()
                                     }
                                 )
                             }
                             Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(7.dp))
-                                    .background(c.accent)
+                                modifier = Modifier.clip(RoundedCornerShape(7.dp)).background(c.accent)
                                     .clickable {
-                                        val v = codeOrAddrInput.trim()
-                                        if (v.length == 6 && v.all { it.isDigit() }) {
-                                            pairCode = WhimCoreBridge.setPairCode(v)
-                                            syncStatus = "配对码已更新为 $pairCode"
-                                        } else if (v.contains(":")) {
-                                            WhimCoreBridge.setManualPeers(listOf(v))
-                                            syncStatus = "已添加兜底对端 $v"
+                                        val addr = remoteAddrInput.trim()
+                                        val code = remoteCodeInput.trim()
+                                        if (addr.isNotEmpty() && code.filter { it.isDigit() }.length == 6) {
+                                            scope.launch {
+                                                syncStatus = "正在配对并同步..."
+                                                runCatching { WhimCoreBridge.pairAndSync(addr, code) }
+                                                    .onSuccess { res ->
+                                                        syncStatus = "配对成功！合并 ${res.notesMerged} 条"
+                                                        remoteCodeInput = ""
+                                                        reload()
+                                                    }
+                                                    .onFailure { err -> syncStatus = "配对失败：${err.message}" }
+                                            }
                                         }
-                                        codeOrAddrInput = ""
+                                    }.padding(horizontal = 12.dp, vertical = 8.dp)
+                            ) { Text("配对", style = t.meta, color = Color.White, fontWeight = FontWeight.Medium) }
+                        }
+
+                        if (pairedPeers.isNotEmpty()) {
+                            Text("已配对设备 (${pairedPeers.size})", style = t.meta, color = c.textMuted)
+                            pairedPeers.forEach { p ->
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(7.dp)).background(c.canvas).padding(10.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column {
+                                        Text(p.displayName.ifEmpty { p.peerId }, style = t.body, color = c.textPrimary)
+                                        Text("${p.lastAddr} · 对方码 ${p.pairCode}", style = t.meta, color = c.textMuted)
                                     }
-                                    .padding(horizontal = 14.dp, vertical = 8.dp)
-                            ) {
-                                Text("应用", style = t.meta, color = Color.White, fontWeight = FontWeight.Medium)
+                                    Text(
+                                        "移除",
+                                        style = t.meta,
+                                        color = Color(0xFFE06C75),
+                                        modifier = Modifier.clickable {
+                                            scope.launch {
+                                                WhimCoreBridge.removePairedPeer(p.peerId)
+                                                reload()
+                                            }
+                                        }
+                                    )
+                                }
                             }
                         }
                     }

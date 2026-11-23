@@ -70,6 +70,23 @@ object WhimCoreBridge {
             json.decodeFromString(raw)
         }
 
+    suspend fun listNotesPage(filter: WhimListFilter = WhimListFilter()): WhimNotePage =
+        withContext(Dispatchers.IO) {
+            val raw = Mobile.listNotesPage(json.encodeToString(filter))
+            json.decodeFromString(raw)
+        }
+
+    suspend fun getStats(days: Int = 90): WhimStats = withContext(Dispatchers.IO) {
+        val raw = Mobile.getStats(days.toLong())
+        json.decodeFromString(raw)
+    }
+
+    suspend fun listRandomNotes(query: String = "", limit: Int = 12): List<WhimNote> =
+        withContext(Dispatchers.IO) {
+            val raw = Mobile.listRandomNotes(query, limit.toLong())
+            json.decodeFromString(raw)
+        }
+
     suspend fun listTodayNotes(): List<WhimNote> = withContext(Dispatchers.IO) {
         val raw = Mobile.listTodayNotes()
         json.decodeFromString(raw)

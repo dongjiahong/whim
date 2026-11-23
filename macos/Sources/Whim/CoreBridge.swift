@@ -44,6 +44,43 @@ struct WhimNote: Codable, Identifiable, Equatable {
     }
 }
 
+struct WhimNoteCursor: Codable, Equatable {
+    let pinned: Bool
+    let createdAt: Int64
+    let id: String
+
+    enum CodingKeys: String, CodingKey {
+        case pinned, id
+        case createdAt = "created_at"
+    }
+}
+
+struct WhimNotePage: Codable {
+    let notes: [WhimNote]
+    let hasMore: Bool
+    let nextCursor: WhimNoteCursor?
+
+    enum CodingKeys: String, CodingKey {
+        case notes
+        case hasMore = "has_more"
+        case nextCursor = "next_cursor"
+    }
+}
+
+struct WhimStats: Codable, Equatable {
+    let totalNotes: Int
+    let totalTags: Int
+    let activeDays: Int
+    let dailyCounts: [String: Int]
+
+    enum CodingKeys: String, CodingKey {
+        case totalNotes = "total_notes"
+        case totalTags = "total_tags"
+        case activeDays = "active_days"
+        case dailyCounts = "daily_counts"
+    }
+}
+
 struct WhimTagNode: Codable, Identifiable, Equatable {
     var id: String { fullPath }
     let name: String
@@ -170,8 +207,6 @@ enum WhimCoreError: LocalizedError {
 
 final class CoreBridge {
     static let shared = CoreBridge()
-    private let decoder = JSONDecoder()
-    private let encoder = JSONEncoder()
 
     private init() {}
 
@@ -179,7 +214,7 @@ final class CoreBridge {
         guard let ptr else { throw WhimCoreError.bridge("nil response from core") }
         defer { WhimFreeString(ptr) }
         let str = String(cString: ptr)
-        let env = try decoder.decode(Envelope<T>.self, from: Data(str.utf8))
+        let env = try JSONDecoder().decode(Envelope<T>.self, from: Data(str.utf8))
         if env.ok, let data = env.data {
             return data
         }
@@ -215,7 +250,7 @@ final class CoreBridge {
     }
 
     func createNote(content: String, attachments: [WhimAttachment] = []) throws -> WhimNote {
-        let attData = try encoder.encode(attachments)
+        let attData = try JSONEncoder().encode(attachments)
         let attStr = String(data: attData, encoding: .utf8) ?? "[]"
         return try content.withCString { cContent in
             try attStr.withCString { cAtt in
@@ -241,7 +276,7 @@ final class CoreBridge {
         if let archived { patch["archived"] = archived }
         if let deleted { patch["deleted"] = deleted }
         if let attachments, !attachments.isEmpty {
-            let attData = try encoder.encode(attachments)
+            let attData = try JSONEncoder().encode(attachments)
             if let arr = try JSONSerialization.jsonObject(with: attData) as? [[String: Any]] {
                 patch["attachments"] = arr
             }
@@ -259,20 +294,60 @@ final class CoreBridge {
         dateFromMs: Int64 = 0,
         dateToMs: Int64 = 0,
         includeArchived: Bool = false,
-        limit: Int = 500
+        onlyArchived: Bool = false,
+        limit: Int = 50
     ) throws -> [WhimNote] {
+        try listNotesPage(
+            query: query,
+            tagPrefix: tagPrefix,
+            dateFromMs: dateFromMs,
+            dateToMs: dateToMs,
+            includeArchived: includeArchived,
+            onlyArchived: onlyArchived,
+            limit: limit
+        ).notes
+    }
+
+    func listNotesPage(
+        query: String = "",
+        tagPrefix: String = "",
+        dateFromMs: Int64 = 0,
+        dateToMs: Int64 = 0,
+        includeArchived: Bool = false,
+        onlyArchived: Bool = false,
+        limit: Int = 50,
+        cursor: WhimNoteCursor? = nil
+    ) throws -> WhimNotePage {
         var filter: [String: Any] = [
             "query": query,
             "tag_prefix": tagPrefix,
             "include_archived": includeArchived,
+            "only_archived": onlyArchived,
             "limit": limit
         ]
         if dateFromMs > 0 { filter["date_from_ms"] = dateFromMs }
         if dateToMs > 0 { filter["date_to_ms"] = dateToMs }
+        if let cursor {
+            filter["cursor"] = [
+                "pinned": cursor.pinned,
+                "created_at": cursor.createdAt,
+                "id": cursor.id
+            ]
+        }
         let jsonData = try JSONSerialization.data(withJSONObject: filter)
         let jsonStr = String(data: jsonData, encoding: .utf8) ?? "{}"
         return try jsonStr.withCString { cFilter in
-            try decodeCString(WhimListNotes(UnsafeMutablePointer(mutating: cFilter)), as: [WhimNote].self)
+            try decodeCString(WhimListNotesPage(UnsafeMutablePointer(mutating: cFilter)), as: WhimNotePage.self)
+        }
+    }
+
+    func getStats(days: Int32 = 90) throws -> WhimStats {
+        try decodeCString(WhimGetStats(days), as: WhimStats.self)
+    }
+
+    func listRandomNotes(query: String = "", limit: Int32 = 10) throws -> [WhimNote] {
+        try query.withCString { cQuery in
+            try decodeCString(WhimListRandomNotes(UnsafeMutablePointer(mutating: cQuery), limit), as: [WhimNote].self)
         }
     }
 
@@ -307,7 +382,7 @@ final class CoreBridge {
     }
 
     func setManualPeers(_ addrs: [String]) throws {
-        let data = try encoder.encode(addrs)
+        let data = try JSONEncoder().encode(addrs)
         let str = String(data: data, encoding: .utf8) ?? "[]"
         _ = try str.withCString { cAddrs in
             try decodeCString(WhimSetManualPeers(UnsafeMutablePointer(mutating: cAddrs)), as: String.self)

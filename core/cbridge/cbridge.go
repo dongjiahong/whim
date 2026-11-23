@@ -106,6 +106,33 @@ func WhimListNotes(filterJSON *C.char) *C.char {
 	return okJSON(res)
 }
 
+//export WhimListNotesPage
+func WhimListNotesPage(filterJSON *C.char) *C.char {
+	res, err := mobile.ListNotesPage(C.GoString(filterJSON))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimGetStats
+func WhimGetStats(days C.int) *C.char {
+	res, err := mobile.GetStats(int(days))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimListRandomNotes
+func WhimListRandomNotes(query *C.char, limit C.int) *C.char {
+	res, err := mobile.ListRandomNotes(C.GoString(query), int(limit))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
 //export WhimListTodayNotes
 func WhimListTodayNotes() *C.char {
 	res, err := mobile.ListTodayNotes()

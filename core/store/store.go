@@ -92,6 +92,8 @@ CREATE TABLE IF NOT EXISTS notes (
 );
 CREATE INDEX IF NOT EXISTS idx_notes_updated ON notes(updated_at);
 CREATE INDEX IF NOT EXISTS idx_notes_created ON notes(created_at);
+CREATE INDEX IF NOT EXISTS idx_notes_feed ON notes(deleted, archived, pinned DESC, created_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_notes_deleted_created ON notes(deleted, created_at);
 
 CREATE TABLE IF NOT EXISTS note_tags (
 	note_id  TEXT NOT NULL,
@@ -179,18 +181,35 @@ func (s *Store) SaveBlob(data []byte, mime string) (string, string, int64, error
 	return hash, path, int64(len(data)), nil
 }
 
+// BlobPathWithMIME locates an existing blob file directly via its MIME extension (O(1) stat),
+// falling back to BlobPath only if the expected extension does not exist.
+func (s *Store) BlobPathWithMIME(hash, mime string) (string, bool) {
+	if len(hash) != 64 {
+		return "", false
+	}
+	if mime != "" {
+		candidate := filepath.Join(s.blobsDir, hash+extFromMIME(mime))
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, true
+		}
+	}
+	return s.BlobPath(hash)
+}
+
 // BlobPath locates an existing blob file on disk by its SHA-256 hash.
 func (s *Store) BlobPath(hash string) (string, bool) {
 	if len(hash) != 64 {
 		return "", false
 	}
+	for _, ext := range []string{".png", ".jpg", ".webp", ".gif", ".heic", ".jpeg", ".bin", ""} {
+		candidate := filepath.Join(s.blobsDir, hash+ext)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, true
+		}
+	}
 	matches, err := filepath.Glob(filepath.Join(s.blobsDir, hash+".*"))
 	if err == nil && len(matches) > 0 {
 		return matches[0], true
-	}
-	plain := filepath.Join(s.blobsDir, hash)
-	if _, err := os.Stat(plain); err == nil {
-		return plain, true
 	}
 	return "", false
 }
@@ -425,6 +444,15 @@ func (s *Store) getNoteLocked(id string) (*model.Note, error) {
 
 // ListNotes queries active notes matching the given filter.
 func (s *Store) ListNotes(f model.ListFilter) ([]model.Note, error) {
+	page, err := s.ListNotesPage(f)
+	if err != nil {
+		return nil, err
+	}
+	return page.Notes, nil
+}
+
+// ListNotesPage queries notes with keyset cursor pagination (or offset fallback) and batch-loaded attachments.
+func (s *Store) ListNotesPage(f model.ListFilter) (*model.NotePage, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
@@ -432,7 +460,9 @@ func (s *Store) ListNotes(f model.ListFilter) ([]model.Note, error) {
 	var args []any
 	where = append(where, "n.deleted = 0")
 
-	if !f.IncludeArchived {
+	if f.OnlyArchived {
+		where = append(where, "n.archived = 1")
+	} else if !f.IncludeArchived {
 		where = append(where, "n.archived = 0")
 	}
 	if f.OnlyPinned {
@@ -451,17 +481,25 @@ func (s *Store) ListNotes(f model.ListFilter) ([]model.Note, error) {
 		args = append(args, tp, tp+"/%")
 	}
 	if q := strings.TrimSpace(f.Query); q != "" {
-		// Use LIKE fallback for CJK substrings (FTS5 unicode61 splits on spaces, not Chinese characters)
 		where = append(where, "n.content LIKE ?")
 		args = append(args, "%"+q+"%")
 	}
 
+	useCursor := f.Cursor != nil && f.Cursor.ID != ""
+	if useCursor {
+		cp := boolInt(f.Cursor.Pinned)
+		where = append(where, "(n.pinned < ? OR (n.pinned = ? AND (n.created_at < ? OR (n.created_at = ? AND n.id < ?))))")
+		args = append(args, cp, cp, f.Cursor.CreatedAt, f.Cursor.CreatedAt, f.Cursor.ID)
+	}
+
 	limit := f.Limit
-	if limit <= 0 || limit > 500 {
-		limit = 100
+	if limit <= 0 {
+		limit = 50
+	} else if limit > 500 {
+		limit = 500
 	}
 	offset := f.Offset
-	if offset < 0 {
+	if offset < 0 || useCursor {
 		offset = 0
 	}
 
@@ -469,9 +507,9 @@ func (s *Store) ListNotes(f model.ListFilter) ([]model.Note, error) {
 		SELECT n.id, n.content, n.pinned, n.archived, n.deleted, n.created_at, n.updated_at, n.stamps_json
 		FROM notes n
 		WHERE %s
-		ORDER BY n.pinned DESC, n.created_at DESC
+		ORDER BY n.pinned DESC, n.created_at DESC, n.id DESC
 		LIMIT ? OFFSET ?`, strings.Join(where, " AND "))
-	args = append(args, limit, offset)
+	args = append(args, limit+1, offset)
 
 	rows, err := s.db.Query(query, args...)
 	if err != nil {
@@ -479,7 +517,7 @@ func (s *Store) ListNotes(f model.ListFilter) ([]model.Note, error) {
 	}
 	defer rows.Close()
 
-	var notes []model.Note
+	notes := make([]model.Note, 0, limit)
 	for rows.Next() {
 		var n model.Note
 		var pinned, archived, deleted int
@@ -494,15 +532,192 @@ func (s *Store) ListNotes(f model.ListFilter) ([]model.Note, error) {
 		n.Tags = tags.Extract(n.Content)
 		notes = append(notes, n)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
 
-	for i := range notes {
-		atts, err := s.listNoteAttachmentsLocked(notes[i].ID, false)
-		if err != nil {
+	hasMore := false
+	if len(notes) > limit {
+		hasMore = true
+		notes = notes[:limit]
+	}
+
+	if err := s.attachBatchLocked(notes); err != nil {
+		return nil, err
+	}
+
+	var nextCursor *model.NoteCursor
+	if hasMore && len(notes) > 0 {
+		last := notes[len(notes)-1]
+		nextCursor = &model.NoteCursor{
+			Pinned:    last.Pinned,
+			CreatedAt: last.CreatedAt,
+			ID:        last.ID,
+		}
+	}
+
+	return &model.NotePage{
+		Notes:      notes,
+		HasMore:    hasMore,
+		NextCursor: nextCursor,
+	}, nil
+}
+
+// GetStats computes sidebar totals and recent daily heatmap counts directly in SQL.
+func (s *Store) GetStats(days int) (*model.Stats, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if days <= 0 {
+		days = 90
+	}
+	stats := &model.Stats{
+		ActiveDays:  1,
+		DailyCounts: make(map[string]int),
+	}
+
+	if err := s.db.QueryRow(`SELECT COUNT(1) FROM notes WHERE deleted = 0 AND archived = 0`).Scan(&stats.TotalNotes); err != nil {
+		return nil, err
+	}
+	if err := s.db.QueryRow(`
+		SELECT COUNT(DISTINCT nt.tag_path)
+		FROM note_tags nt
+		JOIN notes n ON n.id = nt.note_id
+		WHERE n.deleted = 0 AND n.archived = 0`).Scan(&stats.TotalTags); err != nil {
+		return nil, err
+	}
+
+	var earliest sql.NullInt64
+	if err := s.db.QueryRow(`SELECT MIN(created_at) FROM notes WHERE deleted = 0 AND archived = 0 AND created_at > 0`).Scan(&earliest); err != nil {
+		return nil, err
+	}
+	if earliest.Valid && earliest.Int64 > 0 {
+		now := time.Now()
+		startDay := time.UnixMilli(earliest.Int64).In(now.Location())
+		startMidnight := time.Date(startDay.Year(), startDay.Month(), startDay.Day(), 0, 0, 0, 0, now.Location())
+		todayMidnight := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+		diffDays := int(todayMidnight.Sub(startMidnight)/(24*time.Hour)) + 1
+		if diffDays > 1 {
+			stats.ActiveDays = diffDays
+		}
+	}
+
+	now := time.Now()
+	cutoff := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -(days - 1))
+	rows, err := s.db.Query(`SELECT created_at FROM notes WHERE deleted = 0 AND archived = 0 AND created_at >= ?`, cutoff.UnixMilli())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var ts int64
+		if err := rows.Scan(&ts); err != nil {
 			return nil, err
 		}
-		notes[i].Attachments = atts
+		key := time.UnixMilli(ts).In(now.Location()).Format("2006-01-02")
+		stats.DailyCounts[key]++
+	}
+	return stats, rows.Err()
+}
+
+// ListRandomNotes returns up to limit randomly sampled active notes directly from SQLite.
+func (s *Store) ListRandomNotes(query string, limit int) ([]model.Note, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 {
+		limit = 10
+	} else if limit > 50 {
+		limit = 50
+	}
+
+	var where []string
+	var args []any
+	where = append(where, "deleted = 0", "archived = 0")
+	if q := strings.TrimSpace(query); q != "" {
+		where = append(where, "content LIKE ?")
+		args = append(args, "%"+q+"%")
+	}
+	args = append(args, limit)
+
+	sqlStr := fmt.Sprintf(`
+		SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
+		FROM notes
+		WHERE %s
+		ORDER BY RANDOM()
+		LIMIT ?`, strings.Join(where, " AND "))
+
+	rows, err := s.db.Query(sqlStr, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	notes := make([]model.Note, 0, limit)
+	for rows.Next() {
+		var n model.Note
+		var pinned, archived, deleted int
+		var stampsRaw string
+		if err := rows.Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
+			return nil, err
+		}
+		n.Pinned = pinned != 0
+		n.Archived = archived != 0
+		n.Deleted = deleted != 0
+		_ = json.Unmarshal([]byte(stampsRaw), &n.Stamps)
+		n.Tags = tags.Extract(n.Content)
+		notes = append(notes, n)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := s.attachBatchLocked(notes); err != nil {
+		return nil, err
 	}
 	return notes, nil
+}
+
+func (s *Store) attachBatchLocked(notes []model.Note) error {
+	if len(notes) == 0 {
+		return nil
+	}
+	placeholders := make([]string, len(notes))
+	args := make([]any, len(notes))
+	idxByID := make(map[string]int, len(notes))
+	for i := range notes {
+		placeholders[i] = "?"
+		args[i] = notes[i].ID
+		idxByID[notes[i].ID] = i
+	}
+
+	q := fmt.Sprintf(`
+		SELECT id, note_id, sha256, mime, width, height, size_bytes, sort_order, deleted, updated_at
+		FROM note_attachments
+		WHERE deleted = 0 AND note_id IN (%s)
+		ORDER BY note_id ASC, sort_order ASC, id ASC`, strings.Join(placeholders, ","))
+
+	rows, err := s.db.Query(q, args...)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var a model.Attachment
+		var del int
+		if err := rows.Scan(&a.ID, &a.NoteID, &a.SHA256, &a.MIME, &a.Width, &a.Height, &a.SizeBytes, &a.SortOrder, &del, &a.UpdatedAt); err != nil {
+			return err
+		}
+		a.Deleted = del != 0
+		if p, ok := s.BlobPathWithMIME(a.SHA256, a.MIME); ok {
+			a.LocalPath = p
+		}
+		if idx, ok := idxByID[a.NoteID]; ok {
+			notes[idx].Attachments = append(notes[idx].Attachments, a)
+		}
+	}
+	return rows.Err()
 }
 
 // CountNotesInRange counts non-deleted notes created within [fromMs, toMs].

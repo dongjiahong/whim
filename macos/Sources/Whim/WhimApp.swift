@@ -13,8 +13,9 @@ enum SidebarTab: Equatable {
 
 @MainActor
 final class WhimStoreVM: ObservableObject {
-    @Published var allNotes: [WhimNote] = []
     @Published var displayedNotes: [WhimNote] = []
+    @Published var hasMore: Bool = false
+    @Published var isLoadingMore: Bool = false
     @Published var tagTree: [WhimTagNode] = []
     @Published var searchQuery: String = ""
     @Published var activeTab: SidebarTab = .all
@@ -30,10 +31,13 @@ final class WhimStoreVM: ObservableObject {
     // Undo delete toast
     @Published var lastDeletedNoteId: String? = nil
     private var undoDismissTask: DispatchWorkItem?
-    private var autoSyncTimer: Timer?
-    private var localPollTimer: Timer?
+    private var searchDebounceTask: DispatchWorkItem?
+    private var nextCursor: WhimNoteCursor? = nil
+    private var filterRequestGen: Int = 0
+    private let pageSize: Int = 50
+    private let ioQueue = DispatchQueue(label: "whim.store.io", qos: .userInitiated)
 
-    // Stats for sidebar
+    // Stats for sidebar (computed in SQLite)
     @Published var totalNoteCount: Int = 0
     @Published var totalTagCount: Int = 0
     @Published var activeDayCount: Int = 1
@@ -62,64 +66,192 @@ final class WhimStoreVM: ObservableObject {
     }
 
     func reload() {
-        do {
-            let full = try CoreBridge.shared.listNotes(query: "", tagPrefix: "", includeArchived: false, limit: 500)
-            allNotes = full
-            tagTree = try CoreBridge.shared.listTagTree()
-            recomputeStats(from: full)
-            applyFilter()
-        } catch {
-            syncMessage = error.localizedDescription
+        refreshMetadata()
+        applyFilter()
+    }
+
+    func refreshMetadata() {
+        ioQueue.async { [weak self] in
+            let stats = try? CoreBridge.shared.getStats(days: 90)
+            let tree = try? CoreBridge.shared.listTagTree()
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let stats {
+                    self.totalNoteCount = stats.totalNotes
+                    self.totalTagCount = stats.totalTags
+                    self.activeDayCount = stats.activeDays
+                    self.dailyCounts = stats.dailyCounts
+                }
+                if let tree {
+                    self.tagTree = tree
+                }
+            }
         }
     }
 
+    func scheduleSearchFilter() {
+        searchDebounceTask?.cancel()
+        let task = DispatchWorkItem { [weak self] in
+            self?.applyFilter()
+        }
+        searchDebounceTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.18, execute: task)
+    }
+
     func applyFilter() {
-        do {
-            switch activeTab {
-            case .all:
-                displayedNotes = searchQuery.isEmpty
-                    ? allNotes
-                    : try CoreBridge.shared.listNotes(query: searchQuery)
+        filterRequestGen += 1
+        let gen = filterRequestGen
+        let tab = activeTab
+        let query = searchQuery
+        let revDate = reviewDate
+        let limit = pageSize
+        nextCursor = nil
+        hasMore = false
+        isLoadingMore = false
+
+        if tab == .random {
+            reshuffleRandom()
+            return
+        }
+
+        let dayRange: (Int64, Int64)? = { () -> (Int64, Int64)? in
+            switch tab {
             case .review:
-                let start = Calendar.current.startOfDay(for: reviewDate)
+                let start = Calendar.current.startOfDay(for: revDate)
                 let end = start.addingTimeInterval(86400 - 0.001)
-                displayedNotes = try CoreBridge.shared.listNotes(
-                    query: searchQuery,
-                    dateFromMs: Int64(start.timeIntervalSince1970 * 1000),
-                    dateToMs: Int64(end.timeIntervalSince1970 * 1000),
-                    includeArchived: true
-                )
-            case .random:
-                reshuffleRandom()
-            case .archived:
-                let allInc = try CoreBridge.shared.listNotes(query: searchQuery, includeArchived: true, limit: 500)
-                displayedNotes = allInc.filter { $0.archived }
+                return (Int64(start.timeIntervalSince1970 * 1000), Int64(end.timeIntervalSince1970 * 1000))
             case .day(let dayStr):
-                if let d = dayFmt.date(from: dayStr) {
-                    let start = Calendar.current.startOfDay(for: d)
-                    let end = start.addingTimeInterval(86400 - 0.001)
-                    displayedNotes = try CoreBridge.shared.listNotes(
-                        query: searchQuery,
-                        dateFromMs: Int64(start.timeIntervalSince1970 * 1000),
-                        dateToMs: Int64(end.timeIntervalSince1970 * 1000),
-                        includeArchived: true
-                    )
-                } else {
-                    displayedNotes = []
-                }
-            case .tag(let path):
-                displayedNotes = try CoreBridge.shared.listNotes(query: searchQuery, tagPrefix: path)
+                guard let d = dayFmt.date(from: dayStr) else { return nil }
+                let start = Calendar.current.startOfDay(for: d)
+                let end = start.addingTimeInterval(86400 - 0.001)
+                return (Int64(start.timeIntervalSince1970 * 1000), Int64(end.timeIntervalSince1970 * 1000))
+            default:
+                return nil
             }
-        } catch {
-            syncMessage = error.localizedDescription
+        }()
+
+        ioQueue.async { [weak self] in
+            do {
+                let page: WhimNotePage
+                switch tab {
+                case .all:
+                    page = try CoreBridge.shared.listNotesPage(query: query, limit: limit)
+                case .review, .day:
+                    if let (fromMs, toMs) = dayRange {
+                        page = try CoreBridge.shared.listNotesPage(
+                            query: query,
+                            dateFromMs: fromMs,
+                            dateToMs: toMs,
+                            includeArchived: true,
+                            limit: limit
+                        )
+                    } else {
+                        page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
+                    }
+                case .archived:
+                    page = try CoreBridge.shared.listNotesPage(query: query, onlyArchived: true, limit: limit)
+                case .tag(let path):
+                    page = try CoreBridge.shared.listNotesPage(query: query, tagPrefix: path, limit: limit)
+                case .random:
+                    page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.filterRequestGen == gen else { return }
+                    self.displayedNotes = page.notes
+                    self.hasMore = page.hasMore
+                    self.nextCursor = page.nextCursor
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.syncMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    func loadMore() {
+        guard hasMore, !isLoadingMore, let cursor = nextCursor, activeTab != .random else { return }
+        isLoadingMore = true
+        let gen = filterRequestGen
+        let tab = activeTab
+        let query = searchQuery
+        let revDate = reviewDate
+        let limit = pageSize
+
+        let dayRange: (Int64, Int64)? = { () -> (Int64, Int64)? in
+            switch tab {
+            case .review:
+                let start = Calendar.current.startOfDay(for: revDate)
+                let end = start.addingTimeInterval(86400 - 0.001)
+                return (Int64(start.timeIntervalSince1970 * 1000), Int64(end.timeIntervalSince1970 * 1000))
+            case .day(let dayStr):
+                guard let d = dayFmt.date(from: dayStr) else { return nil }
+                let start = Calendar.current.startOfDay(for: d)
+                let end = start.addingTimeInterval(86400 - 0.001)
+                return (Int64(start.timeIntervalSince1970 * 1000), Int64(end.timeIntervalSince1970 * 1000))
+            default:
+                return nil
+            }
+        }()
+
+        ioQueue.async { [weak self] in
+            do {
+                let page: WhimNotePage
+                switch tab {
+                case .all:
+                    page = try CoreBridge.shared.listNotesPage(query: query, limit: limit, cursor: cursor)
+                case .review, .day:
+                    if let (fromMs, toMs) = dayRange {
+                        page = try CoreBridge.shared.listNotesPage(
+                            query: query,
+                            dateFromMs: fromMs,
+                            dateToMs: toMs,
+                            includeArchived: true,
+                            limit: limit,
+                            cursor: cursor
+                        )
+                    } else {
+                        page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
+                    }
+                case .archived:
+                    page = try CoreBridge.shared.listNotesPage(query: query, onlyArchived: true, limit: limit, cursor: cursor)
+                case .tag(let path):
+                    page = try CoreBridge.shared.listNotesPage(query: query, tagPrefix: path, limit: limit, cursor: cursor)
+                case .random:
+                    page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
+                }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.filterRequestGen == gen else { return }
+                    self.isLoadingMore = false
+                    let existing = Set(self.displayedNotes.map(\.id))
+                    let fresh = page.notes.filter { !existing.contains($0.id) }
+                    self.displayedNotes.append(contentsOf: fresh)
+                    self.hasMore = page.hasMore && !fresh.isEmpty
+                    self.nextCursor = page.nextCursor
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.filterRequestGen == gen else { return }
+                    self.isLoadingMore = false
+                    self.syncMessage = error.localizedDescription
+                }
+            }
         }
     }
 
     func reshuffleRandom() {
-        let pool = searchQuery.isEmpty
-            ? allNotes
-            : allNotes.filter { $0.content.localizedCaseInsensitiveContains(searchQuery) }
-        displayedNotes = Array(pool.shuffled().prefix(10))
+        filterRequestGen += 1
+        let gen = filterRequestGen
+        let query = searchQuery
+        hasMore = false
+        nextCursor = nil
+        ioQueue.async { [weak self] in
+            let items = (try? CoreBridge.shared.listRandomNotes(query: query, limit: 10)) ?? []
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.filterRequestGen == gen else { return }
+                self.displayedNotes = items
+            }
+        }
     }
 
     func shiftReviewDay(by days: Int) {
@@ -135,48 +267,28 @@ final class WhimStoreVM: ObservableObject {
         applyFilter()
     }
 
-    private func recomputeStats(from notes: [WhimNote]) {
-        totalNoteCount = notes.count
-        var tagSet = Set<String>()
-        var counts: [String: Int] = [:]
-        var earliestMs: Int64 = Int64.max
-
-        for n in notes {
-            if let tags = n.tags {
-                for t in tags { tagSet.insert(t) }
-            }
-            if n.createdAt > 0 {
-                if n.createdAt < earliestMs { earliestMs = n.createdAt }
-                let d = Date(timeIntervalSince1970: TimeInterval(n.createdAt) / 1000.0)
-                let key = dayFmt.string(from: d)
-                counts[key, default: 0] += 1
-            }
-        }
-        totalTagCount = tagSet.count
-        dailyCounts = counts
-        if earliestMs < Int64.max {
-            let start = Date(timeIntervalSince1970: TimeInterval(earliestMs) / 1000.0)
-            let days = Calendar.current.dateComponents([.day], from: start, to: Date()).day ?? 0
-            activeDayCount = max(1, days + 1)
-        } else {
-            activeDayCount = 1
-        }
-    }
-
     func createNote(content: String, attachments: [WhimAttachment]) {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
-        _ = try? CoreBridge.shared.createNote(content: trimmed, attachments: attachments)
-        reload()
-        syncNow()
+        do {
+            _ = try CoreBridge.shared.createNote(content: trimmed, attachments: attachments)
+            reload()
+            syncNow()
+        } catch {
+            syncMessage = "保存失败: \(error.localizedDescription)"
+        }
     }
 
     func editNote(id: String, content: String, attachments: [WhimAttachment]) {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty || !attachments.isEmpty else { return }
-        _ = try? CoreBridge.shared.updateNote(id: id, content: trimmed, attachments: attachments)
-        reload()
-        syncNow()
+        do {
+            _ = try CoreBridge.shared.updateNote(id: id, content: trimmed, attachments: attachments)
+            reload()
+            syncNow()
+        } catch {
+            syncMessage = "更新失败: \(error.localizedDescription)"
+        }
     }
 
     func togglePin(_ note: WhimNote) {
@@ -220,22 +332,12 @@ final class WhimStoreVM: ObservableObject {
                 let changed = CoreBridge.shared.waitForChange(timeoutSec: 25)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
-                    self.reloadIfChanged()
                     if changed {
+                        self.reload()
                         self.syncNow()
                     }
                 }
             }
-        }
-    }
-
-    private func reloadIfChanged() {
-        guard let full = try? CoreBridge.shared.listNotes(query: "", tagPrefix: "", includeArchived: false, limit: 500) else { return }
-        if full != allNotes {
-            allNotes = full
-            tagTree = (try? CoreBridge.shared.listTagTree()) ?? tagTree
-            recomputeStats(from: full)
-            applyFilter()
         }
     }
 
@@ -247,8 +349,10 @@ final class WhimStoreVM: ObservableObject {
             let res = try? CoreBridge.shared.syncOnce(timeoutSec: 6)
             DispatchQueue.main.async {
                 self.isSyncing = false
+                var hasRemoteUpdates = false
                 if let res {
                     self.peerStatuses = res.peers ?? []
+                    hasRemoteUpdates = res.notesMerged > 0 || res.blobsDownloaded > 0
                     if res.peersSynced > 0 {
                         self.syncMessage = "已同步 \(res.peersSynced) 台设备" + (res.notesMerged > 0 ? " · 合并 \(res.notesMerged) 条" : "")
                     } else if let firstErr = self.peerStatuses.first(where: { $0.status != "synced" }) {
@@ -258,7 +362,9 @@ final class WhimStoreVM: ObservableObject {
                     }
                 }
                 self.refreshSyncState()
-                self.reload()
+                if hasRemoteUpdates {
+                    self.reload()
+                }
             }
         }
     }
@@ -375,9 +481,13 @@ final class WhimStoreVM: ObservableObject {
     }
 
     func clearSampleNotes() {
-        let all = (try? CoreBridge.shared.listNotes(includeArchived: true, limit: 500)) ?? []
-        for n in all where (n.tags ?? []).contains("示例") {
-            _ = try? CoreBridge.shared.updateNote(id: n.id, deleted: true)
+        var cursor: WhimNoteCursor? = nil
+        while let page = try? CoreBridge.shared.listNotesPage(tagPrefix: "示例", includeArchived: true, limit: 200, cursor: cursor) {
+            for n in page.notes {
+                _ = try? CoreBridge.shared.updateNote(id: n.id, deleted: true)
+            }
+            if !page.hasMore || page.nextCursor == nil { break }
+            cursor = page.nextCursor
         }
         reload()
     }
@@ -846,7 +956,7 @@ struct MainContentView: View {
                                 .font(.system(size: 12.5))
                                 .foregroundColor(FlomoPalette.textPrimary(scheme))
                                 .focused($searchFocused)
-                                .onChange(of: vm.searchQuery) { _, _ in vm.applyFilter() }
+                                .onChange(of: vm.searchQuery) { _, _ in vm.scheduleSearchFilter() }
                             if !vm.searchQuery.isEmpty {
                                 Button {
                                     vm.searchQuery = ""
@@ -913,35 +1023,73 @@ struct MainContentView: View {
                         LazyVStack(spacing: 12) {
                             if vm.displayedNotes.isEmpty {
                                 VStack(spacing: 8) {
-                                    Text("暂无记录")
+                                    Text(vm.searchQuery.isEmpty ? "暂无记录" : "未找到匹配“\(vm.searchQuery)”的笔记")
                                         .font(.system(size: 14))
                                         .foregroundColor(FlomoPalette.textMuted(scheme))
-                                    Text("在上方输入框记下想法（支持 ⌘V 光标处贴图），或随时按 ⌘⇧J 呼出悬浮速记")
-                                        .font(.system(size: 12))
-                                        .foregroundColor(FlomoPalette.textMuted(scheme))
+                                    if vm.searchQuery.isEmpty {
+                                        Text("在上方输入框记下想法（支持 ⌘V 光标处贴图），或随时按 ⌘⇧J 呼出悬浮速记")
+                                            .font(.system(size: 12))
+                                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                                    } else {
+                                        Button("清除搜索") {
+                                            vm.searchQuery = ""
+                                            vm.applyFilter()
+                                        }
+                                        .buttonStyle(.plain)
+                                        .font(.system(size: 12.5))
+                                        .foregroundColor(FlomoPalette.tagText(scheme))
+                                    }
                                 }
                                 .frame(maxWidth: .infinity)
                                 .padding(.top, 56)
                             } else {
-                                ForEach(vm.displayedNotes) { note in
-                                    if editingNoteId == note.id {
-                                        FlomoComposerView(vm: vm, editingNote: note) {
-                                            editingNoteId = nil
+                                ForEach(Array(vm.displayedNotes.enumerated()), id: \.element.id) { idx, note in
+                                    Group {
+                                        if editingNoteId == note.id {
+                                            FlomoComposerView(vm: vm, editingNote: note) {
+                                                editingNoteId = nil
+                                            }
+                                        } else {
+                                            FlomoNoteCard(
+                                                note: note,
+                                                onTapTag: { path in
+                                                    vm.activeTab = .tag(path)
+                                                    vm.applyFilter()
+                                                },
+                                                onTapImage: { path in previewImagePath = path },
+                                                onEdit: { editingNoteId = note.id },
+                                                onPin: { vm.togglePin(note) },
+                                                onArchive: { vm.toggleArchive(note) },
+                                                onDelete: { vm.deleteNote(note) }
+                                            )
                                         }
-                                    } else {
-                                        FlomoNoteCard(
-                                            note: note,
-                                            onTapTag: { path in
-                                                vm.activeTab = .tag(path)
-                                                vm.applyFilter()
-                                            },
-                                            onTapImage: { path in previewImagePath = path },
-                                            onEdit: { editingNoteId = note.id },
-                                            onPin: { vm.togglePin(note) },
-                                            onArchive: { vm.toggleArchive(note) },
-                                            onDelete: { vm.deleteNote(note) }
-                                        )
                                     }
+                                    .onAppear {
+                                        if idx >= vm.displayedNotes.count - 5 {
+                                            vm.loadMore()
+                                        }
+                                    }
+                                }
+
+                                if vm.isLoadingMore {
+                                    HStack(spacing: 8) {
+                                        ProgressView().controlSize(.small)
+                                        Text("正在加载更多...")
+                                            .font(.system(size: 12))
+                                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                                    }
+                                    .padding(.vertical, 12)
+                                } else if vm.hasMore {
+                                    Button("加载更多") { vm.loadMore() }
+                                        .buttonStyle(.plain)
+                                        .font(.system(size: 12.5))
+                                        .foregroundColor(FlomoPalette.tagText(scheme))
+                                        .padding(.vertical, 10)
+                                } else if vm.displayedNotes.count >= 20 {
+                                    Text("已加载全部 \(vm.displayedNotes.count) 条")
+                                        .font(.system(size: 11.5))
+                                        .foregroundColor(FlomoPalette.textMuted(scheme))
+                                        .padding(.vertical, 10)
                                 }
                             }
                         }
@@ -1210,11 +1358,15 @@ private struct FlomoNoteCard: View {
 
     @State private var expanded: Bool = false
 
-    private var formattedTime: String {
-        let d = Date(timeIntervalSince1970: TimeInterval(note.createdAt) / 1000.0)
+    private static let cardTimeFmt: DateFormatter = {
         let f = DateFormatter()
         f.dateFormat = "yyyy-MM-dd HH:mm"
-        return f.string(from: d)
+        return f
+    }()
+
+    private var formattedTime: String {
+        let d = Date(timeIntervalSince1970: TimeInterval(note.createdAt) / 1000.0)
+        return Self.cardTimeFmt.string(from: d)
     }
 
     private var blocks: [NoteContentBlock] {
@@ -1281,7 +1433,7 @@ private struct FlomoNoteCard: View {
                     case .text(_, let val):
                         MarkdownBlockView(text: val, collapsed: !expanded && isLongNote)
                     case .image(_, _, let path):
-                        if let img = NSImage(contentsOfFile: path) {
+                        if let img = ThumbnailCache.shared.image(forPath: path) {
                             Image(nsImage: img)
                                 .resizable()
                                 .scaledToFit()

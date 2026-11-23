@@ -74,18 +74,19 @@ enum NoteContentParser {
         return blocks
     }
 
+    private static let tagStripRegex = try! NSRegularExpression(
+        pattern: #"(^|[\s(\[{（【「『，。、；：！？,.;:!?])#([^\s#,.;:!?，。、；：！？)\]}）】」』]+)"#,
+        options: [.anchorsMatchLines]
+    )
+
     /// Removes `#tag/subtag` tokens that are already shown as top tag pills on the card,
     /// collapsing any blank lines left behind without mutating the underlying stored content.
     static func stripInlineTags(from text: String, tags: [String]) -> String {
         let tagSet = Set(tags.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
         guard !tagSet.isEmpty else { return text }
 
-        let tagPattern = try! NSRegularExpression(
-            pattern: #"(^|[\s(\[{（【「『，。、；：！？,.;:!?])#([^\s#,.;:!?，。、；：！？)\]}）】」』]+)"#,
-            options: [.anchorsMatchLines]
-        )
         let ns = text as NSString
-        let matches = tagPattern.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
+        let matches = tagStripRegex.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
 
         let mutable = NSMutableString(string: text)
         for m in matches.reversed() {
@@ -135,6 +136,26 @@ enum NoteContentParser {
             }
         }
         return nil
+    }
+}
+
+/// Bounded in-memory cache of decoded card images to avoid repeated synchronous disk I/O during scrolling.
+final class ThumbnailCache {
+    static let shared = ThumbnailCache()
+    private let cache: NSCache<NSString, NSImage> = {
+        let c = NSCache<NSString, NSImage>()
+        c.countLimit = 120
+        return c
+    }()
+
+    func image(forPath path: String) -> NSImage? {
+        let key = path as NSString
+        if let hit = cache.object(forKey: key) {
+            return hit
+        }
+        guard let img = NSImage(contentsOfFile: path) else { return nil }
+        cache.setObject(img, forKey: key)
+        return img
     }
 }
 

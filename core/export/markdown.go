@@ -23,12 +23,29 @@ type Result struct {
 
 // Markdown exports notes matching filter into daily YYYY-MM-DD.md files plus an attachments/ folder.
 func Markdown(st *store.Store, f model.ListFilter, outDir string) (*Result, error) {
-	if f.Limit <= 0 {
-		f.Limit = 500
-	}
-	notes, err := st.ListNotes(f)
-	if err != nil {
-		return nil, err
+	var notes []model.Note
+	if f.Limit > 0 {
+		batch, err := st.ListNotes(f)
+		if err != nil {
+			return nil, err
+		}
+		notes = batch
+	} else {
+		pageFilter := f
+		pageFilter.Limit = 200
+		pageFilter.Offset = 0
+		pageFilter.Cursor = nil
+		for {
+			page, err := st.ListNotesPage(pageFilter)
+			if err != nil {
+				return nil, err
+			}
+			notes = append(notes, page.Notes...)
+			if !page.HasMore || page.NextCursor == nil {
+				break
+			}
+			pageFilter.Cursor = page.NextCursor
+		}
 	}
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
 		return nil, err

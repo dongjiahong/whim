@@ -40,11 +40,35 @@ data class WhimTagNode(
 )
 
 @Serializable
+data class WhimNoteCursor(
+    val pinned: Boolean = false,
+    @SerialName("created_at") val createdAt: Long = 0,
+    val id: String = ""
+)
+
+@Serializable
+data class WhimNotePage(
+    val notes: List<WhimNote> = emptyList(),
+    @SerialName("has_more") val hasMore: Boolean = false,
+    @SerialName("next_cursor") val nextCursor: WhimNoteCursor? = null
+)
+
+@Serializable
+data class WhimStats(
+    @SerialName("total_notes") val totalNotes: Int = 0,
+    @SerialName("total_tags") val totalTags: Int = 0,
+    @SerialName("active_days") val activeDays: Int = 1,
+    @SerialName("daily_counts") val dailyCounts: Map<String, Int> = emptyMap()
+)
+
+@Serializable
 data class WhimListFilter(
     val query: String = "",
     @SerialName("tag_prefix") val tagPrefix: String = "",
     @SerialName("include_archived") val includeArchived: Boolean = false,
-    val limit: Int = 100
+    @SerialName("only_archived") val onlyArchived: Boolean = false,
+    val limit: Int = 50,
+    val cursor: WhimNoteCursor? = null
 )
 
 @Serializable

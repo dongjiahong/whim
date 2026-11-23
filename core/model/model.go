@@ -70,16 +70,40 @@ type TagNode struct {
 	Children []TagNode `json:"children,omitempty"`
 }
 
+// NoteCursor represents a keyset pagination cursor ordered by (pinned DESC, created_at DESC, id DESC).
+type NoteCursor struct {
+	Pinned    bool   `json:"pinned"`
+	CreatedAt int64  `json:"created_at"`
+	ID        string `json:"id"`
+}
+
 // ListFilter controls note queries.
 type ListFilter struct {
-	Query           string `json:"query,omitempty"`
-	TagPrefix       string `json:"tag_prefix,omitempty"`
-	DateFromMs      int64  `json:"date_from_ms,omitempty"`
-	DateToMs        int64  `json:"date_to_ms,omitempty"`
-	IncludeArchived bool   `json:"include_archived,omitempty"`
-	OnlyPinned      bool   `json:"only_pinned,omitempty"`
-	Limit           int    `json:"limit,omitempty"`
-	Offset          int    `json:"offset,omitempty"`
+	Query           string      `json:"query,omitempty"`
+	TagPrefix       string      `json:"tag_prefix,omitempty"`
+	DateFromMs      int64       `json:"date_from_ms,omitempty"`
+	DateToMs        int64       `json:"date_to_ms,omitempty"`
+	IncludeArchived bool        `json:"include_archived,omitempty"`
+	OnlyArchived    bool        `json:"only_archived,omitempty"`
+	OnlyPinned      bool        `json:"only_pinned,omitempty"`
+	Limit           int         `json:"limit,omitempty"`
+	Offset          int         `json:"offset,omitempty"`
+	Cursor          *NoteCursor `json:"cursor,omitempty"`
+}
+
+// NotePage is a paginated slice of notes with a keyset cursor for the next page.
+type NotePage struct {
+	Notes      []Note      `json:"notes"`
+	HasMore    bool        `json:"has_more"`
+	NextCursor *NoteCursor `json:"next_cursor,omitempty"`
+}
+
+// Stats holds SQL-aggregated sidebar counters and recent daily heatmap counts.
+type Stats struct {
+	TotalNotes  int            `json:"total_notes"`
+	TotalTags   int            `json:"total_tags"`
+	ActiveDays  int            `json:"active_days"`
+	DailyCounts map[string]int `json:"daily_counts"`
 }
 
 // SyncPeer records per-peer pairing credentials and sync watermark locally.

@@ -79,3 +79,116 @@ func TestStoreCRUDTagsBlobsAndExport(t *testing.T) {
 		t.Fatalf("expected exported attachment image: %v", err)
 	}
 }
+
+func TestPaginationStatsRandomAndBatchExport(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	// Create 560 active notes (3 pinned), 5 archived, 2 deleted
+	const totalActive = 560
+	for i := 0; i < totalActive; i++ {
+		content := "笔记内容 #测试/分页"
+		if i%2 == 0 {
+			content += " #偶数"
+		}
+		n, err := st.CreateNote(content, nil)
+		if err != nil {
+			t.Fatalf("create note %d: %v", i, err)
+		}
+		if i < 3 {
+			pinned := true
+			if _, err := st.UpdateNote(n.ID, nil, &pinned, nil, nil); err != nil {
+				t.Fatalf("pin note %d: %v", i, err)
+			}
+		}
+	}
+	for i := 0; i < 5; i++ {
+		n, err := st.CreateNote("归档内容 #归档", nil)
+		if err != nil {
+			t.Fatalf("create archived: %v", err)
+		}
+		arch := true
+		if _, err := st.UpdateNote(n.ID, nil, nil, &arch, nil); err != nil {
+			t.Fatalf("archive: %v", err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		n, err := st.CreateNote("已删内容", nil)
+		if err != nil {
+			t.Fatalf("create deleted: %v", err)
+		}
+		del := true
+		if _, err := st.UpdateNote(n.ID, nil, nil, nil, &del); err != nil {
+			t.Fatalf("delete: %v", err)
+		}
+	}
+
+	// Walk all active notes via keyset cursor pagination (page size 50)
+	seen := make(map[string]bool)
+	var cursor *model.NoteCursor
+	pages := 0
+	for {
+		page, err := st.ListNotesPage(model.ListFilter{Limit: 50, Cursor: cursor})
+		if err != nil {
+			t.Fatalf("list page %d: %v", pages, err)
+		}
+		pages++
+		for _, n := range page.Notes {
+			if seen[n.ID] {
+				t.Fatalf("duplicate note id %s across pages", n.ID)
+			}
+			seen[n.ID] = true
+		}
+		if !page.HasMore {
+			break
+		}
+		if page.NextCursor == nil {
+			t.Fatalf("expected next cursor when has_more is true")
+		}
+		cursor = page.NextCursor
+	}
+	if len(seen) != totalActive {
+		t.Fatalf("expected %d unique active notes across pages, got %d (pages=%d)", totalActive, len(seen), pages)
+	}
+
+	// OnlyArchived filter
+	archPage, err := st.ListNotesPage(model.ListFilter{OnlyArchived: true, Limit: 50})
+	if err != nil || len(archPage.Notes) != 5 || archPage.HasMore {
+		t.Fatalf("expected 5 archived notes, got %d (hasMore=%v, err=%v)", len(archPage.Notes), archPage.HasMore, err)
+	}
+
+	// SQL Stats
+	stats, err := st.GetStats(84)
+	if err != nil {
+		t.Fatalf("get stats: %v", err)
+	}
+	if stats.TotalNotes != totalActive {
+		t.Fatalf("expected TotalNotes=%d, got %d", totalActive, stats.TotalNotes)
+	}
+	if stats.TotalTags != 2 {
+		t.Fatalf("expected TotalTags=2, got %d", stats.TotalTags)
+	}
+	if stats.ActiveDays < 1 {
+		t.Fatalf("expected ActiveDays >= 1, got %d", stats.ActiveDays)
+	}
+
+	// Random walk
+	rnd, err := st.ListRandomNotes("", 10)
+	if err != nil || len(rnd) != 10 {
+		t.Fatalf("expected 10 random notes, got %d (%v)", len(rnd), err)
+	}
+
+	// Export all 560 notes (must not truncate at 500)
+	expDir := filepath.Join(t.TempDir(), "md_all")
+	res, err := export.Markdown(st, model.ListFilter{}, expDir)
+	if err != nil {
+		t.Fatalf("export markdown: %v", err)
+	}
+	if res.NotesExported != totalActive {
+		t.Fatalf("expected %d exported notes, got %d", totalActive, res.NotesExported)
+	}
+}

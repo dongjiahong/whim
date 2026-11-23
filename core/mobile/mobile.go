@@ -141,6 +141,60 @@ func ListNotes(filterJSON string) (string, error) {
 	return string(b), err
 }
 
+// ListNotesPage queries notes with keyset pagination and returns JSON model.NotePage.
+func ListNotesPage(filterJSON string) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	var f model.ListFilter
+	if filterJSON != "" {
+		if err := json.Unmarshal([]byte(filterJSON), &f); err != nil {
+			return "", err
+		}
+	}
+	page, err := e.Store.ListNotesPage(f)
+	if err != nil {
+		return "", err
+	}
+	if page.Notes == nil {
+		page.Notes = []model.Note{}
+	}
+	b, err := json.Marshal(page)
+	return string(b), err
+}
+
+// GetStats returns SQL-aggregated sidebar totals and daily heatmap counts as JSON.
+func GetStats(days int) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	stats, err := e.Store.GetStats(days)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(stats)
+	return string(b), err
+}
+
+// ListRandomNotes returns up to limit randomly sampled active notes as JSON array.
+func ListRandomNotes(query string, limit int) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	notes, err := e.Store.ListRandomNotes(query, limit)
+	if err != nil {
+		return "", err
+	}
+	if notes == nil {
+		notes = []model.Note{}
+	}
+	b, err := json.Marshal(notes)
+	return string(b), err
+}
+
 // ListTodayNotes returns today's notes as JSON array (for Daily Review).
 func ListTodayNotes() (string, error) {
 	e, err := requireEngine()

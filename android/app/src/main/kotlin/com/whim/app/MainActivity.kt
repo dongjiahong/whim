@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
@@ -57,12 +58,16 @@ import androidx.compose.material3.ModalNavigationDrawer
 import androidx.compose.material3.Text
 import androidx.compose.material3.rememberDrawerState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -86,6 +91,8 @@ import com.whim.app.capture.WhimWidgetProvider
 import com.whim.app.core.WhimCoreBridge
 import com.whim.app.core.WhimListFilter
 import com.whim.app.core.WhimNote
+import com.whim.app.core.WhimNoteCursor
+import com.whim.app.core.WhimStats
 import com.whim.app.core.WhimTagNode
 import com.whim.app.sync.SyncWorker
 import com.whim.app.ui.theme.WhimTheme
@@ -186,8 +193,14 @@ private fun FlomoMobileApp(
     var checkingUpdate by remember { mutableStateOf(false) }
     var randomSeed by remember { mutableStateOf(0) }
 
-    var allNotes by remember { mutableStateOf<List<WhimNote>>(emptyList()) }
+    var stats by remember { mutableStateOf(WhimStats()) }
     var displayedNotes by remember { mutableStateOf<List<WhimNote>>(emptyList()) }
+    var hasMore by remember { mutableStateOf(false) }
+    var isLoadingMore by remember { mutableStateOf(false) }
+    var nextCursor by remember { mutableStateOf<WhimNoteCursor?>(null) }
+    var filterGen by remember { mutableStateOf(0) }
+    val pageSize = 50
+
     var tagTree by remember { mutableStateOf<List<WhimTagNode>>(emptyList()) }
     var pairCode by remember { mutableStateOf("") }
     var syncStatus by remember { mutableStateOf("") }
@@ -195,51 +208,117 @@ private fun FlomoMobileApp(
     var manualAddrInput by remember { mutableStateOf("") }
     var peerStatuses by remember { mutableStateOf<List<com.whim.app.core.WhimPeerSyncStatus>>(emptyList()) }
 
-    val dayFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()) }
-
-    val dailyCounts = remember(allNotes) {
-        val map = mutableMapOf<String, Int>()
-        for (n in allNotes) {
-            if (n.createdAt > 0) {
-                val key = dayFmt.format(Date(n.createdAt))
-                map[key] = (map[key] ?: 0) + 1
+    suspend fun refreshMetadata() {
+        runCatching {
+            stats = WhimCoreBridge.getStats(90)
+            tagTree = WhimCoreBridge.listTagTree()
+            pairCode = WhimCoreBridge.getPairCode()
+            if (remoteCodeInput.isEmpty() && pairCode.isNotEmpty()) {
+                remoteCodeInput = pairCode
             }
         }
-        map
     }
-    val uniqueTagCount = remember(allNotes) { allNotes.flatMap { it.tags }.toSet().size }
-    val activeDayCount = remember(allNotes) {
-        val earliest = allNotes.minOfOrNull { it.createdAt } ?: System.currentTimeMillis()
-        val diffDays = ((System.currentTimeMillis() - earliest) / (24L * 3600L * 1000L)).toInt() + 1
-        diffDays.coerceAtLeast(1)
+
+    suspend fun loadFirstPage() {
+        val gen = ++filterGen
+        nextCursor = null
+        hasMore = false
+        isLoadingMore = false
+        runCatching {
+            when (val tab = activeTab) {
+                MobileTab.All -> {
+                    val page = WhimCoreBridge.listNotesPage(WhimListFilter(query = searchQuery, limit = pageSize))
+                    if (filterGen == gen) {
+                        displayedNotes = page.notes
+                        hasMore = page.hasMore
+                        nextCursor = page.nextCursor
+                    }
+                }
+                MobileTab.Review -> {
+                    val today = WhimCoreBridge.listTodayNotes()
+                    val filtered = if (searchQuery.isEmpty()) today else today.filter { it.content.contains(searchQuery, ignoreCase = true) }
+                    if (filterGen == gen) {
+                        displayedNotes = filtered
+                        hasMore = false
+                        nextCursor = null
+                    }
+                }
+                MobileTab.Random -> {
+                    val rnd = WhimCoreBridge.listRandomNotes(query = searchQuery, limit = 12)
+                    if (filterGen == gen) {
+                        displayedNotes = rnd
+                        hasMore = false
+                        nextCursor = null
+                    }
+                }
+                is MobileTab.Tag -> {
+                    val page = WhimCoreBridge.listNotesPage(WhimListFilter(query = searchQuery, tagPrefix = tab.path, limit = pageSize))
+                    if (filterGen == gen) {
+                        displayedNotes = page.notes
+                        hasMore = page.hasMore
+                        nextCursor = page.nextCursor
+                    }
+                }
+            }
+        }
+    }
+
+    fun loadMore() {
+        val cursor = nextCursor ?: return
+        if (!hasMore || isLoadingMore) return
+        val tab = activeTab
+        if (tab == MobileTab.Review || tab == MobileTab.Random) return
+        isLoadingMore = true
+        val gen = filterGen
+        scope.launch {
+            runCatching {
+                val filter = when (tab) {
+                    MobileTab.All -> WhimListFilter(query = searchQuery, limit = pageSize, cursor = cursor)
+                    is MobileTab.Tag -> WhimListFilter(query = searchQuery, tagPrefix = tab.path, limit = pageSize, cursor = cursor)
+                    else -> return@launch
+                }
+                val page = WhimCoreBridge.listNotesPage(filter)
+                if (filterGen == gen) {
+                    val existing = displayedNotes.map { it.id }.toHashSet()
+                    val fresh = page.notes.filter { it.id !in existing }
+                    displayedNotes = displayedNotes + fresh
+                    hasMore = page.hasMore && fresh.isNotEmpty()
+                    nextCursor = page.nextCursor
+                }
+            }
+            if (filterGen == gen) {
+                isLoadingMore = false
+            }
+        }
     }
 
     fun reload() {
         scope.launch {
-            runCatching {
-                val full = WhimCoreBridge.listNotes(WhimListFilter(limit = 500))
-                allNotes = full
-                tagTree = WhimCoreBridge.listTagTree()
-                pairCode = WhimCoreBridge.getPairCode()
-                if (remoteCodeInput.isEmpty() && pairCode.isNotEmpty()) {
-                    remoteCodeInput = pairCode
-                }
-
-                displayedNotes = when (val tab = activeTab) {
-                    MobileTab.All -> if (searchQuery.isEmpty()) full else WhimCoreBridge.listNotes(WhimListFilter(query = searchQuery))
-                    MobileTab.Review -> {
-                        val today = WhimCoreBridge.listTodayNotes()
-                        if (searchQuery.isEmpty()) today else today.filter { it.content.contains(searchQuery, ignoreCase = true) }
-                    }
-                    MobileTab.Random -> full.shuffled().take(12)
-                    is MobileTab.Tag -> WhimCoreBridge.listNotes(WhimListFilter(query = searchQuery, tagPrefix = tab.path))
-                }
-            }
+            refreshMetadata()
+            loadFirstPage()
         }
     }
 
+    LaunchedEffect(Unit) {
+        refreshMetadata()
+    }
+
+    val lifecycleOwner = LocalLifecycleOwner.current
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                reload()
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
     LaunchedEffect(activeTab, searchQuery, randomSeed) {
-        reload()
+        if (searchQuery.isNotEmpty()) {
+            delay(180L)
+        }
+        loadFirstPage()
     }
 
     // Auto-scroll to top when a newly synced note arrives at index 0
@@ -304,16 +383,16 @@ private fun FlomoMobileApp(
 
                     // 3-Column Stats (笔记 / 标签 / 天)
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        StatBlock("${allNotes.size}", "笔记")
-                        StatBlock("$uniqueTagCount", "标签")
-                        StatBlock("$activeDayCount", "天")
+                        StatBlock("${stats.totalNotes}", "笔记")
+                        StatBlock("${stats.totalTags}", "标签")
+                        StatBlock("${stats.activeDays}", "天")
                         Spacer(Modifier.width(12.dp))
                     }
 
                     Spacer(Modifier.height(14.dp))
 
                     // 12-week Activity Heatmap
-                    MobileHeatmap(dailyCounts = dailyCounts)
+                    MobileHeatmap(dailyCounts = stats.dailyCounts)
 
                     Spacer(Modifier.height(16.dp))
 
@@ -691,17 +770,35 @@ private fun FlomoMobileApp(
                 ) {
                     if (displayedNotes.isEmpty()) {
                         item {
-                            Box(
+                            Column(
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .padding(top = 80.dp),
-                                contentAlignment = Alignment.Center
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
                             ) {
-                                Text("暂无笔记，点击右下角记下第一个想法", style = t.body, color = c.textMuted)
+                                Text(
+                                    if (searchQuery.isEmpty()) "暂无笔记，点击右下角记下第一个想法" else "未找到匹配“$searchQuery”的笔记",
+                                    style = t.body,
+                                    color = c.textMuted
+                                )
+                                if (searchQuery.isNotEmpty()) {
+                                    Text(
+                                        "清除搜索",
+                                        style = t.meta,
+                                        color = c.tagText,
+                                        modifier = Modifier.clickable { searchQuery = "" }
+                                    )
+                                }
                             }
                         }
                     } else {
-                        items(displayedNotes, key = { it.id }) { note ->
+                        itemsIndexed(displayedNotes, key = { _, note -> note.id }) { idx, note ->
+                            LaunchedEffect(idx, displayedNotes.size, hasMore) {
+                                if (idx >= displayedNotes.size - 5 && hasMore && !isLoadingMore) {
+                                    loadMore()
+                                }
+                            }
                             FlomoMobileNoteCard(
                                 note = note,
                                 onTapTag = { path -> activeTab = MobileTab.Tag(path) },
@@ -726,6 +823,25 @@ private fun FlomoMobileApp(
                                     }
                                 }
                             )
+                        }
+                        item(key = "__footer__") {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(vertical = 12.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                when {
+                                    isLoadingMore -> Text("正在加载更多...", style = t.meta, color = c.textMuted)
+                                    hasMore -> Text(
+                                        "加载更多",
+                                        style = t.meta,
+                                        color = c.tagText,
+                                        modifier = Modifier.clickable { loadMore() }
+                                    )
+                                    displayedNotes.size >= 20 -> Text("已加载全部 ${displayedNotes.size} 条", style = t.meta, color = c.textMuted)
+                                }
+                            }
                         }
                     }
                 }
@@ -1118,8 +1234,10 @@ private fun MobileMarkdownBlock(text: String, collapsed: Boolean) {
     }
 }
 
+private val inlineMdTokenRegex = Regex("(\\*\\*[^*]+\\*\\*|~~[^~]+~~|`[^`]+`|\\*[^*]+\\*)")
+
 private fun parseInlineMarkdown(raw: String, codeBg: Color, codeFg: Color) = buildAnnotatedString {
-    val tokenRegex = Regex("(\\*\\*[^*]+\\*\\*|~~[^~]+~~|`[^`]+`|\\*[^*]+\\*)")
+    val tokenRegex = inlineMdTokenRegex
     var idx = 0
     for (m in tokenRegex.findAll(raw)) {
         if (m.range.first > idx) append(raw.substring(idx, m.range.first))

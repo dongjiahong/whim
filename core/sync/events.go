@@ -35,12 +35,25 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher.Flush()
 
 	ch := make(chan struct{}, 1)
+	clientPeerID := r.Header.Get(HeaderPeerID)
 	p.sseMu.Lock()
 	p.sseSubs[ch] = struct{}{}
+	if clientPeerID != "" {
+		p.activeSSEPeers[clientPeerID] = time.Now().UnixMilli()
+	}
 	p.sseMu.Unlock()
+	if clientPeerID != "" {
+		select {
+		case p.localChanged <- struct{}{}:
+		default:
+		}
+	}
 	defer func() {
 		p.sseMu.Lock()
 		delete(p.sseSubs, ch)
+		if clientPeerID != "" {
+			delete(p.activeSSEPeers, clientPeerID)
+		}
 		p.sseMu.Unlock()
 	}()
 

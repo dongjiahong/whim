@@ -55,6 +55,7 @@ final class WhimStoreVM: ObservableObject {
             reload()
             scheduleDailyReviewNotification()
             startAutoSyncTimer()
+            syncNow()
         } catch {
             syncMessage = "初始化失败: \(error.localizedDescription)"
         }

@@ -40,12 +40,13 @@ type Peer struct {
 	client       *http.Client
 	streamClient *http.Client // no timeout for long-lived SSE push streams
 
-	sseMu         sync.Mutex
-	sseSubs       map[chan struct{}]struct{}
-	localChanged  chan struct{}
-	remoteChanged chan struct{}
-	sseStarted    bool
-	sseCancel     context.CancelFunc
+	sseMu          sync.Mutex
+	sseSubs        map[chan struct{}]struct{}
+	activeSSEPeers map[string]int64 // peerID -> connected unix ms
+	localChanged   chan struct{}
+	remoteChanged  chan struct{}
+	sseStarted     bool
+	sseCancel      context.CancelFunc
 }
 
 // NewPeer constructs a Peer attached to a local Store.
@@ -59,10 +60,11 @@ func NewPeer(st *store.Store, peerID, displayName, localCode string) *Peer {
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
-		streamClient:  &http.Client{},
-		sseSubs:       make(map[chan struct{}]struct{}),
-		localChanged:  make(chan struct{}, 1),
-		remoteChanged: make(chan struct{}, 1),
+		streamClient:   &http.Client{},
+		sseSubs:        make(map[chan struct{}]struct{}),
+		activeSSEPeers: make(map[string]int64),
+		localChanged:   make(chan struct{}, 1),
+		remoteChanged:  make(chan struct{}, 1),
 	}
 }
 
@@ -299,7 +301,11 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 	}
 
 	summary.PeersFound = len(byAddr)
+	seenPeerIDs := make(map[string]bool)
 	for _, t := range byAddr {
+		if t.peerID != "" {
+			seenPeerIDs[t.peerID] = true
+		}
 		if len(NormalizeCode(code)) != 6 {
 			summary.Peers = append(summary.Peers, model.PeerSyncStatus{
 				PeerID:      t.peerID,
@@ -344,6 +350,46 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 			Status:      "synced",
 			Message:     "已同步",
 		})
+	}
+
+	// Also include incoming client devices (e.g. Android phones) recorded in SQLite sync_peers
+	// so the Mac remembers paired/synced devices across restarts even though phones do not serve UDP.
+	if savedPeers, err := p.store.ListSyncPeers(); err == nil {
+		nowMs := time.Now().UnixMilli()
+		p.sseMu.Lock()
+		activeCopy := make(map[string]int64, len(p.activeSSEPeers))
+		for k, v := range p.activeSSEPeers {
+			activeCopy[k] = v
+		}
+		p.sseMu.Unlock()
+
+		for _, sp := range savedPeers {
+			if sp.PeerID == "" || sp.PeerID == p.peerID || seenPeerIDs[sp.PeerID] {
+				continue
+			}
+			seenPeerIDs[sp.PeerID] = true
+			summary.PeersFound++
+			_, sseOnline := activeCopy[sp.PeerID]
+			recentlySynced := sp.LastSyncAt > 0 && (nowMs-sp.LastSyncAt) < 90_000
+			msg := "已同步"
+			if sseOnline || recentlySynced {
+				summary.PeersSynced++
+				msg = "在线 · 已同步"
+			} else if sp.LastSyncAt > 0 {
+				msg = "上次同步 " + time.UnixMilli(sp.LastSyncAt).Format("15:04")
+			}
+			name := sp.DisplayName
+			if name == "" {
+				name = "已连接设备"
+			}
+			summary.Peers = append(summary.Peers, model.PeerSyncStatus{
+				PeerID:      sp.PeerID,
+				DisplayName: name,
+				Addr:        sp.LastAddr,
+				Status:      "synced",
+				Message:     msg,
+			})
+		}
 	}
 	return summary
 }
@@ -629,12 +675,22 @@ func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UnixMilli()
 	if req.PeerID != "" {
+		clientIP := r.RemoteAddr
+		if host, _, herr := net.SplitHostPort(r.RemoteAddr); herr == nil && host != "" {
+			clientIP = host
+		}
 		_ = p.store.UpsertSyncPeer(model.SyncPeer{
 			PeerID:      req.PeerID,
 			DisplayName: req.DisplayName,
+			LastAddr:    clientIP,
 			LastHeardAt: now,
 			LastSyncAt:  now,
 		})
+		// Wake Mac UI so newly connected phone shows up immediately in Settings
+		select {
+		case p.localChanged <- struct{}{}:
+		default:
+		}
 	}
 
 	resp := model.SyncExchangeResponse{

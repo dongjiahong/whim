@@ -31,6 +31,7 @@ final class WhimStoreVM: ObservableObject {
     @Published var lastDeletedNoteId: String? = nil
     private var undoDismissTask: DispatchWorkItem?
     private var autoSyncTimer: Timer?
+    private var localPollTimer: Timer?
 
     // Stats for sidebar
     @Published var totalNoteCount: Int = 0
@@ -180,16 +181,19 @@ final class WhimStoreVM: ObservableObject {
     func togglePin(_ note: WhimNote) {
         _ = try? CoreBridge.shared.updateNote(id: note.id, pinned: !note.pinned)
         reload()
+        syncNow()
     }
 
     func toggleArchive(_ note: WhimNote) {
         _ = try? CoreBridge.shared.updateNote(id: note.id, archived: !note.archived)
         reload()
+        syncNow()
     }
 
     func deleteNote(_ note: WhimNote) {
         _ = try? CoreBridge.shared.updateNote(id: note.id, deleted: true)
         reload()
+        syncNow()
         lastDeletedNoteId = note.id
         undoDismissTask?.cancel()
         let task = DispatchWorkItem { [weak self] in
@@ -205,14 +209,33 @@ final class WhimStoreVM: ObservableObject {
         lastDeletedNoteId = nil
         _ = try? CoreBridge.shared.updateNote(id: id, deleted: false)
         reload()
+        syncNow()
     }
 
     private func startAutoSyncTimer() {
+        // Mirror Navigator HOST_MS (2.5s): pick up incoming phone pushes from local SQLite immediately
+        localPollTimer?.invalidate()
+        localPollTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.reloadIfChanged()
+            }
+        }
+        // Peer-to-peer sync with other Macs every 10s
         autoSyncTimer?.invalidate()
-        autoSyncTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+        autoSyncTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.syncNow()
             }
+        }
+    }
+
+    private func reloadIfChanged() {
+        guard let full = try? CoreBridge.shared.listNotes(query: "", tagPrefix: "", includeArchived: false, limit: 500) else { return }
+        if full != allNotes {
+            allNotes = full
+            tagTree = (try? CoreBridge.shared.listTagTree()) ?? tagTree
+            recomputeStats(from: full)
+            applyFilter()
         }
     }
 

@@ -87,6 +87,8 @@ import com.whim.app.ui.theme.WhimThemeProvider
 import com.whim.app.ui.theme.heatmapColor
 import com.whim.app.update.GitHubUpdater
 import com.whim.app.update.ReleaseInfo
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.io.File
 import java.text.SimpleDateFormat
@@ -230,6 +232,24 @@ private fun FlomoMobileApp(
 
     LaunchedEffect(activeTab, searchQuery, randomSeed) {
         reload()
+    }
+
+    // Mirror Navigator's foreground sync loop: poll Mac every 2.5s while app is open
+    LaunchedEffect(Unit) {
+        while (isActive) {
+            val code = runCatching { WhimCoreBridge.getPairCode() }.getOrDefault("")
+            if (code.length == 6) {
+                val res = runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }.getOrNull()
+                if (res != null) {
+                    peerStatuses = res.peers
+                    if (res.notesMerged > 0 || res.blobsDownloaded > 0) {
+                        reload()
+                        WhimWidgetProvider.refreshAll(context)
+                    }
+                }
+            }
+            delay(2500L)
+        }
     }
 
     ModalNavigationDrawer(
@@ -667,6 +687,7 @@ private fun FlomoMobileApp(
                                     scope.launch {
                                         WhimCoreBridge.updateNote(note.id, pinned = !note.pinned)
                                         reload()
+                                        runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
                                         SyncWorker.enqueueImmediate(context)
                                     }
                                 },
@@ -678,6 +699,7 @@ private fun FlomoMobileApp(
                                     scope.launch {
                                         WhimCoreBridge.updateNote(note.id, deleted = true)
                                         reload()
+                                        runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
                                         SyncWorker.enqueueImmediate(context)
                                     }
                                 }

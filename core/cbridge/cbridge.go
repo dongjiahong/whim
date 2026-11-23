@@ -198,6 +198,14 @@ func WhimWaitForChange(timeoutSec C.int) *C.char {
 	return okJSON("false")
 }
 
+//export WhimReconnectEvents
+func WhimReconnectEvents() *C.char {
+	if err := mobile.ReconnectEvents(); err != nil {
+		return errJSON(err)
+	}
+	return okString("reconnected")
+}
+
 //export WhimGetPairCode
 func WhimGetPairCode() *C.char {
 	code, err := mobile.GetPairCode()
@@ -271,6 +279,15 @@ func WhimRemovePairedPeer(peerID *C.char) *C.char {
 //export WhimExportMarkdown
 func WhimExportMarkdown(filterJSON, outDir *C.char) *C.char {
 	res, err := mobile.ExportMarkdown(C.GoString(filterJSON), C.GoString(outDir))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimCleanupOrphanBlobs
+func WhimCleanupOrphanBlobs(minAgeSec C.int, dryRun C.int) *C.char {
+	res, err := mobile.CleanupOrphanBlobs(int(minAgeSec), dryRun != 0)
 	if err != nil {
 		return errJSON(err)
 	}

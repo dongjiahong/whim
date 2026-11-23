@@ -118,6 +118,12 @@ object WhimCoreBridge {
         runCatching { Mobile.waitForChange(timeoutSec.toLong()) }.getOrDefault(false)
     }
 
+    fun reconnectEvents() {
+        runCatching { Mobile.reconnectEvents() }
+    }
+
+    fun dataVersion(): Long = runCatching { Mobile.dataVersion() }.getOrDefault(0L)
+
     fun syncOnceBlocking(timeoutSec: Int = 8): WhimSyncSummary {
         val raw = Mobile.syncOnce(timeoutSec.toLong())
         return json.decodeFromString(raw)
@@ -151,4 +157,10 @@ object WhimCoreBridge {
     suspend fun removePairedPeer(peerId: String) = withContext(Dispatchers.IO) {
         Mobile.removePairedPeer(peerId)
     }
+
+    suspend fun cleanupOrphanBlobs(minAgeSec: Int = 0, dryRun: Boolean = false): WhimStorageCleanupResult =
+        withContext(Dispatchers.IO) {
+            val raw = Mobile.cleanupOrphanBlobs(minAgeSec.toLong(), dryRun)
+            json.decodeFromString(raw)
+        }
 }

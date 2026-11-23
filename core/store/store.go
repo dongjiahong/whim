@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -286,11 +287,31 @@ func (s *Store) ListLocalBlobs() ([]string, error) {
 	return out, nil
 }
 
-// MissingBlobs returns SHA-256 hashes referenced by active attachments that do not exist locally.
+var blobRefRegex = regexp.MustCompile(`!\[[^\]]*\]\(whim://blob/([a-fA-F0-9]{64})\)`)
+
+func extractReferencedBlobs(content string) map[string]bool {
+	matches := blobRefRegex.FindAllStringSubmatch(content, -1)
+	if len(matches) == 0 {
+		return nil
+	}
+	out := make(map[string]bool, len(matches))
+	for _, m := range matches {
+		if len(m) >= 2 {
+			out[strings.ToLower(m[1])] = true
+		}
+	}
+	return out
+}
+
+// MissingBlobs returns SHA-256 hashes referenced by active attachments on active notes that do not exist locally.
 func (s *Store) MissingBlobs() ([]string, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT DISTINCT sha256 FROM note_attachments WHERE deleted = 0`)
+	rows, err := s.db.Query(`
+		SELECT DISTINCT na.sha256
+		FROM note_attachments na
+		JOIN notes n ON n.id = na.note_id
+		WHERE na.deleted = 0 AND n.deleted = 0`)
 	if err != nil {
 		return nil, err
 	}
@@ -308,6 +329,84 @@ func (s *Store) MissingBlobs() ([]string, error) {
 	}
 	sort.Strings(missing)
 	return missing, nil
+}
+
+// CleanupOrphanBlobs scans blobsDir for image files not referenced by any active note.
+// When dryRun is true it only reports counts/bytes without deleting anything.
+// minAgeSec protects recently pasted blobs that may belong to an unsent draft.
+func (s *Store) CleanupOrphanBlobs(minAgeSec int, dryRun bool) (*model.StorageCleanupResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	active := make(map[string]bool)
+	rows, err := s.db.Query(`
+		SELECT DISTINCT LOWER(na.sha256)
+		FROM note_attachments na
+		JOIN notes n ON n.id = na.note_id
+		WHERE na.deleted = 0 AND n.deleted = 0`)
+	if err != nil {
+		return nil, err
+	}
+	for rows.Next() {
+		var h string
+		if err := rows.Scan(&h); err == nil && len(h) == 64 {
+			active[h] = true
+		}
+	}
+	rows.Close()
+
+	// Belt-and-suspenders: also keep any blob referenced inline in active note markdown.
+	nRows, err := s.db.Query(`SELECT content FROM notes WHERE deleted = 0 AND content LIKE '%whim://blob/%'`)
+	if err == nil {
+		for nRows.Next() {
+			var c string
+			if err := nRows.Scan(&c); err == nil {
+				for h := range extractReferencedBlobs(c) {
+					active[h] = true
+				}
+			}
+		}
+		nRows.Close()
+	}
+
+	entries, err := os.ReadDir(s.blobsDir)
+	if err != nil {
+		return nil, err
+	}
+	res := &model.StorageCleanupResult{}
+	cutoff := time.Now().Add(-time.Duration(minAgeSec) * time.Second)
+	for _, e := range entries {
+		if e.IsDir() || strings.HasSuffix(e.Name(), ".tmp") {
+			continue
+		}
+		name := e.Name()
+		hash := name
+		if dot := strings.IndexByte(name, '.'); dot > 0 {
+			hash = name[:dot]
+		}
+		hash = strings.ToLower(hash)
+		if len(hash) != 64 || active[hash] {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		if minAgeSec > 0 && info.ModTime().After(cutoff) {
+			continue
+		}
+		if !dryRun {
+			if rerr := os.Remove(filepath.Join(s.blobsDir, name)); rerr != nil && !errors.Is(rerr, os.ErrNotExist) {
+				continue
+			}
+		}
+		res.RemovedFiles++
+		res.FreedBytes += info.Size()
+	}
+	if !dryRun {
+		_, _ = s.db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`)
+	}
+	return res, nil
 }
 
 // CreateNote creates a new note with optional pre-saved attachments.
@@ -369,7 +468,8 @@ func (s *Store) UpdateNote(id string, content *string, pinned *bool, archived *b
 	return s.UpdateNoteWithAttachments(id, content, pinned, archived, deleted, nil)
 }
 
-// UpdateNoteWithAttachments updates mutable fields and optionally appends newly pasted attachments.
+// UpdateNoteWithAttachments updates mutable fields, appends newly pasted attachments,
+// and soft-deletes (or restores on undo) attachments removed from content or deleted notes.
 func (s *Store) UpdateNoteWithAttachments(id string, content *string, pinned *bool, archived *bool, deleted *bool, newAttachments []model.Attachment) (*model.Note, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -383,9 +483,11 @@ func (s *Store) UpdateNoteWithAttachments(id string, content *string, pinned *bo
 		now = existing.UpdatedAt + 1
 	}
 
+	contentChanged := false
 	if content != nil && *content != existing.Content {
 		existing.Content = *content
 		existing.Stamps.Content = now
+		contentChanged = true
 	}
 	if pinned != nil && *pinned != existing.Pinned {
 		existing.Pinned = *pinned
@@ -395,11 +497,13 @@ func (s *Store) UpdateNoteWithAttachments(id string, content *string, pinned *bo
 		existing.Archived = *archived
 		existing.Stamps.Archived = now
 	}
+	deletedChanged := false
 	if deleted != nil && *deleted != existing.Deleted {
 		existing.Deleted = *deleted
 		existing.Stamps.Deleted = now
+		deletedChanged = true
 	}
-	if len(newAttachments) > 0 {
+	if len(newAttachments) > 0 || deletedChanged || contentChanged {
 		existing.Stamps.Attachments = now
 	}
 	existing.UpdatedAt = existing.Stamps.Max()
@@ -414,14 +518,64 @@ func (s *Store) UpdateNoteWithAttachments(id string, content *string, pinned *bo
 	if err := s.upsertNoteTx(tx, existing); err != nil {
 		return nil, err
 	}
-	if len(newAttachments) > 0 {
+
+	// 1. If the note itself was soft-deleted or restored (undo), cascade to its attachments.
+	if deletedChanged {
+		if existing.Deleted {
+			if _, err := tx.Exec(`UPDATE note_attachments SET deleted = 1, updated_at = ? WHERE note_id = ? AND deleted = 0`, now, existing.ID); err != nil {
+				return nil, err
+			}
+			existing.Attachments = nil
+		} else {
+			refs := extractReferencedBlobs(existing.Content)
+			if len(refs) > 0 {
+				for h := range refs {
+					if _, err := tx.Exec(`UPDATE note_attachments SET deleted = 0, updated_at = ? WHERE note_id = ? AND LOWER(sha256) = ? AND deleted = 1`, now, existing.ID, h); err != nil {
+						return nil, err
+					}
+				}
+			} else {
+				if _, err := tx.Exec(`UPDATE note_attachments SET deleted = 0, updated_at = ? WHERE note_id = ? AND deleted = 1`, now, existing.ID); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	// 2. If note content was edited, soft-delete any existing attachment no longer referenced in content or newAttachments.
+	if content != nil && !existing.Deleted {
+		kept := extractReferencedBlobs(*content)
+		if kept == nil {
+			kept = make(map[string]bool)
+		}
+		for _, a := range newAttachments {
+			if a.SHA256 != "" {
+				kept[strings.ToLower(a.SHA256)] = true
+			}
+		}
+		filtered := make([]model.Attachment, 0, len(existing.Attachments))
+		for _, a := range existing.Attachments {
+			if kept[strings.ToLower(a.SHA256)] {
+				filtered = append(filtered, a)
+			} else {
+				if _, err := tx.Exec(`UPDATE note_attachments SET deleted = 1, updated_at = ? WHERE id = ? AND deleted = 0`, now, a.ID); err != nil {
+					return nil, err
+				}
+			}
+		}
+		existing.Attachments = filtered
+	}
+
+	// 3. Append any newly pasted attachments.
+	if len(newAttachments) > 0 && !existing.Deleted {
 		knownSHA := make(map[string]bool)
 		for _, a := range existing.Attachments {
-			knownSHA[a.SHA256] = true
+			knownSHA[strings.ToLower(a.SHA256)] = true
 		}
 		sortIdx := len(existing.Attachments)
 		for _, att := range newAttachments {
-			if att.SHA256 == "" || knownSHA[att.SHA256] {
+			sha := strings.ToLower(att.SHA256)
+			if sha == "" || knownSHA[sha] {
 				continue
 			}
 			if att.ID == "" {
@@ -438,11 +592,16 @@ func (s *Store) UpdateNoteWithAttachments(id string, content *string, pinned *bo
 				att.LocalPath = p
 			}
 			existing.Attachments = append(existing.Attachments, att)
-			knownSHA[att.SHA256] = true
+			knownSHA[sha] = true
 		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	if deletedChanged && !existing.Deleted {
+		if restored, lerr := s.listNoteAttachmentsLocked(existing.ID, false); lerr == nil {
+			existing.Attachments = restored
+		}
 	}
 	return existing, nil
 }

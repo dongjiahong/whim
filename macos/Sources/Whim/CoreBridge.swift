@@ -190,6 +190,16 @@ struct ExportResult: Codable {
     }
 }
 
+struct StorageCleanupResult: Codable {
+    let removedFiles: Int
+    let freedBytes: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case removedFiles = "removed_files"
+        case freedBytes = "freed_bytes"
+    }
+}
+
 private struct Envelope<T: Decodable>: Decodable {
     let ok: Bool
     let data: T?
@@ -423,5 +433,9 @@ final class CoreBridge {
                 )
             }
         }
+    }
+
+    func cleanupOrphanBlobs(minAgeSec: Int32 = 0, dryRun: Bool = false) throws -> StorageCleanupResult {
+        try decodeCString(WhimCleanupOrphanBlobs(minAgeSec, dryRun ? 1 : 0), as: StorageCleanupResult.self)
     }
 }

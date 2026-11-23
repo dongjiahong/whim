@@ -279,6 +279,25 @@ func WaitForChange(timeoutSec int) (bool, error) {
 	return e.Peer.WaitForChange(timeoutSec), nil
 }
 
+// ReconnectEvents drops any stale/half-open SSE stream and immediately reconnects.
+func ReconnectEvents() error {
+	e, err := requireEngine()
+	if err != nil {
+		return err
+	}
+	e.Peer.ReconnectEvents()
+	return nil
+}
+
+// DataVersion returns a monotonically increasing version bumped on every local write or remote merge.
+func DataVersion() (int64, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return 0, err
+	}
+	return e.Peer.DataVersion(), nil
+}
+
 // GetPairCode returns the 6-digit pairing code of this library.
 func GetPairCode() (string, error) {
 	e, err := requireEngine()
@@ -391,6 +410,21 @@ func ExportMarkdown(filterJSON, outDir string) (string, error) {
 		}
 	}
 	res, err := e.ExportMarkdown(f, outDir)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(res)
+	return string(b), err
+}
+
+// CleanupOrphanBlobs inspects (dryRun=true) or deletes (dryRun=false) unreferenced image blobs
+// older than minAgeSec seconds and checkpoints the SQLite WAL file.
+func CleanupOrphanBlobs(minAgeSec int, dryRun bool) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	res, err := e.Store.CleanupOrphanBlobs(minAgeSec, dryRun)
 	if err != nil {
 		return "", err
 	}

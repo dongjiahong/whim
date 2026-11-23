@@ -69,6 +69,15 @@ struct SettingsModalView: View {
     @State private var copiedLocalCode: Bool = false
     @State private var showRegenerateConfirm: Bool = false
     @State private var copiedMCP: Bool = false
+    @State private var storageTotalBytes: Int64 = 0
+    @State private var storageDbBytes: Int64 = 0
+    @State private var storageBlobsBytes: Int64 = 0
+    @State private var storageBlobCount: Int = 0
+    @State private var storageOrphanCount: Int = 0
+    @State private var storageOrphanBytes: Int64 = 0
+    @State private var storageCleanupMsg: String = ""
+    @State private var isCleaningStorage: Bool = false
+    @State private var storageLoaded: Bool = false
     @StateObject private var updater = GitHubUpdater()
 
     private var themeMode: AppThemeMode {
@@ -157,6 +166,7 @@ struct SettingsModalView: View {
         .onAppear {
             activeSection = initialSection
             vm.refreshSyncState()
+            refreshStorageUsage()
         }
     }
 
@@ -192,6 +202,48 @@ struct SettingsModalView: View {
             }
 
             settingsCard {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("本地存储空间")
+                                .font(.system(size: 13.5, weight: .medium))
+                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                            Text(storageLoaded ? "数据库 \(formatBytes(storageDbBytes)) · 图片附件 \(formatBytes(storageBlobsBytes))（\(storageBlobCount) 张）" : "正在统计本地存储...")
+                                .font(.system(size: 12))
+                                .foregroundColor(FlomoPalette.textSecondary(scheme))
+                            if storageLoaded && storageOrphanCount > 0 {
+                                Text("检测到 \(storageOrphanCount) 张未引用冗余图片（可释放 \(formatBytes(storageOrphanBytes))）")
+                                    .font(.system(size: 11.5))
+                                    .foregroundColor(FlomoPalette.tagText(scheme))
+                            }
+                        }
+                        Spacer()
+                        Text(storageLoaded ? formatBytes(storageTotalBytes) : "--")
+                            .font(.system(size: 16, weight: .semibold).monospacedDigit())
+                            .foregroundColor(FlomoPalette.accent(scheme))
+                    }
+                    HStack(spacing: 10) {
+                        Button(isCleaningStorage ? "清理中..." : "清理冗余图片") {
+                            cleanupOrphanStorage()
+                        }
+                        .disabled(isCleaningStorage)
+                        Button("在访达中打开") {
+                            NSWorkspace.shared.open(whimDataDirectory())
+                        }
+                        Button("刷新统计") {
+                            refreshStorageUsage()
+                        }
+                        Spacer()
+                    }
+                    if !storageCleanupMsg.isEmpty {
+                        Text(storageCleanupMsg)
+                            .font(.system(size: 12))
+                            .foregroundColor(FlomoPalette.accent(scheme))
+                    }
+                }
+            }
+
+            settingsCard {
                 HStack {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("开发期示例数据")
@@ -202,11 +254,78 @@ struct SettingsModalView: View {
                             .foregroundColor(FlomoPalette.textSecondary(scheme))
                     }
                     Spacer()
-                    Button("注入示例") { vm.seedSampleNotes() }
-                    Button("清除示例") { vm.clearSampleNotes() }
+                    Button("注入示例") { vm.seedSampleNotes(); refreshStorageUsage() }
+                    Button("清除示例") { vm.clearSampleNotes(); refreshStorageUsage() }
                 }
             }
         }
+    }
+
+    private func whimDataDirectory() -> URL {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+        return appSupport.appendingPathComponent("Whim", isDirectory: true)
+    }
+
+    private func refreshStorageUsage() {
+        let dir = whimDataDirectory()
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            var total: Int64 = 0
+            var db: Int64 = 0
+            var blobs: Int64 = 0
+            var blobCnt: Int = 0
+            if let enumerator = fm.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey, .fileSizeKey], options: [.skipsHiddenFiles]) {
+                for case let url as URL in enumerator {
+                    guard let vals = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+                          vals.isRegularFile == true,
+                          let sz = vals.fileSize else { continue }
+                    let size64 = Int64(sz)
+                    total += size64
+                    if url.path.contains("/blobs/") {
+                        blobs += size64
+                        blobCnt += 1
+                    } else if url.lastPathComponent.hasPrefix("whim.sqlite3") {
+                        db += size64
+                    }
+                }
+            }
+            let dry = try? CoreBridge.shared.cleanupOrphanBlobs(minAgeSec: 0, dryRun: true)
+            DispatchQueue.main.async {
+                storageTotalBytes = total
+                storageDbBytes = db
+                storageBlobsBytes = blobs
+                storageBlobCount = blobCnt
+                storageOrphanCount = dry?.removedFiles ?? 0
+                storageOrphanBytes = dry?.freedBytes ?? 0
+                storageLoaded = true
+            }
+        }
+    }
+
+    private func cleanupOrphanStorage() {
+        isCleaningStorage = true
+        storageCleanupMsg = ""
+        DispatchQueue.global(qos: .userInitiated).async {
+            let res = try? CoreBridge.shared.cleanupOrphanBlobs(minAgeSec: 0, dryRun: false)
+            DispatchQueue.main.async {
+                isCleaningStorage = false
+                if let res {
+                    storageCleanupMsg = res.removedFiles > 0
+                        ? "已清理 \(res.removedFiles) 张冗余图片，释放 \(formatBytes(res.freedBytes))"
+                        : "没有发现未引用的冗余图片，已整理数据库缓存"
+                } else {
+                    storageCleanupMsg = "清理失败，请重试"
+                }
+                refreshStorageUsage()
+            }
+        }
+    }
+
+    private func formatBytes(_ bytes: Int64) -> String {
+        let fmt = ByteCountFormatter()
+        fmt.allowedUnits = [.useBytes, .useKB, .useMB, .useGB]
+        fmt.countStyle = .file
+        return fmt.string(fromByteCount: bytes)
     }
 
     // MARK: - Shortcuts (mirrors flomo's clean card list)

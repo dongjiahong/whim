@@ -131,3 +131,10 @@ data class SavedBlob(
     @SerialName("size_bytes") val sizeBytes: Long,
     val mime: String
 )
+
+@Immutable
+@Serializable
+data class WhimStorageCleanupResult(
+    @SerialName("removed_files") val removedFiles: Int = 0,
+    @SerialName("freed_bytes") val freedBytes: Long = 0
+)

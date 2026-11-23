@@ -11,6 +11,8 @@ import (
 	"time"
 )
 
+const sseIdleTimeout = 35 * time.Second
+
 // handleEvents serves an authenticated Server-Sent Events (SSE) stream on /sync/events.
 // Whenever a note is created, updated, deleted, or merged on this host, all connected
 // clients receive an instant `event: changed` frame (< 50ms latency) over the existing HTTP port.
@@ -96,28 +98,37 @@ func (p *Peer) ensureEventSubscriber() {
 }
 
 func (p *Peer) runEventSubscriberLoop(ctx context.Context) {
+	waitOrReconnect := func(d time.Duration) bool {
+		timer := time.NewTimer(d)
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return false
+		case <-p.sseReconnect:
+			return true
+		case <-timer.C:
+			return true
+		}
+	}
+
 	for {
 		if ctx.Err() != nil {
 			return
 		}
 		code := NormalizeCode(p.auth.Code())
 		if len(code) != 6 {
-			select {
-			case <-ctx.Done():
+			if !waitOrReconnect(1 * time.Second) {
 				return
-			case <-time.After(1 * time.Second):
-				continue
 			}
+			continue
 		}
 
 		addrs := p.findEventTargetAddrs(ctx)
 		if len(addrs) == 0 {
-			select {
-			case <-ctx.Done():
+			if !waitOrReconnect(2 * time.Second) {
 				return
-			case <-time.After(2 * time.Second):
-				continue
 			}
+			continue
 		}
 
 		// Try each known host until one accepts the SSE stream
@@ -125,16 +136,25 @@ func (p *Peer) runEventSubscriberLoop(ctx context.Context) {
 			if ctx.Err() != nil {
 				return
 			}
-			err := p.subscribeOneSSE(ctx, addr, code)
+			streamCtx, streamCancel := context.WithCancel(ctx)
+			p.sseMu.Lock()
+			p.sseStreamCancel = streamCancel
+			p.sseMu.Unlock()
+
+			err := p.subscribeOneSSE(streamCtx, addr, code)
+
+			p.sseMu.Lock()
+			p.sseStreamCancel = nil
+			p.sseMu.Unlock()
+			streamCancel()
+
 			if err != nil && ctx.Err() == nil {
 				log.Printf("[whim-sync] sse disconnected from %s: %v", addr, err)
 			}
 		}
 
-		select {
-		case <-ctx.Done():
+		if !waitOrReconnect(1 * time.Second) {
 			return
-		case <-time.After(2 * time.Second):
 		}
 	}
 }
@@ -216,8 +236,34 @@ func (p *Peer) subscribeOneSSE(ctx context.Context, addr, code string) error {
 	}
 	log.Printf("[whim-sync] sse subscribed to %s", addr)
 
+	// Immediately trigger a catch-up sync whenever an SSE stream (re)connects so any
+	// events missed while Android was asleep/frozen are pulled right away.
+	select {
+	case p.remoteChanged <- struct{}{}:
+	default:
+	}
+
+	// Watchdog: server sends `: keepalive` every 20s. If no bytes arrive for 35s
+	// (e.g. half-open TCP socket after Android Doze/Wi-Fi sleep), close body to force reconnect.
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = resp.Body.Close()
+		case <-done:
+		}
+	}()
+
+	watchdog := time.AfterFunc(sseIdleTimeout, func() {
+		log.Printf("[whim-sync] sse idle timeout from %s, forcing reconnect", addr)
+		_ = resp.Body.Close()
+	})
+	defer watchdog.Stop()
+
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
+		watchdog.Reset(sseIdleTimeout)
 		line := scanner.Text()
 		if strings.HasPrefix(line, "event: changed") {
 			log.Printf("[whim-sync] sse received change from %s", addr)

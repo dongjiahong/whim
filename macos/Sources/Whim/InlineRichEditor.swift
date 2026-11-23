@@ -513,6 +513,12 @@ final class WhimNSTextView: NSTextView {
     }
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        // Only intercept editing shortcuts when THIS text view is the active first responder.
+        // AppKit walks the entire view tree for performKeyEquivalent; without this guard,
+        // the top new-note composer steals Cmd+V/C/X/A/Z from inline edit composers and search fields.
+        guard window?.firstResponder === self else {
+            return super.performKeyEquivalent(with: event)
+        }
         if event.type == .keyDown,
            event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
            let chars = event.charactersIgnoringModifiers?.lowercased() {

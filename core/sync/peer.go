@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"whim/core/model"
@@ -41,17 +42,37 @@ type Peer struct {
 	client       *http.Client
 	streamClient *http.Client // no timeout for long-lived SSE push streams
 
-	sseMu          sync.Mutex
-	sseSubs        map[chan struct{}]struct{}
-	activeSSEPeers map[string]int64 // peerID -> connected unix ms
-	localChanged   chan struct{}
-	remoteChanged  chan struct{}
-	sseStarted     bool
-	sseCancel      context.CancelFunc
+	sseMu           sync.Mutex
+	sseSubs         map[chan struct{}]struct{}
+	activeSSEPeers  map[string]int64 // peerID -> connected unix ms
+	localChanged    chan struct{}
+	remoteChanged   chan struct{}
+	sseReconnect    chan struct{}
+	sseStarted      bool
+	sseCancel       context.CancelFunc
+	sseStreamCancel context.CancelFunc
+	dataVersion     atomic.Int64
 }
 
 // NewPeer constructs a Peer attached to a local Store.
 func NewPeer(st *store.Store, peerID, displayName, localCode string) *Peer {
+	apiTransport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   2 * time.Second,
+			KeepAlive: 15 * time.Second,
+		}).DialContext,
+		MaxIdleConns:        8,
+		IdleConnTimeout:     30 * time.Second,
+		TLSHandshakeTimeout: 3 * time.Second,
+	}
+	streamTransport := &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 15 * time.Second,
+		}).DialContext,
+		ResponseHeaderTimeout: 5 * time.Second,
+		DisableKeepAlives:     true,
+	}
 	return &Peer{
 		store:         st,
 		auth:          NewAuth(localCode),
@@ -59,18 +80,43 @@ func NewPeer(st *store.Store, peerID, displayName, localCode string) *Peer {
 		displayName:   displayName,
 		discoveryPort: DefaultDiscoveryPort,
 		client: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout:   10 * time.Second,
+			Transport: apiTransport,
 		},
-		streamClient:   &http.Client{},
+		streamClient: &http.Client{
+			Transport: streamTransport,
+		},
 		sseSubs:        make(map[chan struct{}]struct{}),
 		activeSSEPeers: make(map[string]int64),
 		localChanged:   make(chan struct{}, 1),
 		remoteChanged:  make(chan struct{}, 1),
+		sseReconnect:   make(chan struct{}, 1),
+	}
+}
+
+// DataVersion returns a monotonically increasing version bumped on every local write or remote merge.
+func (p *Peer) DataVersion() int64 {
+	return p.dataVersion.Load()
+}
+
+// ReconnectEvents tears down any existing (potentially half-open/zombie) SSE stream
+// and immediately wakes the subscriber loop to establish a fresh connection.
+func (p *Peer) ReconnectEvents() {
+	p.sseMu.Lock()
+	cancel := p.sseStreamCancel
+	p.sseMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	select {
+	case p.sseReconnect <- struct{}{}:
+	default:
 	}
 }
 
 // NotifyChanged wakes local UI listeners and pushes an instant SSE event to all connected clients.
 func (p *Peer) NotifyChanged() {
+	p.dataVersion.Add(1)
 	select {
 	case p.localChanged <- struct{}{}:
 	default:
@@ -281,12 +327,20 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 		addr        string
 	}
 	byAddr := make(map[string]targetPeer)
+	discoveredPeerIDs := make(map[string]bool, len(discovered))
 	for _, dp := range discovered {
 		byAddr[dp.Addr] = targetPeer{peerID: dp.PeerID, displayName: dp.DisplayName, addr: dp.Addr}
+		if dp.PeerID != "" {
+			discoveredPeerIDs[dp.PeerID] = true
+		}
 	}
 	if savedPeers, err := p.store.ListSyncPeers(); err == nil {
 		for _, sp := range savedPeers {
 			if sp.PeerID == p.peerID || !strings.Contains(sp.LastAddr, ":") {
+				continue
+			}
+			// Prefer freshly UDP-discovered address if this peerID is already online on a new DHCP IP.
+			if sp.PeerID != "" && discoveredPeerIDs[sp.PeerID] {
 				continue
 			}
 			if _, exists := byAddr[sp.LastAddr]; !exists {
@@ -319,6 +373,7 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 	summary.PeersFound = len(byAddr)
 	seenPeerIDs := make(map[string]bool)
 	seenAddrs := make(map[string]bool)
+	var targets []targetPeer
 	for _, t := range byAddr {
 		if t.peerID != "" {
 			seenPeerIDs[t.peerID] = true
@@ -336,41 +391,58 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 			})
 			continue
 		}
-		merged, dl, ul, serr := p.SyncWithAddr(ctx, t.addr, t.peerID, code)
-		if serr != nil {
-			errStr := serr.Error()
-			status := "error"
-			msg := errStr
-			switch {
-			case strings.Contains(errStr, "配对码不正确") || strings.Contains(errStr, "unauthorized"):
-				status = "wrong_code"
-				msg = "配对码不对"
-			case strings.Contains(errStr, "locked"):
-				status = "locked"
-				msg = "尝试太多次，稍后再试"
+		targets = append(targets, t)
+	}
+
+	// Sync all candidate peers concurrently so a stale/offline IP never burns the timeout of a live host.
+	var (
+		wg    sync.WaitGroup
+		resMu sync.Mutex
+	)
+	for _, t := range targets {
+		t := t
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			merged, dl, ul, serr := p.SyncWithAddr(ctx, t.addr, t.peerID, code)
+			resMu.Lock()
+			defer resMu.Unlock()
+			if serr != nil {
+				errStr := serr.Error()
+				status := "error"
+				msg := errStr
+				switch {
+				case strings.Contains(errStr, "配对码不正确") || strings.Contains(errStr, "unauthorized"):
+					status = "wrong_code"
+					msg = "配对码不对"
+				case strings.Contains(errStr, "locked"):
+					status = "locked"
+					msg = "尝试太多次，稍后再试"
+				}
+				summary.Peers = append(summary.Peers, model.PeerSyncStatus{
+					PeerID:      t.peerID,
+					DisplayName: t.displayName,
+					Addr:        t.addr,
+					Status:      status,
+					Message:     msg,
+				})
+				summary.Errors = append(summary.Errors, fmt.Sprintf("%s: %s", t.addr, msg))
+				return
 			}
+			summary.PeersSynced++
+			summary.NotesMerged += merged
+			summary.BlobsDownloaded += dl
+			summary.BlobsUploaded += ul
 			summary.Peers = append(summary.Peers, model.PeerSyncStatus{
 				PeerID:      t.peerID,
 				DisplayName: t.displayName,
 				Addr:        t.addr,
-				Status:      status,
-				Message:     msg,
+				Status:      "synced",
+				Message:     "已同步",
 			})
-			summary.Errors = append(summary.Errors, fmt.Sprintf("%s: %s", t.addr, msg))
-			continue
-		}
-		summary.PeersSynced++
-		summary.NotesMerged += merged
-		summary.BlobsDownloaded += dl
-		summary.BlobsUploaded += ul
-		summary.Peers = append(summary.Peers, model.PeerSyncStatus{
-			PeerID:      t.peerID,
-			DisplayName: t.displayName,
-			Addr:        t.addr,
-			Status:      "synced",
-			Message:     "已同步",
-		})
+		}()
 	}
+	wg.Wait()
 
 	// Also include incoming client devices (e.g. Android phones) recorded in SQLite sync_peers
 	// so the Mac remembers paired/synced devices across restarts even though phones do not serve UDP.
@@ -546,6 +618,12 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 			LastHeardAt: heard,
 			LastSyncAt:  now,
 		})
+	}
+
+	// Notify local UI listeners (and bump dataVersion) whenever an outgoing sync
+	// (including Android background SyncWorker) merges new notes or downloads blobs.
+	if totalMerged > 0 || blobsDown > 0 {
+		p.NotifyChanged()
 	}
 
 	return totalMerged, blobsDown, blobsUp, nil

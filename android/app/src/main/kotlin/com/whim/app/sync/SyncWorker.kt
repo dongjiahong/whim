@@ -26,7 +26,7 @@ class SyncWorker(
     override suspend fun doWork(): Result {
         WhimCoreBridge.ensureInit(applicationContext)
         val summary = WhimCoreBridge.syncOnceBlocking(timeoutSec = 8)
-        if (summary.notesMerged > 0) {
+        if (summary.notesMerged > 0 || summary.blobsDownloaded > 0) {
             WhimWidgetProvider.refreshAll(applicationContext)
         }
         return Result.success()
@@ -36,13 +36,14 @@ class SyncWorker(
         private const val PERIODIC_WORK_NAME = "whim_lan_periodic_sync"
         private const val IMMEDIATE_WORK_NAME = "whim_lan_immediate_sync"
 
-        private fun wifiConstraints(): Constraints = Constraints.Builder()
-            .setRequiredNetworkType(NetworkType.UNMETERED)
+        // Use CONNECTED instead of UNMETERED so metered Wi-Fi / hotspots don't stall LAN sync.
+        private fun networkConstraints(): Constraints = Constraints.Builder()
+            .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
 
         fun enqueuePeriodic(context: Context) {
             val req = PeriodicWorkRequestBuilder<SyncWorker>(15, TimeUnit.MINUTES)
-                .setConstraints(wifiConstraints())
+                .setConstraints(networkConstraints())
                 .build()
             WorkManager.getInstance(context).enqueueUniquePeriodicWork(
                 PERIODIC_WORK_NAME,
@@ -53,7 +54,7 @@ class SyncWorker(
 
         fun enqueueImmediate(context: Context) {
             val req = OneTimeWorkRequestBuilder<SyncWorker>()
-                .setConstraints(wifiConstraints())
+                .setConstraints(networkConstraints())
                 .build()
             WorkManager.getInstance(context).enqueueUniqueWork(
                 IMMEDIATE_WORK_NAME,

@@ -6,6 +6,10 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.graphics.BitmapFactory
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.net.NetworkRequest
 import android.os.Build
 import android.os.Bundle
 import android.util.LruCache
@@ -262,8 +266,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        // Mirror Navigator: phone does NOT run a server; it connects to Mac(s) via UDP discovery
-        SyncWorker.enqueueImmediate(this)
+        // Foreground ON_RESUME handles immediate sync + UI refresh directly (avoiding WorkManager race).
     }
 }
 
@@ -315,6 +318,8 @@ private fun FlomoMobileApp(
     var syncToast by remember { mutableStateOf("") }
     var syncToastJob by remember { mutableStateOf<Job?>(null) }
     var peerStatuses by remember { mutableStateOf<List<com.whim.app.core.WhimPeerSyncStatus>>(emptyList()) }
+    var lastLoadedVersion by remember { mutableStateOf(-1L) }
+    var foregroundSyncTrigger by remember { mutableStateOf(0) }
 
     fun buildFilterForTab(tab: MobileTab, cursor: WhimNoteCursor?): WhimListFilter? {
         return when (tab) {
@@ -410,6 +415,7 @@ private fun FlomoMobileApp(
 
     fun reload() {
         scope.launch {
+            lastLoadedVersion = WhimCoreBridge.dataVersion()
             refreshMetadata()
             loadFirstPage()
         }
@@ -433,11 +439,37 @@ private fun FlomoMobileApp(
                 exactAlarmGranted = DailyReviewScheduler.canScheduleExactAlarms(context)
                 notifPermissionGranted = DailyReviewReceiver.hasNotificationPermission(context)
                 reviewSchedule = DailyReviewScheduler.getSchedule(context)
+                // Tear down any half-open SSE socket from sleep/background and trigger immediate foreground sync
+                WhimCoreBridge.reconnectEvents()
                 reload()
+                foregroundSyncTrigger++
             }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
+
+    // Reconnect SSE & sync immediately whenever Wi-Fi comes back online
+    DisposableEffect(context) {
+        val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE) as? ConnectivityManager
+        val callback = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                WhimCoreBridge.reconnectEvents()
+                scope.launch { foregroundSyncTrigger++ }
+            }
+        }
+        val registered = runCatching {
+            val req = NetworkRequest.Builder()
+                .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                .build()
+            cm?.registerNetworkCallback(req, callback)
+            cm != null
+        }.getOrDefault(false)
+        onDispose {
+            if (registered) {
+                runCatching { cm?.unregisterNetworkCallback(callback) }
+            }
+        }
     }
 
     LaunchedEffect(activeTab, reviewOffsetDays, searchQuery, randomSeed) {
@@ -497,21 +529,43 @@ private fun FlomoMobileApp(
         previousTopNoteId = currentTopNoteId
     }
 
+    // Immediate foreground catch-up sync on every ON_RESUME / Wi-Fi reconnect
+    LaunchedEffect(foregroundSyncTrigger) {
+        if (foregroundSyncTrigger == 0) return@LaunchedEffect
+        val code = pairCode.ifEmpty { runCatching { WhimCoreBridge.getPairCode() }.getOrDefault("") }
+        if (code.length != 6) return@LaunchedEffect
+        val res = runCatching { WhimCoreBridge.syncOnce(timeoutSec = 6) }.getOrNull()
+        if (res != null) {
+            peerStatuses = res.peers
+            if (res.notesMerged > 0 || res.blobsDownloaded > 0 || WhimCoreBridge.dataVersion() != lastLoadedVersion) {
+                reload()
+                WhimWidgetProvider.refreshAll(context)
+            }
+        } else if (WhimCoreBridge.dataVersion() != lastLoadedVersion) {
+            reload()
+        }
+    }
+
     // Real-time SSE push loop: wakes up in < 50ms when Mac creates/edits/deletes a note,
     // with a 15s fallback sync in case of Wi-Fi hiccups. Re-runs immediately when pairCode changes.
     LaunchedEffect(pairCode) {
         while (isActive) {
             val code = pairCode.ifEmpty { runCatching { WhimCoreBridge.getPairCode() }.getOrDefault("") }
             if (code.length == 6) {
-                val res = runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }.getOrNull()
+                val res = runCatching { WhimCoreBridge.syncOnce(timeoutSec = 6) }.getOrNull()
                 if (res != null) {
                     peerStatuses = res.peers
-                    if (res.notesMerged > 0 || res.blobsDownloaded > 0) {
+                    if (res.notesMerged > 0 || res.blobsDownloaded > 0 || WhimCoreBridge.dataVersion() != lastLoadedVersion) {
                         reload()
                         WhimWidgetProvider.refreshAll(context)
                     }
+                } else if (WhimCoreBridge.dataVersion() != lastLoadedVersion) {
+                    reload()
                 }
                 WhimCoreBridge.waitForChange(timeoutSec = 15)
+                if (WhimCoreBridge.dataVersion() != lastLoadedVersion) {
+                    reload()
+                }
             } else {
                 delay(2000L)
             }

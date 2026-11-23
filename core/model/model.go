@@ -170,6 +170,12 @@ type SyncSummary struct {
 	Errors          []string         `json:"errors,omitempty"`
 }
 
+// StorageCleanupResult reports orphan image blobs inspected or removed during cleanup.
+type StorageCleanupResult struct {
+	RemovedFiles int   `json:"removed_files"`
+	FreedBytes   int64 `json:"freed_bytes"`
+}
+
 const crockford = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 // NewULID generates a lexicographically sortable 26-char ULID.

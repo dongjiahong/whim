@@ -229,3 +229,89 @@ func TestPaginationStatsRandomAndBatchExport(t *testing.T) {
 		t.Fatalf("expected 20 short-query hits for '偶数', got %d (%v)", len(hits2), err)
 	}
 }
+
+func TestAttachmentSoftDeleteUndoAndOrphanBlobGC(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.Open(dir)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	// 1. Save 3 blobs: imgA (kept), imgB (removed during edit), imgC (unsent draft zombie)
+	hA, pA, sA, err := st.SaveBlob([]byte("\x89PNG\r\n\x1a\nimage-A-kept"), "image/png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	hB, pB, sB, err := st.SaveBlob([]byte("\x89PNG\r\n\x1a\nimage-B-removed"), "image/png")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, pC, _, err := st.SaveBlob([]byte("\x89PNG\r\n\x1a\nimage-C-unsent-zombie"), "image/png")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	contentWithBoth := "测试图文\n![image](whim://blob/" + hA + ")\n![image](whim://blob/" + hB + ")"
+	note, err := st.CreateNote(contentWithBoth, []model.Attachment{
+		{SHA256: hA, MIME: "image/png", SizeBytes: sA},
+		{SHA256: hB, MIME: "image/png", SizeBytes: sB},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Edit note to remove imgB -> imgB attachment should be soft-deleted
+	contentOnlyA := "测试图文（已删掉图 B）\n![image](whim://blob/" + hA + ")"
+	updated, err := st.UpdateNoteWithAttachments(note.ID, &contentOnlyA, nil, nil, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(updated.Attachments) != 1 || updated.Attachments[0].SHA256 != hA {
+		t.Fatalf("expected only imgA to remain active, got %+v", updated.Attachments)
+	}
+
+	// Dry-run GC should find 2 orphans (imgB + imgC) without deleting them
+	dry, err := st.CleanupOrphanBlobs(0, true)
+	if err != nil || dry.RemovedFiles != 2 || dry.FreedBytes <= 0 {
+		t.Fatalf("expected 2 orphan blobs in dry-run, got %+v (%v)", dry, err)
+	}
+
+	// Real GC removes imgB & imgC, keeps imgA
+	cleaned, err := st.CleanupOrphanBlobs(0, false)
+	if err != nil || cleaned.RemovedFiles != 2 {
+		t.Fatalf("expected 2 orphan blobs removed, got %+v (%v)", cleaned, err)
+	}
+	if _, err := os.Stat(pA); err != nil {
+		t.Fatalf("expected active imgA to still exist: %v", err)
+	}
+	if _, err := os.Stat(pB); !os.IsNotExist(err) {
+		t.Fatalf("expected removed imgB to be deleted")
+	}
+	if _, err := os.Stat(pC); !os.IsNotExist(err) {
+		t.Fatalf("expected unsent zombie imgC to be deleted")
+	}
+
+	// 3. Soft-delete note -> imgA becomes orphan; undo delete -> imgA restored!
+	delTrue := true
+	if _, err := st.UpdateNote(note.ID, nil, nil, nil, &delTrue); err != nil {
+		t.Fatal(err)
+	}
+	dryAfterDel, err := st.CleanupOrphanBlobs(0, true)
+	if err != nil || dryAfterDel.RemovedFiles != 1 {
+		t.Fatalf("expected 1 orphan after deleting note, got %+v (%v)", dryAfterDel, err)
+	}
+
+	delFalse := false
+	restored, err := st.UpdateNote(note.ID, nil, nil, nil, &delFalse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(restored.Attachments) != 1 || restored.Attachments[0].SHA256 != hA {
+		t.Fatalf("expected imgA restored on undo delete, got %+v", restored.Attachments)
+	}
+	dryAfterUndo, err := st.CleanupOrphanBlobs(0, true)
+	if err != nil || dryAfterUndo.RemovedFiles != 0 {
+		t.Fatalf("expected 0 orphans after undo delete, got %+v (%v)", dryAfterUndo, err)
+	}
+}

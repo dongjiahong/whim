@@ -146,3 +146,44 @@ func TestPairingCodeLockoutAfterFiveFailures(t *testing.T) {
 		t.Fatalf("expected lockout on 5th failed attempt, got: %+v", last.Peers)
 	}
 }
+
+func TestSyncOnceNotifiesDataVersionAndConcurrentPeers(t *testing.T) {
+	stMac, _ := store.Open(t.TempDir())
+	defer stMac.Close()
+	stAndroid, _ := store.Open(t.TempDir())
+	defer stAndroid.Close()
+
+	const code = "246810"
+	peerMac := whimsync.NewPeer(stMac, "peer-mac", "Mac", code)
+	peerAndroid := whimsync.NewPeer(stAndroid, "peer-android", "Android", code)
+	peerMac.SetDiscoveryPort(58790)
+	peerAndroid.SetDiscoveryPort(58790)
+
+	port, err := peerMac.StartServer(0, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer peerMac.StopServer()
+
+	// Include a dead/unreachable peer alongside the live Mac to verify concurrent sync succeeds quickly.
+	liveAddr := fmt.Sprintf("127.0.0.1:%d", port)
+	rawManual, _ := json.Marshal([]string{"127.0.0.1:1", liveAddr})
+	_ = stAndroid.SetMeta("whim.manual_addrs", string(rawManual))
+
+	if _, err := stMac.CreateNote("Mac 新笔记 #测试", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	vBefore := peerAndroid.DataVersion()
+	sum := peerAndroid.SyncOnce(context.Background())
+	if sum.PeersSynced != 1 || sum.NotesMerged != 1 {
+		t.Fatalf("expected live Mac to sync despite unreachable sibling addr, got: %+v", sum)
+	}
+	if peerAndroid.DataVersion() <= vBefore {
+		t.Fatalf("expected DataVersion to increment after outgoing sync merged notes (before=%d, after=%d)", vBefore, peerAndroid.DataVersion())
+	}
+	// WaitForChange should return immediately (localChanged signaled by SyncWithAddr)
+	if !peerAndroid.WaitForChange(1) {
+		t.Fatalf("expected WaitForChange to wake immediately after outgoing sync merged notes")
+	}
+}

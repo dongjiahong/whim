@@ -30,6 +30,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.Palette
+import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material.icons.rounded.Update
 import androidx.compose.material3.Icon
@@ -64,6 +65,7 @@ import com.whim.app.update.ReleaseInfo
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.util.Calendar
 import java.util.Locale
 
@@ -106,6 +108,30 @@ fun MobileSettingsScreen(
     var updateStatus by remember { mutableStateOf("当前版本 v${GitHubUpdater.CURRENT_VERSION}，点击检查 GitHub 最新版本") }
     var availableRelease by remember { mutableStateOf<ReleaseInfo?>(null) }
     var checkingUpdate by remember { mutableStateOf(false) }
+    var storageTotalBytes by remember { mutableStateOf(0L) }
+    var storageDbBytes by remember { mutableStateOf(0L) }
+    var storageBlobsBytes by remember { mutableStateOf(0L) }
+    var storageBlobCount by remember { mutableStateOf(0) }
+    var storageOrphanCount by remember { mutableStateOf(0) }
+    var storageOrphanBytes by remember { mutableStateOf(0L) }
+    var storageCleanupMsg by remember { mutableStateOf("") }
+    var isCleaningStorage by remember { mutableStateOf(false) }
+    var storageLoaded by remember { mutableStateOf(false) }
+    var storageRefreshTick by remember { mutableStateOf(0) }
+
+    LaunchedEffect(storageRefreshTick) {
+        val usage = withContext(Dispatchers.IO) {
+            computeAndroidStorageUsage(File(context.applicationContext.filesDir, "whim_data"))
+        }
+        val dry = runCatching { WhimCoreBridge.cleanupOrphanBlobs(minAgeSec = 0, dryRun = true) }.getOrNull()
+        storageTotalBytes = usage.totalBytes
+        storageDbBytes = usage.dbBytes
+        storageBlobsBytes = usage.blobsBytes
+        storageBlobCount = usage.blobCount
+        storageOrphanCount = dry?.removedFiles ?: 0
+        storageOrphanBytes = dry?.freedBytes ?: 0L
+        storageLoaded = true
+    }
 
     BackHandler(onBack = onBack)
 
@@ -633,7 +659,88 @@ fun MobileSettingsScreen(
                 }
             }
 
-            // 4. 关于与更新
+            // 4. 本地存储空间
+            SettingsSectionCard(
+                icon = Icons.Rounded.Storage,
+                title = "本地存储空间",
+                highlighted = false,
+                trailing = {
+                    Text(
+                        "刷新",
+                        style = t.meta,
+                        color = c.tagText,
+                        modifier = Modifier.clickable { storageRefreshTick++ }
+                    )
+                }
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(
+                        modifier = Modifier.weight(1f).padding(end = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Text("当前数据占用", style = t.body, color = c.textPrimary)
+                        Text(
+                            if (storageLoaded) {
+                                "数据库 ${formatStorageBytes(storageDbBytes)} · 图片附件 ${formatStorageBytes(storageBlobsBytes)}（${storageBlobCount} 张）"
+                            } else {
+                                "正在统计本地存储..."
+                            },
+                            style = t.meta,
+                            color = c.textSecondary
+                        )
+                    }
+                    Text(
+                        if (storageLoaded) formatStorageBytes(storageTotalBytes) else "--",
+                        style = t.section,
+                        color = c.accent
+                    )
+                }
+                if (storageLoaded && storageOrphanCount > 0) {
+                    Text(
+                        "检测到 ${storageOrphanCount} 张未引用冗余图片（可释放 ${formatStorageBytes(storageOrphanBytes)}）",
+                        style = t.meta,
+                        color = c.tagText
+                    )
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Box(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(c.canvas)
+                            .clickable(enabled = !isCleaningStorage) {
+                                isCleaningStorage = true
+                                storageCleanupMsg = ""
+                                scope.launch {
+                                    val res = runCatching { WhimCoreBridge.cleanupOrphanBlobs(minAgeSec = 0, dryRun = false) }.getOrNull()
+                                    isCleaningStorage = false
+                                    storageCleanupMsg = when {
+                                        res == null -> "清理失败，请重试"
+                                        res.removedFiles > 0 -> "已清理 ${res.removedFiles} 张冗余图片，释放 ${formatStorageBytes(res.freedBytes)}"
+                                        else -> "没有发现未引用的冗余图片，已整理数据库缓存"
+                                    }
+                                    storageRefreshTick++
+                                }
+                            }
+                            .padding(horizontal = 12.dp, vertical = 8.dp)
+                    ) {
+                        Text(
+                            if (isCleaningStorage) "清理中..." else "清理冗余图片",
+                            style = t.meta,
+                            color = c.textPrimary,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+                if (storageCleanupMsg.isNotEmpty()) {
+                    Text(storageCleanupMsg, style = t.meta, color = c.accent)
+                }
+            }
+
+            // 5. 关于与更新
             SettingsSectionCard(
                 icon = Icons.Rounded.Update,
                 title = "关于与更新 · v${GitHubUpdater.CURRENT_VERSION}",
@@ -681,6 +788,45 @@ fun MobileSettingsScreen(
             Spacer(Modifier.height(24.dp))
         }
     }
+}
+
+private data class AndroidStorageUsage(
+    val totalBytes: Long,
+    val dbBytes: Long,
+    val blobsBytes: Long,
+    val blobCount: Int
+)
+
+private fun computeAndroidStorageUsage(rootDir: File): AndroidStorageUsage {
+    if (!rootDir.exists()) return AndroidStorageUsage(0L, 0L, 0L, 0)
+    var total = 0L
+    var db = 0L
+    var blobs = 0L
+    var blobCnt = 0
+    val blobsDirPath = File(rootDir, "blobs").absolutePath
+    rootDir.walkTopDown().forEach { f ->
+        if (f.isFile) {
+            val len = f.length()
+            total += len
+            if (f.absolutePath.startsWith(blobsDirPath)) {
+                blobs += len
+                blobCnt++
+            } else if (f.name.startsWith("whim.sqlite3")) {
+                db += len
+            }
+        }
+    }
+    return AndroidStorageUsage(total, db, blobs, blobCnt)
+}
+
+private fun formatStorageBytes(bytes: Long): String {
+    if (bytes < 1024L) return "$bytes B"
+    val kb = bytes / 1024.0
+    if (kb < 1024.0) return String.format(Locale.getDefault(), "%.1f KB", kb)
+    val mb = kb / 1024.0
+    if (mb < 1024.0) return String.format(Locale.getDefault(), "%.1f MB", mb)
+    val gb = mb / 1024.0
+    return String.format(Locale.getDefault(), "%.2f GB", gb)
 }
 
 @Composable

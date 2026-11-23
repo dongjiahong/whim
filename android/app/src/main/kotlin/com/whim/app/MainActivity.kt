@@ -33,6 +33,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -70,8 +71,13 @@ import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil.compose.AsyncImage
@@ -167,6 +173,8 @@ private fun FlomoMobileApp(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val listState = rememberLazyListState()
+    var previousTopNoteId by remember { mutableStateOf<String?>(null) }
 
     var activeTab by remember { mutableStateOf<MobileTab>(if (initialReviewMode) MobileTab.Review else MobileTab.All) }
     var searchQuery by remember { mutableStateOf("") }
@@ -232,6 +240,15 @@ private fun FlomoMobileApp(
 
     LaunchedEffect(activeTab, searchQuery, randomSeed) {
         reload()
+    }
+
+    // Auto-scroll to top when a newly synced note arrives at index 0
+    val currentTopNoteId = displayedNotes.firstOrNull()?.id
+    LaunchedEffect(currentTopNoteId) {
+        if (currentTopNoteId != null && previousTopNoteId != null && currentTopNoteId != previousTopNoteId && listState.firstVisibleItemIndex <= 1) {
+            listState.animateScrollToItem(0)
+        }
+        previousTopNoteId = currentTopNoteId
     }
 
     // Real-time SSE push loop: wakes up in < 50ms when Mac creates/edits/deletes a note,
@@ -667,6 +684,7 @@ private fun FlomoMobileApp(
 
                 // Flomo Note Card Feed
                 LazyColumn(
+                    state = listState,
                     modifier = Modifier.fillMaxSize(),
                     contentPadding = PaddingValues(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 96.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
@@ -923,16 +941,18 @@ private fun FlomoMobileNoteCard(
             }
         }
 
-        // Interleaved inline Text + Image blocks (strip #tags already shown as top pills)
+        // Interleaved inline Text + Image blocks (strip #tags already shown as top pills, preserve leading indent!)
         val displayBody = remember(note.content, note.tags) {
             var cleaned = note.content
             for (tag in note.tags.sortedByDescending { it.length }) {
                 val escaped = Regex.escape(tag).replace("/", "\\s*/\\s*")
                 cleaned = Regex("#\\s*$escaped(?=$|[\\s,.;:!?，。；：！？\\)\\]）】」』])").replace(cleaned, "")
             }
-            cleaned.lines().map { it.trim() }.filterIndexed { i, line ->
-                line.isNotEmpty() || (i > 0)
-            }.joinToString("\n").trim()
+            cleaned.lines()
+                .map { line -> if (line.isBlank()) "" else line.trimEnd() }
+                .dropWhile { it.isEmpty() }
+                .dropLastWhile { it.isEmpty() }
+                .joinToString("\n")
         }
         val blobRegex = remember { Regex("!\\[[^\\]]*\\]\\(whim://blob/([a-fA-F0-9]{64})\\)") }
         val pathByHash = remember(note.attachments) { note.attachments.associate { it.sha256 to it.localPath } }
@@ -942,15 +962,9 @@ private fun FlomoMobileNoteCard(
 
         matches.forEach { m ->
             if (m.range.first > cursor) {
-                val seg = displayBody.substring(cursor, m.range.first).trim()
-                if (seg.isNotEmpty()) {
-                    Text(
-                        text = seg,
-                        style = t.body,
-                        color = c.textPrimary,
-                        maxLines = if (textExpanded || !isLong) Int.MAX_VALUE else 6,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                val seg = displayBody.substring(cursor, m.range.first).trim('\n')
+                if (seg.isNotBlank()) {
+                    MobileMarkdownBlock(text = seg, collapsed = !textExpanded && isLong)
                 }
             }
             val hash = m.groupValues[1]
@@ -970,15 +984,9 @@ private fun FlomoMobileNoteCard(
             cursor = m.range.last + 1
         }
         if (cursor < displayBody.length) {
-            val tail = displayBody.substring(cursor).trim()
-            if (tail.isNotEmpty()) {
-                Text(
-                    text = tail,
-                    style = t.body,
-                    color = c.textPrimary,
-                    maxLines = if (textExpanded || !isLong) Int.MAX_VALUE else 6,
-                    overflow = TextOverflow.Ellipsis
-                )
+            val tail = displayBody.substring(cursor).trim('\n')
+            if (tail.isNotBlank()) {
+                MobileMarkdownBlock(text = tail, collapsed = !textExpanded && isLong)
             }
         }
 
@@ -1008,4 +1016,110 @@ private fun FlomoMobileNoteCard(
             }
         }
     }
+}
+
+@Composable
+private fun MobileMarkdownBlock(text: String, collapsed: Boolean) {
+    val c = WhimTheme.colors
+    val t = WhimTheme.typography
+    val lines = remember(text, collapsed) {
+        val raw = text.lines()
+        if (collapsed) raw.take(6) else raw
+    }
+    val orderedRegex = remember { Regex("^(\\d+)\\. (.*)$") }
+
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        lines.forEach { line ->
+            var spaces = 0
+            for (ch in line) {
+                if (ch == ' ') spaces++ else if (ch == '\t') spaces += 2 else break
+            }
+            val level = (spaces / 2).coerceAtMost(6)
+            val indentDp = (level * 18).dp
+            val trimmed = line.trim()
+            val bulletGlyph = when (level % 3) {
+                0 -> "•"
+                1 -> "◦"
+                else -> "▪"
+            }
+
+            when {
+                trimmed.isEmpty() -> Spacer(Modifier.height(4.dp))
+                trimmed.startsWith("#### ") -> Text(
+                    text = parseInlineMarkdown(trimmed.drop(5), c.tagBg, c.tagText),
+                    style = t.body.copy(fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold),
+                    color = c.textPrimary
+                )
+                trimmed.startsWith("### ") -> Text(
+                    text = parseInlineMarkdown(trimmed.drop(4), c.tagBg, c.tagText),
+                    style = t.body.copy(fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold),
+                    color = c.textPrimary
+                )
+                trimmed.startsWith("## ") -> Text(
+                    text = parseInlineMarkdown(trimmed.drop(3), c.tagBg, c.tagText),
+                    style = t.body.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold),
+                    color = c.textPrimary
+                )
+                trimmed.startsWith("# ") -> Text(
+                    text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText),
+                    style = t.body.copy(fontSize = 18.5.sp, fontWeight = FontWeight.Bold),
+                    color = c.textPrimary
+                )
+                trimmed.startsWith("- [ ] ") || trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ") -> {
+                    val done = !trimmed.startsWith("- [ ] ")
+                    Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text(if (done) "☑" else "☐", style = t.body, color = if (done) c.accent else c.textMuted)
+                        Text(
+                            text = parseInlineMarkdown(trimmed.drop(6), c.tagBg, c.tagText),
+                            style = t.body.copy(textDecoration = if (done) TextDecoration.LineThrough else TextDecoration.None),
+                            color = if (done) c.textSecondary else c.textPrimary
+                        )
+                    }
+                }
+                trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
+                    Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                        Text(bulletGlyph, style = t.body.copy(fontWeight = FontWeight.Bold), color = c.textSecondary)
+                        Text(text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText), style = t.body, color = c.textPrimary)
+                    }
+                }
+                orderedRegex.matches(trimmed) -> {
+                    val m = orderedRegex.matchEntire(trimmed)!!
+                    Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        Text("${m.groupValues[1]}.", style = t.body, color = c.textSecondary)
+                        Text(text = parseInlineMarkdown(m.groupValues[2], c.tagBg, c.tagText), style = t.body, color = c.textPrimary)
+                    }
+                }
+                trimmed.startsWith("> ") -> {
+                    Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Box(modifier = Modifier.width(3.dp).height(18.dp).clip(RoundedCornerShape(2.dp)).background(c.accent.copy(alpha = 0.75f)))
+                        Text(text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText), style = t.body, color = c.textSecondary)
+                    }
+                }
+                else -> Text(
+                    text = parseInlineMarkdown(trimmed, c.tagBg, c.tagText),
+                    style = t.body,
+                    color = c.textPrimary,
+                    modifier = Modifier.padding(start = indentDp)
+                )
+            }
+        }
+    }
+}
+
+private fun parseInlineMarkdown(raw: String, codeBg: Color, codeFg: Color) = buildAnnotatedString {
+    val tokenRegex = Regex("(\\*\\*[^*]+\\*\\*|~~[^~]+~~|`[^`]+`|\\*[^*]+\\*)")
+    var idx = 0
+    for (m in tokenRegex.findAll(raw)) {
+        if (m.range.first > idx) append(raw.substring(idx, m.range.first))
+        val tok = m.value
+        when {
+            tok.startsWith("**") && tok.endsWith("**") -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(tok.drop(2).dropLast(2)) }
+            tok.startsWith("~~") && tok.endsWith("~~") -> withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) { append(tok.drop(2).dropLast(2)) }
+            tok.startsWith("`") && tok.endsWith("`") -> withStyle(SpanStyle(background = codeBg, color = codeFg)) { append(" ${tok.drop(1).dropLast(1)} ") }
+            tok.startsWith("*") && tok.endsWith("*") -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { append(tok.drop(1).dropLast(1)) }
+            else -> append(tok)
+        }
+        idx = m.range.last + 1
+    }
+    if (idx < raw.length) append(raw.substring(idx))
 }

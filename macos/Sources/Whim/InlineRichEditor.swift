@@ -105,7 +105,12 @@ enum NoteContentParser {
 
         let cleanedLines = (mutable as String)
             .components(separatedBy: "\n")
-            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .map { line -> String in
+                // Trim trailing whitespace only so nested list leading indentation is preserved!
+                var s = line
+                while s.last == " " || s.last == "\t" { s.removeLast() }
+                return s.trimmingCharacters(in: .whitespaces).isEmpty ? "" : s
+            }
         var compact: [String] = []
         for line in cleanedLines {
             if line.isEmpty {
@@ -116,7 +121,8 @@ enum NoteContentParser {
                 compact.append(line)
             }
         }
-        return compact.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        while compact.last?.isEmpty == true { compact.removeLast() }
+        return compact.joined(separator: "\n")
     }
 
     static func resolveLocalBlobPath(sha256: String) -> String? {
@@ -206,6 +212,13 @@ final class WhimNSTextView: NSTextView {
             onEscape?()
             return
         }
+        // Tab / Shift+Tab: indent or outdent current list line for multi-level lists
+        if event.keyCode == 48 && !hasMarkedText() {
+            let isShift = event.modifierFlags.contains(.shift)
+            if handleListIndent(outdent: isShift) {
+                return
+            }
+        }
         // Plain Return: smart Markdown list continuation (- , 1. , - [ ] )
         let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
         if mods.isEmpty && (event.keyCode == 36 || event.keyCode == 76) && !hasMarkedText() {
@@ -214,6 +227,35 @@ final class WhimNSTextView: NSTextView {
             }
         }
         super.keyDown(with: event)
+    }
+
+    private func handleListIndent(outdent: Bool) -> Bool {
+        let sel = selectedRange()
+        let ns = string as NSString
+        let lineRange = ns.lineRange(for: NSRange(location: sel.location, length: 0))
+        let rawLine = ns.substring(with: lineRange)
+        let trimmed = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+        let isList = trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") ||
+            trimmed.hasPrefix("- [ ] ") || trimmed.hasPrefix("- [x] ") || trimmed.hasPrefix("- [X] ") ||
+            (try? NSRegularExpression(pattern: #"^\d+\. "#).firstMatch(in: trimmed, range: NSRange(location: 0, length: (trimmed as NSString).length))) != nil
+        guard isList else { return false }
+
+        if outdent {
+            if rawLine.hasPrefix("  ") {
+                textStorage?.replaceCharacters(in: NSRange(location: lineRange.location, length: 2), with: "")
+                setSelectedRange(NSRange(location: max(lineRange.location, sel.location - 2), length: 0))
+            } else if rawLine.hasPrefix("\t") || rawLine.hasPrefix(" ") {
+                textStorage?.replaceCharacters(in: NSRange(location: lineRange.location, length: 1), with: "")
+                setSelectedRange(NSRange(location: max(lineRange.location, sel.location - 1), length: 0))
+            }
+        } else {
+            let indentAttr = NSAttributedString(string: "  ", attributes: defaultTypingAttrs())
+            textStorage?.replaceCharacters(in: NSRange(location: lineRange.location, length: 0), with: indentAttr)
+            setSelectedRange(NSRange(location: sel.location + 2, length: 0))
+        }
+        highlightTags()
+        onContentChanged?()
+        return true
     }
 
     private func handleSmartListReturn() -> Bool {

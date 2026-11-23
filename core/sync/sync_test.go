@@ -29,6 +29,9 @@ func TestSingleLibraryCodeBidirectionalSyncAndBlobs(t *testing.T) {
 	const sharedCode = "614284"
 	peerMac := whimsync.NewPeer(stMac, "peer-mac", "MacBook", sharedCode)
 	peerAndroid := whimsync.NewPeer(stAndroid, "peer-android", "Android", "999111")
+	// Isolate test UDP discovery port so a running desktop Whim.app on :8789 is not picked up
+	peerMac.SetDiscoveryPort(58789)
+	peerAndroid.SetDiscoveryPort(58789)
 
 	port, err := peerMac.StartServer(0, false)
 	if err != nil {
@@ -120,6 +123,8 @@ func TestPairingCodeLockoutAfterFiveFailures(t *testing.T) {
 
 	peerMac := whimsync.NewPeer(stMac, "peer-mac", "Mac", "123456")
 	peerBad := whimsync.NewPeer(stBad, "peer-bad", "Intruder", "000000")
+	peerMac.SetDiscoveryPort(58789)
+	peerBad.SetDiscoveryPort(58789)
 
 	port, err := peerMac.StartServer(0, false)
 	if err != nil {

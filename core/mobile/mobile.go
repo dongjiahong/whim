@@ -86,6 +86,7 @@ func CreateNote(content, attachmentsJSON string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	e.Peer.NotifyChanged()
 	b, err := json.Marshal(note)
 	return string(b), err
 }
@@ -112,6 +113,7 @@ func UpdateNote(patchJSON string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	e.Peer.NotifyChanged()
 	b, err := json.Marshal(note)
 	return string(b), err
 }
@@ -212,6 +214,15 @@ func SyncOnce(timeoutSec int) (string, error) {
 	summary := e.SyncOnce(timeoutSec)
 	b, err := json.Marshal(summary)
 	return string(b), err
+}
+
+// WaitForChange blocks until a real-time SSE push or incoming sync change occurs (or timeoutSec elapses).
+func WaitForChange(timeoutSec int) (bool, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return false, err
+	}
+	return e.Peer.WaitForChange(timeoutSec), nil
 }
 
 // GetPairCode returns the 6-digit pairing code of this library.

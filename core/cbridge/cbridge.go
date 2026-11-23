@@ -159,6 +159,18 @@ func WhimSyncOnce(timeoutSec C.int) *C.char {
 	return okJSON(res)
 }
 
+//export WhimWaitForChange
+func WhimWaitForChange(timeoutSec C.int) *C.char {
+	changed, err := mobile.WaitForChange(int(timeoutSec))
+	if err != nil {
+		return errJSON(err)
+	}
+	if changed {
+		return okJSON("true")
+	}
+	return okJSON("false")
+}
+
 //export WhimGetPairCode
 func WhimGetPairCode() *C.char {
 	code, err := mobile.GetPairCode()

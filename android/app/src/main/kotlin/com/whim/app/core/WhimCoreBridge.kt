@@ -93,6 +93,10 @@ object WhimCoreBridge {
         json.decodeFromString(raw)
     }
 
+    suspend fun waitForChange(timeoutSec: Int = 25): Boolean = withContext(Dispatchers.IO) {
+        runCatching { Mobile.waitForChange(timeoutSec.toLong()) }.getOrDefault(false)
+    }
+
     fun syncOnceBlocking(timeoutSec: Int = 8): WhimSyncSummary {
         val raw = Mobile.syncOnce(timeoutSec.toLong())
         return json.decodeFromString(raw)

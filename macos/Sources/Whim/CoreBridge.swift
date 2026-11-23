@@ -288,6 +288,10 @@ final class CoreBridge {
         try decodeCString(WhimSyncOnce(timeoutSec), as: WhimSyncSummary.self)
     }
 
+    func waitForChange(timeoutSec: Int32 = 25) -> Bool {
+        (try? decodeCString(WhimWaitForChange(timeoutSec), as: Bool.self)) ?? false
+    }
+
     func getPairCode() throws -> String {
         try decodeCString(WhimGetPairCode(), as: String.self)
     }

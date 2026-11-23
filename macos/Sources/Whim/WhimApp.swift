@@ -213,18 +213,17 @@ final class WhimStoreVM: ObservableObject {
     }
 
     private func startAutoSyncTimer() {
-        // Mirror Navigator HOST_MS (2.5s): pick up incoming phone pushes from local SQLite immediately
-        localPollTimer?.invalidate()
-        localPollTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.reloadIfChanged()
-            }
-        }
-        // Peer-to-peer sync with other Macs every 10s
-        autoSyncTimer?.invalidate()
-        autoSyncTimer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.syncNow()
+        // Real-time event loop: wakes up in < 50ms when a phone pushes a change or another Mac sends an SSE event
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            while self != nil {
+                let changed = CoreBridge.shared.waitForChange(timeoutSec: 25)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.reloadIfChanged()
+                    if changed {
+                        self.syncNow()
+                    }
+                }
             }
         }
     }

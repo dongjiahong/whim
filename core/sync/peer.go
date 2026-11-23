@@ -34,10 +34,18 @@ type Peer struct {
 	displayName   string
 	discoveryPort int
 
-	server      *http.Server
-	httpPort    int
-	cancelServe context.CancelFunc
-	client      *http.Client
+	server       *http.Server
+	httpPort     int
+	cancelServe  context.CancelFunc
+	client       *http.Client
+	streamClient *http.Client // no timeout for long-lived SSE push streams
+
+	sseMu         sync.Mutex
+	sseSubs       map[chan struct{}]struct{}
+	localChanged  chan struct{}
+	remoteChanged chan struct{}
+	sseStarted    bool
+	sseCancel     context.CancelFunc
 }
 
 // NewPeer constructs a Peer attached to a local Store.
@@ -51,6 +59,45 @@ func NewPeer(st *store.Store, peerID, displayName, localCode string) *Peer {
 		client: &http.Client{
 			Timeout: 10 * time.Second,
 		},
+		streamClient:  &http.Client{},
+		sseSubs:       make(map[chan struct{}]struct{}),
+		localChanged:  make(chan struct{}, 1),
+		remoteChanged: make(chan struct{}, 1),
+	}
+}
+
+// NotifyChanged wakes local UI listeners and pushes an instant SSE event to all connected clients.
+func (p *Peer) NotifyChanged() {
+	select {
+	case p.localChanged <- struct{}{}:
+	default:
+	}
+	p.sseMu.Lock()
+	for ch := range p.sseSubs {
+		select {
+		case ch <- struct{}{}:
+		default:
+		}
+	}
+	p.sseMu.Unlock()
+}
+
+// WaitForChange blocks until either a local incoming sync push or a remote SSE push arrives,
+// or timeoutSec elapses. Returns true if woken by a real-time change.
+func (p *Peer) WaitForChange(timeoutSec int) bool {
+	if timeoutSec <= 0 {
+		timeoutSec = 25
+	}
+	p.ensureEventSubscriber()
+	timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
+	defer timer.Stop()
+	select {
+	case <-p.localChanged:
+		return true
+	case <-p.remoteChanged:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
@@ -99,6 +146,7 @@ func (p *Peer) StartServer(httpPort int, enableDiscovery bool) (int, error) {
 	mux.HandleFunc("/health", p.handleHealth)
 	mux.HandleFunc("/sync/challenge", p.handleChallenge)
 	mux.HandleFunc("/sync/exchange", p.handleExchange)
+	mux.HandleFunc("/sync/events", p.handleEvents)
 	mux.HandleFunc("/sync/blobs/", p.handleBlob)
 
 	srv := &http.Server{
@@ -124,16 +172,22 @@ func (p *Peer) StartServer(httpPort int, enableDiscovery bool) (int, error) {
 	return actualPort, nil
 }
 
-// StopServer shuts down the HTTP listener and UDP discovery responder.
+// StopServer shuts down the HTTP listener, UDP discovery responder, and SSE subscriber.
 func (p *Peer) StopServer() error {
 	p.mu.Lock()
 	srv := p.server
 	cancel := p.cancelServe
+	sseCancel := p.sseCancel
 	p.server = nil
 	p.httpPort = 0
 	p.cancelServe = nil
+	p.sseCancel = nil
+	p.sseStarted = false
 	p.mu.Unlock()
 
+	if sseCancel != nil {
+		sseCancel()
+	}
 	if cancel != nil {
 		cancel()
 	}
@@ -542,9 +596,13 @@ func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if _, err := p.store.MergeRemote(req.Notes, req.Attachments); err != nil {
+	merged, err := p.store.MergeRemote(req.Notes, req.Attachments)
+	if err != nil {
 		http.Error(w, "merge error", http.StatusInternalServerError)
 		return
+	}
+	if merged > 0 {
+		p.NotifyChanged()
 	}
 
 	since := req.Since

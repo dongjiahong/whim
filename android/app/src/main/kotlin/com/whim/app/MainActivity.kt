@@ -234,7 +234,8 @@ private fun FlomoMobileApp(
         reload()
     }
 
-    // Mirror Navigator's foreground sync loop: poll Mac every 2.5s while app is open
+    // Real-time SSE push loop: wakes up in < 50ms when Mac creates/edits/deletes a note,
+    // with a 25s fallback sync in case of Wi-Fi hiccups.
     LaunchedEffect(Unit) {
         while (isActive) {
             val code = runCatching { WhimCoreBridge.getPairCode() }.getOrDefault("")
@@ -247,8 +248,11 @@ private fun FlomoMobileApp(
                         WhimWidgetProvider.refreshAll(context)
                     }
                 }
+                // Block on SSE push stream until Mac broadcasts `event: changed` (or 25s keepalive fallback)
+                WhimCoreBridge.waitForChange(timeoutSec = 25)
+            } else {
+                delay(2000L)
             }
-            delay(2500L)
         }
     }
 

@@ -148,12 +148,8 @@ class MainActivity : ComponentActivity() {
 
     override fun onStart() {
         super.onStart()
-        runCatching { WhimCoreBridge.startPeerServer(8788) }
-    }
-
-    override fun onStop() {
-        super.onStop()
-        WhimCoreBridge.stopPeerServer()
+        // Mirror Navigator: phone does NOT run a server; it connects to Mac(s) via UDP discovery
+        SyncWorker.enqueueImmediate(this)
     }
 }
 
@@ -186,6 +182,7 @@ private fun FlomoMobileApp(
     var pairCode by remember { mutableStateOf("") }
     var syncStatus by remember { mutableStateOf("") }
     var remoteCodeInput by remember { mutableStateOf("") }
+    var manualAddrInput by remember { mutableStateOf("") }
     var peerStatuses by remember { mutableStateOf<List<com.whim.app.core.WhimPeerSyncStatus>>(emptyList()) }
 
     val dayFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()) }
@@ -214,6 +211,9 @@ private fun FlomoMobileApp(
                 allNotes = full
                 tagTree = WhimCoreBridge.listTagTree()
                 pairCode = WhimCoreBridge.getPairCode()
+                if (remoteCodeInput.isEmpty() && pairCode.isNotEmpty()) {
+                    remoteCodeInput = pairCode
+                }
 
                 displayedNotes = when (val tab = activeTab) {
                     MobileTab.All -> if (searchQuery.isEmpty()) full else WhimCoreBridge.listNotes(WhimListFilter(query = searchQuery))
@@ -289,7 +289,7 @@ private fun FlomoMobileApp(
                         activeTab = MobileTab.Random
                         scope.launch { drawerState.close() }
                     }
-                    DrawerNavRow(Icons.Rounded.Sync, "局域网同步 · $pairCode", false) {
+                    DrawerNavRow(Icons.Rounded.Sync, "连到 Mac · ${if (pairCode.length == 6) "已配对" else "未配对"}", false) {
                         showSyncCard = true
                         showAboutCard = false
                         scope.launch { drawerState.close() }
@@ -420,6 +420,7 @@ private fun FlomoMobileApp(
                 }
 
                 if (showSyncCard) {
+                    // Mirror Navigator PhoneHome LinkSheet: phone does NOT generate a code; it enters Mac's 6-digit code.
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -427,42 +428,52 @@ private fun FlomoMobileApp(
                             .clip(RoundedCornerShape(10.dp))
                             .background(c.card)
                             .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Text(
-                            text = pairCode.chunked(3).joinToString(" "),
-                            fontSize = 30.sp,
-                            fontWeight = FontWeight.Bold,
-                            color = c.textPrimary
-                        )
-                        Text(
-                            text = "在 Mac 或另一台手机的同步设置里输入这 6 位数字。同一份笔记库只需要一个码。",
-                            style = t.meta,
-                            color = c.textSecondary
-                        )
-
                         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Text("设备", style = t.meta, color = c.textMuted)
+                            Text("连到 Mac", style = t.section, color = c.textPrimary)
                             Text(
                                 "刷新",
                                 style = t.meta,
                                 color = c.tagText,
                                 modifier = Modifier.clickable {
                                     scope.launch {
-                                        syncStatus = "正在通过 UDP 自动发现..."
+                                        syncStatus = "正在查找同 Wi-Fi 下的 Mac..."
                                         val res = WhimCoreBridge.syncOnce()
                                         peerStatuses = res.peers
-                                        syncStatus = if (res.peersSynced > 0) "已同步 ${res.peersSynced} 台设备" else ""
+                                        syncStatus = when {
+                                            res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台 Mac" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
+                                            res.peers.isNotEmpty() -> res.peers.first().message
+                                            else -> "暂未发现同 Wi-Fi 下的 Mac"
+                                        }
                                         reload()
                                     }
                                 }
                             )
                         }
+                        Text(
+                            text = "在 Mac 的「设置 → 局域网同步」里找到 6 位数字。同一个 Wi-Fi 下会自动找到每一台 Mac，只要对一次。",
+                            style = t.meta,
+                            color = c.textSecondary
+                        )
 
-                        if (peerStatuses.isEmpty()) {
-                            Text("暂未发现同一 Wi-Fi 下的其他 Whim 设备", style = t.meta, color = c.textMuted, modifier = Modifier.fillMaxWidth())
-                        } else {
+                        Box(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(c.canvas).padding(horizontal = 12.dp, vertical = 12.dp)) {
+                            BasicTextField(
+                                value = remoteCodeInput,
+                                onValueChange = { remoteCodeInput = it.filter { ch -> ch.isDigit() }.take(6) },
+                                singleLine = true,
+                                textStyle = t.statNumber.copy(color = c.textPrimary),
+                                cursorBrush = SolidColor(c.accent),
+                                modifier = Modifier.fillMaxWidth(),
+                                decorationBox = { inner ->
+                                    if (remoteCodeInput.isEmpty()) Text("482 913", style = t.statNumber, color = c.textMuted)
+                                    inner()
+                                }
+                            )
+                        }
+
+                        if (peerStatuses.isNotEmpty()) {
+                            Text("设备", style = t.meta, color = c.textMuted)
                             peerStatuses.forEach { peer ->
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
@@ -483,62 +494,61 @@ private fun FlomoMobileApp(
                             }
                         }
 
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
-                            Box(modifier = Modifier.weight(1f).clip(RoundedCornerShape(8.dp)).background(c.canvas).padding(horizontal = 12.dp, vertical = 10.dp)) {
-                                BasicTextField(
-                                    value = remoteCodeInput,
-                                    onValueChange = { remoteCodeInput = it },
-                                    singleLine = true,
-                                    textStyle = t.body.copy(color = c.textPrimary),
-                                    cursorBrush = SolidColor(c.accent),
-                                    decorationBox = { inner ->
-                                        if (remoteCodeInput.isEmpty()) Text("另一台设备的码", style = t.body, color = c.textMuted)
-                                        inner()
-                                    }
-                                )
-                            }
-                            Box(
-                                modifier = Modifier.clip(RoundedCornerShape(8.dp)).background(c.accent)
-                                    .clickable {
-                                        val digits = remoteCodeInput.filter { it.isDigit() }
-                                        if (digits.length == 6) {
-                                            scope.launch {
-                                                runCatching { WhimCoreBridge.setPairCode(digits) }
-                                                    .onSuccess { updated ->
-                                                        pairCode = updated
-                                                        remoteCodeInput = ""
-                                                        syncStatus = "正在自动发现并同步..."
-                                                        val res = WhimCoreBridge.syncOnce()
-                                                        peerStatuses = res.peers
-                                                        syncStatus = when {
-                                                            res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台设备" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
-                                                            res.peers.isNotEmpty() -> res.peers.first().message
-                                                            else -> "已使用新配对码"
-                                                        }
-                                                        reload()
-                                                    }
-                                                    .onFailure { syncStatus = it.message ?: "配对码无效" }
-                                            }
-                                        }
-                                    }.padding(horizontal = 16.dp, vertical = 10.dp)
-                            ) { Text("使用", style = t.meta, color = Color.White, fontWeight = FontWeight.Medium) }
-                        }
-
                         if (syncStatus.isNotEmpty()) {
-                            Text(syncStatus, style = t.meta, color = c.textSecondary, modifier = Modifier.fillMaxWidth())
+                            Text(syncStatus, style = t.meta, color = c.textSecondary)
                         }
 
-                        Text(
-                            "重新生成",
-                            style = t.meta,
-                            color = c.textSecondary,
-                            modifier = Modifier.clickable {
-                                scope.launch {
-                                    pairCode = WhimCoreBridge.regeneratePairCode()
-                                    syncStatus = "已重新生成配对码"
+                        val codeReady = remoteCodeInput.filter { it.isDigit() }.length == 6
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (codeReady) c.accent else c.canvas)
+                                .clickable(enabled = codeReady) {
+                                    val digits = remoteCodeInput.filter { it.isDigit() }
+                                    val addr = manualAddrInput.trim()
+                                    scope.launch {
+                                        if (addr.isNotEmpty()) {
+                                            runCatching { WhimCoreBridge.setManualPeers(listOf(addr)) }
+                                        }
+                                        runCatching { WhimCoreBridge.setPairCode(digits) }
+                                            .onSuccess { updated ->
+                                                pairCode = updated
+                                                syncStatus = "正在自动发现 Mac 并同步..."
+                                                val res = WhimCoreBridge.syncOnce()
+                                                peerStatuses = res.peers
+                                                syncStatus = when {
+                                                    res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台 Mac" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
+                                                    res.peers.isNotEmpty() -> res.peers.first().message
+                                                    else -> "已保存配对码，未发现同一 Wi-Fi 下的 Mac"
+                                                }
+                                                reload()
+                                                WhimWidgetProvider.refreshAll(context)
+                                            }
+                                            .onFailure { syncStatus = it.message ?: "配对码无效" }
+                                    }
                                 }
-                            }.padding(top = 2.dp)
-                        )
+                                .padding(vertical = 12.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("配对", style = t.body, color = if (codeReady) Color.White else c.textMuted, fontWeight = FontWeight.SemiBold)
+                        }
+
+                        Text("找不到 Mac 时，才把 Mac 的地址填进来（可选）", style = t.meta, color = c.textMuted)
+                        Box(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(c.canvas).padding(horizontal = 12.dp, vertical = 9.dp)) {
+                            BasicTextField(
+                                value = manualAddrInput,
+                                onValueChange = { manualAddrInput = it },
+                                singleLine = true,
+                                textStyle = t.body.copy(color = c.textPrimary),
+                                cursorBrush = SolidColor(c.accent),
+                                modifier = Modifier.fillMaxWidth(),
+                                decorationBox = { inner ->
+                                    if (manualAddrInput.isEmpty()) Text("192.168.5.111:8788", style = t.meta, color = c.textMuted)
+                                    inner()
+                                }
+                            )
+                        }
                     }
                 }
 

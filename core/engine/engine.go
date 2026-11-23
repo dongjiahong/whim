@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"strings"
 	"time"
 
@@ -50,7 +51,9 @@ func Open(dataDir, displayName string) (*Engine, error) {
 		_ = st.Close()
 		return nil, err
 	}
-	if pairCode == "" {
+	// Mirror Navigator: desktop hosts generate a 6-digit code automatically,
+	// while phones start empty until they enter the Mac's 6-digit code.
+	if pairCode == "" && runtime.GOOS != "android" {
 		pairCode = whimsync.GenerateCode()
 		if err := st.SetMeta(metaPairCode, pairCode); err != nil {
 			_ = st.Close()

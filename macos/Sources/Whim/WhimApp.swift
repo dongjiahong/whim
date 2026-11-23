@@ -30,6 +30,7 @@ final class WhimStoreVM: ObservableObject {
     // Undo delete toast
     @Published var lastDeletedNoteId: String? = nil
     private var undoDismissTask: DispatchWorkItem?
+    private var autoSyncTimer: Timer?
 
     // Stats for sidebar
     @Published var totalNoteCount: Int = 0
@@ -52,6 +53,7 @@ final class WhimStoreVM: ObservableObject {
             seedSampleNotesIfEmpty()
             reload()
             scheduleDailyReviewNotification()
+            startAutoSyncTimer()
         } catch {
             syncMessage = "初始化失败: \(error.localizedDescription)"
         }
@@ -203,6 +205,15 @@ final class WhimStoreVM: ObservableObject {
         lastDeletedNoteId = nil
         _ = try? CoreBridge.shared.updateNote(id: id, deleted: false)
         reload()
+    }
+
+    private func startAutoSyncTimer() {
+        autoSyncTimer?.invalidate()
+        autoSyncTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.syncNow()
+            }
+        }
     }
 
     func syncNow() {

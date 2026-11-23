@@ -42,9 +42,6 @@ type Peer struct {
 
 // NewPeer constructs a Peer attached to a local Store.
 func NewPeer(st *store.Store, peerID, displayName, localCode string) *Peer {
-	if localCode == "" {
-		localCode = GenerateCode()
-	}
 	return &Peer{
 		store:         st,
 		auth:          NewAuth(localCode),
@@ -249,6 +246,16 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 
 	summary.PeersFound = len(byAddr)
 	for _, t := range byAddr {
+		if len(NormalizeCode(code)) != 6 {
+			summary.Peers = append(summary.Peers, model.PeerSyncStatus{
+				PeerID:      t.peerID,
+				DisplayName: t.displayName,
+				Addr:        t.addr,
+				Status:      "need",
+				Message:     "需要配对码",
+			})
+			continue
+		}
 		merged, dl, ul, serr := p.SyncWithAddr(ctx, t.addr, t.peerID, code)
 		if serr != nil {
 			errStr := serr.Error()

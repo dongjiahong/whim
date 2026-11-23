@@ -67,6 +67,7 @@ struct SettingsModalView: View {
     @State private var remoteAddrInput: String = ""
     @State private var remoteCodeInput: String = ""
     @State private var copiedLocalCode: Bool = false
+    @State private var showRegenerateConfirm: Bool = false
     @State private var copiedMCP: Bool = false
     @StateObject private var updater = GitHubUpdater()
 
@@ -338,14 +339,14 @@ struct SettingsModalView: View {
 
                     rowDivider
 
-                    // Single clean input row: enter another device's 6-digit code
+                    // For a second Mac joining the first Mac's note library (mirrors Navigator PairDialog)
                     VStack(alignment: .leading, spacing: 10) {
-                        Text("第二台设备输入第一台上的 6 位码，两边就自动连在同一份笔记库上，无需填写 IP。")
+                        Text("第二台 Mac 输入第一台 Mac 上的码，两边就接在同一份笔记库上（手机端直接输入上方 6 位码即可，无需在此处填写）。")
                             .font(.system(size: 12.5))
                             .foregroundColor(FlomoPalette.textSecondary(scheme))
 
                         HStack(spacing: 10) {
-                            TextField("另一台设备的码", text: $remoteCodeInput)
+                            TextField("另一台 Mac 的码", text: $remoteCodeInput)
                                 .textFieldStyle(.plain)
                                 .font(.system(size: 15, design: .monospaced))
                                 .foregroundColor(FlomoPalette.textPrimary(scheme))
@@ -379,12 +380,20 @@ struct SettingsModalView: View {
                     }
 
                     Button("重新生成") {
-                        vm.regeneratePairCode()
+                        showRegenerateConfirm = true
                     }
                     .buttonStyle(.plain)
                     .font(.system(size: 13, weight: .medium))
                     .foregroundColor(FlomoPalette.textSecondary(scheme))
                     .padding(.top, 4)
+                    .alert("重新生成配对码？", isPresented: $showRegenerateConfirm) {
+                        Button("取消", role: .cancel) {}
+                        Button("重新生成", role: .destructive) {
+                            vm.regeneratePairCode()
+                        }
+                    } message: {
+                        Text("重新生成后，已配对的手机和另一台 Mac 都需要重新输入新的 6 位数字。")
+                    }
                 }
             }
 

@@ -943,12 +943,24 @@ private fun FlomoMobileNoteCard(
 
         // Interleaved inline Text + Image blocks (strip #tags already shown as top pills, preserve leading indent!)
         val displayBody = remember(note.content, note.tags) {
-            var cleaned = note.content
-            for (tag in note.tags.sortedByDescending { it.length }) {
-                val escaped = Regex.escape(tag).replace("/", "\\s*/\\s*")
-                cleaned = Regex("#\\s*$escaped(?=$|[\\s,.;:!?，。；：！？\\)\\]）】」』])").replace(cleaned, "")
+            val tagSet = note.tags.map { it.trim() }.toSet()
+            val stripped = if (tagSet.isEmpty()) {
+                note.content
+            } else {
+                val tagPattern = Regex(
+                    "(^|[\\s(\\[{（【「『，。、；：！？,.;:!?])#([^\\s#,.;:!?，。；：！？)\\]}）】」』]+)",
+                    RegexOption.MULTILINE
+                )
+                tagPattern.replace(note.content) { m ->
+                    val rawTag = m.groupValues[2]
+                    val normalized = rawTag.split("/")
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                        .joinToString("/")
+                    if (normalized in tagSet) m.groupValues[1] else m.value
+                }
             }
-            cleaned.lines()
+            stripped.lines()
                 .map { line -> if (line.isBlank()) "" else line.trimEnd() }
                 .dropWhile { it.isEmpty() }
                 .dropLastWhile { it.isEmpty() }

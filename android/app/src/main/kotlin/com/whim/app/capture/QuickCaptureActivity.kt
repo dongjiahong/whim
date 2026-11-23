@@ -229,6 +229,30 @@ fun FlomoQuickCaptureSheet(
 
             Spacer(Modifier.height(12.dp))
 
+            val tagVisual = remember(c.tagText, c.tagBg) {
+                androidx.compose.ui.text.input.VisualTransformation { input ->
+                    val tagRegex = Regex("(^|[\\s(\\[{（【「『，。、；：！？,.;:!?])(#[^\\s#,.;:!?，。、；：！？)\\]}）】」』]+)")
+                    val styled = androidx.compose.ui.text.buildAnnotatedString {
+                        append(input.text)
+                        tagRegex.findAll(input.text).forEach { m ->
+                            val g = m.groups[2] ?: return@forEach
+                            addStyle(
+                                androidx.compose.ui.text.SpanStyle(
+                                    color = c.tagText,
+                                    background = c.tagBg
+                                ),
+                                start = g.range.first,
+                                end = g.range.last + 1
+                            )
+                        }
+                    }
+                    androidx.compose.ui.text.input.TransformedText(
+                        styled,
+                        androidx.compose.ui.text.input.OffsetMapping.Identity
+                    )
+                }
+            }
+
             BasicTextField(
                 value = text,
                 onValueChange = { text = it },
@@ -238,6 +262,7 @@ fun FlomoQuickCaptureSheet(
                     .focusRequester(focusRequester),
                 textStyle = t.body.copy(color = c.textPrimary),
                 cursorBrush = SolidColor(c.accent),
+                visualTransformation = tagVisual,
                 decorationBox = { inner ->
                     if (text.isEmpty()) {
                         Text(text = "现在的想法是...", style = t.body, color = c.textMuted)

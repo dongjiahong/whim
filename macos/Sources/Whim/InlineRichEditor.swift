@@ -76,20 +76,33 @@ enum NoteContentParser {
     /// Removes `#tag/subtag` tokens that are already shown as top tag pills on the card,
     /// collapsing any blank lines left behind without mutating the underlying stored content.
     static func stripInlineTags(from text: String, tags: [String]) -> String {
-        var result = text
-        // Sort longest first so #a/b/c is removed before #a/b
-        let sorted = tags.sorted { $0.count > $1.count }
-        for tag in sorted {
-            let escaped = NSRegularExpression.escapedPattern(for: tag)
-            // Match #tag (including optional spaces around slashes if typed like #新的 /haoshi)
-            let pattern = "#\\s*" + escaped.replacingOccurrences(of: "/", with: "\\s*/\\s*") + "(?=$|[\\s,.;:!?，。；：！？\\)\\]）】」』])"
-            if let re = try? NSRegularExpression(pattern: pattern, options: []) {
-                let range = NSRange(location: 0, length: (result as NSString).length)
-                result = re.stringByReplacingMatches(in: result, options: [], range: range, withTemplate: "")
+        let tagSet = Set(tags.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+        guard !tagSet.isEmpty else { return text }
+
+        let tagPattern = try! NSRegularExpression(
+            pattern: #"(^|[\s(\[{（【「『，。、；：！？,.;:!?])#([^\s#,.;:!?，。、；：！？)\]}）】」』]+)"#,
+            options: [.anchorsMatchLines]
+        )
+        let ns = text as NSString
+        let matches = tagPattern.matches(in: text, options: [], range: NSRange(location: 0, length: ns.length))
+
+        let mutable = NSMutableString(string: text)
+        for m in matches.reversed() {
+            let rawTag = ns.substring(with: m.range(at: 2))
+            let normalized = rawTag
+                .split(separator: "/")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "/")
+            if tagSet.contains(normalized) {
+                // Keep the leading boundary char (group 1), remove `#<rawTag>`
+                let hashStart = m.range(at: 1).location + m.range(at: 1).length
+                let removeRange = NSRange(location: hashStart, length: (m.range.location + m.range.length) - hashStart)
+                mutable.replaceCharacters(in: removeRange, with: "")
             }
         }
-        // Clean up lines that became whitespace-only and collapse excess leading/trailing newlines
-        let cleanedLines = result
+
+        let cleanedLines = (mutable as String)
             .components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
         var compact: [String] = []
@@ -320,16 +333,46 @@ final class WhimNSTextView: NSTextView {
         setSelectedRange(NSRange(location: result.length, length: 0))
     }
 
+    private static let liveTagRegex = try! NSRegularExpression(
+        pattern: #"(^|[\s(\[{（【「『，。、；：！？,.;:!?])(#[^\s#,.;:!?，。、；：！？)\]}）】」』]+)"#,
+        options: [.anchorsMatchLines]
+    )
+
     func applyTheme(isDark: Bool) {
-        guard isDarkTheme != isDark || textStorage?.length == 0 else { return }
+        let changed = isDarkTheme != isDark
         isDarkTheme = isDark
-        let color = isDark
+        typingAttributes = defaultTypingAttrs()
+        if changed {
+            highlightTags()
+        }
+    }
+
+    /// Highlights `#tag/subtag` tokens live in blue pill tint while typing (skips IME composition).
+    func highlightTags() {
+        guard !hasMarkedText(), let storage = textStorage else { return }
+        let fullRange = NSRange(location: 0, length: storage.length)
+        let baseColor = isDarkTheme
             ? NSColor(red: 0.90, green: 0.90, blue: 0.90, alpha: 1.0)
             : NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0)
-        typingAttributes = defaultTypingAttrs()
-        if let storage = textStorage, storage.length > 0 {
-            storage.addAttribute(.foregroundColor, value: color, range: NSRange(location: 0, length: storage.length))
+        let tagFg = isDarkTheme
+            ? NSColor(red: 0.357, green: 0.608, blue: 1.0, alpha: 1.0)
+            : NSColor(red: 0.184, green: 0.435, blue: 0.894, alpha: 1.0)
+        let tagBg = isDarkTheme
+            ? NSColor(red: 0.118, green: 0.165, blue: 0.227, alpha: 1.0)
+            : NSColor(red: 0.918, green: 0.949, blue: 1.0, alpha: 1.0)
+
+        storage.beginEditing()
+        storage.addAttribute(.foregroundColor, value: baseColor, range: fullRange)
+        storage.removeAttribute(.backgroundColor, range: fullRange)
+        let str = storage.string
+        let matches = Self.liveTagRegex.matches(in: str, options: [], range: fullRange)
+        for m in matches {
+            let tagRange = m.range(at: 2)
+            storage.addAttribute(.foregroundColor, value: tagFg, range: tagRange)
+            storage.addAttribute(.backgroundColor, value: tagBg, range: tagRange)
         }
+        storage.endEditing()
+        typingAttributes = defaultTypingAttrs()
     }
 
     func defaultTypingAttrs() -> [NSAttributedString.Key: Any] {
@@ -430,6 +473,7 @@ struct InlineRichEditor: NSViewRepresentable {
 
         if !initialMarkdown.isEmpty {
             tv.loadMarkdown(initialMarkdown, attachments: initialAttachments)
+            tv.highlightTags()
         }
 
         controller.textView = tv
@@ -458,6 +502,7 @@ struct InlineRichEditor: NSViewRepresentable {
 
         func textDidChange(_ notification: Notification) {
             guard let tv = notification.object as? WhimNSTextView else { return }
+            tv.highlightTags()
             let (md, atts) = tv.serializeMarkdown()
             parent.onTextChange(md, atts)
         }

@@ -235,10 +235,10 @@ private fun FlomoMobileApp(
     }
 
     // Real-time SSE push loop: wakes up in < 50ms when Mac creates/edits/deletes a note,
-    // with a 25s fallback sync in case of Wi-Fi hiccups.
-    LaunchedEffect(Unit) {
+    // with a 15s fallback sync in case of Wi-Fi hiccups. Re-runs immediately when pairCode changes.
+    LaunchedEffect(pairCode) {
         while (isActive) {
-            val code = runCatching { WhimCoreBridge.getPairCode() }.getOrDefault("")
+            val code = pairCode.ifEmpty { runCatching { WhimCoreBridge.getPairCode() }.getOrDefault("") }
             if (code.length == 6) {
                 val res = runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }.getOrNull()
                 if (res != null) {
@@ -248,8 +248,8 @@ private fun FlomoMobileApp(
                         WhimWidgetProvider.refreshAll(context)
                     }
                 }
-                // Block on SSE push stream until Mac broadcasts `event: changed` (or 25s keepalive fallback)
-                WhimCoreBridge.waitForChange(timeoutSec = 25)
+                // Block on SSE push stream until Mac broadcasts `event: changed` (or 15s keepalive fallback)
+                WhimCoreBridge.waitForChange(timeoutSec = 15)
             } else {
                 delay(2000L)
             }

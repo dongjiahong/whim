@@ -272,7 +272,8 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 	code := p.auth.Code()
 	discovered, _ := DiscoverPeers(ctx, discPort, p.peerID, 700*time.Millisecond)
 
-	// Merge optional manual fallback addresses if UDP broadcast is blocked on a network
+	// Merge optional manual fallback addresses and previously known server hosts (host:port)
+	// so Android never misses a sync even if a Wi-Fi UDP broadcast packet is dropped.
 	type targetPeer struct {
 		peerID      string
 		displayName string
@@ -281,6 +282,20 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 	byAddr := make(map[string]targetPeer)
 	for _, dp := range discovered {
 		byAddr[dp.Addr] = targetPeer{peerID: dp.PeerID, displayName: dp.DisplayName, addr: dp.Addr}
+	}
+	if savedPeers, err := p.store.ListSyncPeers(); err == nil {
+		for _, sp := range savedPeers {
+			if sp.PeerID == p.peerID || !strings.Contains(sp.LastAddr, ":") {
+				continue
+			}
+			if _, exists := byAddr[sp.LastAddr]; !exists {
+				byAddr[sp.LastAddr] = targetPeer{
+					peerID:      sp.PeerID,
+					displayName: sp.DisplayName,
+					addr:        sp.LastAddr,
+				}
+			}
+		}
 	}
 	if rawManual, _ := p.store.GetMeta("whim.manual_addrs"); rawManual != "" {
 		var addrs []string

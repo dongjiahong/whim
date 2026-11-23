@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -41,7 +42,10 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if clientPeerID != "" {
 		p.activeSSEPeers[clientPeerID] = time.Now().UnixMilli()
 	}
+	subCount := len(p.sseSubs)
 	p.sseMu.Unlock()
+	log.Printf("[whim-sync] sse client connected peer=%s remote=%s subs=%d", clientPeerID, r.RemoteAddr, subCount)
+
 	if clientPeerID != "" {
 		select {
 		case p.localChanged <- struct{}{}:
@@ -55,6 +59,7 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 			delete(p.activeSSEPeers, clientPeerID)
 		}
 		p.sseMu.Unlock()
+		log.Printf("[whim-sync] sse client disconnected peer=%s", clientPeerID)
 	}()
 
 	keepalive := time.NewTicker(20 * time.Second)
@@ -75,7 +80,7 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 }
 
 // ensureEventSubscriber starts a single lightweight background goroutine that discovers
-// LAN hosts via UDP (or manual fallback addrs) and subscribes to their /sync/events SSE stream.
+// LAN hosts via cached sync_peers + UDP (or manual fallback addrs) and subscribes to /sync/events.
 func (p *Peer) ensureEventSubscriber() {
 	p.mu.Lock()
 	if p.sseStarted {
@@ -100,7 +105,7 @@ func (p *Peer) runEventSubscriberLoop(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(2 * time.Second):
+			case <-time.After(1 * time.Second):
 				continue
 			}
 		}
@@ -110,13 +115,21 @@ func (p *Peer) runEventSubscriberLoop(ctx context.Context) {
 			select {
 			case <-ctx.Done():
 				return
-			case <-time.After(3 * time.Second):
+			case <-time.After(2 * time.Second):
 				continue
 			}
 		}
 
-		// Subscribe to the first reachable host (re-discovers automatically on disconnect)
-		_ = p.subscribeOneSSE(ctx, addrs[0], code)
+		// Try each known host until one accepts the SSE stream
+		for _, addr := range addrs {
+			if ctx.Err() != nil {
+				return
+			}
+			err := p.subscribeOneSSE(ctx, addr, code)
+			if err != nil && ctx.Err() == nil {
+				log.Printf("[whim-sync] sse disconnected from %s: %v", addr, err)
+			}
+		}
 
 		select {
 		case <-ctx.Done():
@@ -133,14 +146,31 @@ func (p *Peer) findEventTargetAddrs(ctx context.Context) []string {
 
 	seen := make(map[string]bool)
 	var out []string
+	add := func(a string) {
+		a = strings.TrimSpace(a)
+		if a == "" || seen[a] {
+			return
+		}
+		seen[a] = true
+		out = append(out, a)
+	}
+
+	// 1. Fresh UDP discovery (picks up DHCP IP changes automatically)
 	if discovered, err := DiscoverPeers(ctx, discPort, p.peerID, 700*time.Millisecond); err == nil {
 		for _, d := range discovered {
-			if !seen[d.Addr] {
-				seen[d.Addr] = true
-				out = append(out, d.Addr)
+			add(d.Addr)
+		}
+	}
+	// 2. Persisted server peers from SQLite sync_peers (entries with host:port, e.g. Mac host).
+	// Immune to Android Wi-Fi UDP broadcast packet drops!
+	if saved, err := p.store.ListSyncPeers(); err == nil {
+		for _, sp := range saved {
+			if strings.Contains(sp.LastAddr, ":") {
+				add(sp.LastAddr)
 			}
 		}
 	}
+	// 3. Optional manual fallback addresses
 	if rawManual, _ := p.store.GetMeta("whim.manual_addrs"); rawManual != "" {
 		var addrs []string
 		if json.Unmarshal([]byte(rawManual), &addrs) == nil {
@@ -152,10 +182,7 @@ func (p *Peer) findEventTargetAddrs(ctx context.Context) []string {
 				if !strings.Contains(a, ":") {
 					a = fmt.Sprintf("%s:%d", a, DefaultHTTPPort)
 				}
-				if !seen[a] {
-					seen[a] = true
-					out = append(out, a)
-				}
+				add(a)
 			}
 		}
 	}
@@ -187,11 +214,13 @@ func (p *Peer) subscribeOneSSE(ctx context.Context, addr, code string) error {
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("sse status %d", resp.StatusCode)
 	}
+	log.Printf("[whim-sync] sse subscribed to %s", addr)
 
 	scanner := bufio.NewScanner(resp.Body)
 	for scanner.Scan() {
 		line := scanner.Text()
 		if strings.HasPrefix(line, "event: changed") {
+			log.Printf("[whim-sync] sse received change from %s", addr)
 			select {
 			case p.remoteChanged <- struct{}{}:
 			default:

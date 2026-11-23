@@ -25,6 +25,7 @@ swiftc -O -parse-as-library \
   "$MAC_DIR/Sources/Whim/CoreBridge.swift" \
   "$MAC_DIR/Sources/Whim/DesignTokens.swift" \
   "$MAC_DIR/Sources/Whim/InlineRichEditor.swift" \
+  "$MAC_DIR/Sources/Whim/MarkdownBlockView.swift" \
   "$MAC_DIR/Sources/Whim/Updater.swift" \
   "$MAC_DIR/Sources/Whim/SettingsView.swift" \
   "$MAC_DIR/Sources/Whim/HotKeyManager.swift" \

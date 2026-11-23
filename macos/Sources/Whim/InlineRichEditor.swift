@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Represents a parsed block of note content for interleaved text + inline images.
 enum NoteContentBlock: Identifiable, Equatable {
@@ -205,7 +206,52 @@ final class WhimNSTextView: NSTextView {
             onEscape?()
             return
         }
+        // Plain Return: smart Markdown list continuation (- , 1. , - [ ] )
+        let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if mods.isEmpty && (event.keyCode == 36 || event.keyCode == 76) && !hasMarkedText() {
+            if handleSmartListReturn() {
+                return
+            }
+        }
         super.keyDown(with: event)
+    }
+
+    private func handleSmartListReturn() -> Bool {
+        let sel = selectedRange()
+        guard sel.length == 0 else { return false }
+        let ns = string as NSString
+        let lineRange = ns.lineRange(for: NSRange(location: sel.location, length: 0))
+        let line = ns.substring(with: lineRange).trimmingCharacters(in: CharacterSet.newlines)
+        let lineNS = line as NSString
+
+        let patterns: [(String, (NSTextCheckingResult, NSString) -> (String, String))] = [
+            (#"^(\s*)- \[[ xX]\] (.*)$"#, { m, s in (s.substring(with: m.range(at: 1)) + "- [ ] ", s.substring(with: m.range(at: 2))) }),
+            (#"^(\s*)([-*]) (.*)$"#, { m, s in (s.substring(with: m.range(at: 1)) + s.substring(with: m.range(at: 2)) + " ", s.substring(with: m.range(at: 3))) }),
+            (#"^(\s*)(\d+)\. (.*)$"#, { m, s in
+                let indent = s.substring(with: m.range(at: 1))
+                let num = (Int(s.substring(with: m.range(at: 2))) ?? 1) + 1
+                return ("\(indent)\(num). ", s.substring(with: m.range(at: 3)))
+            })
+        ]
+
+        for (pat, build) in patterns {
+            guard let re = try? NSRegularExpression(pattern: pat),
+                  let m = re.firstMatch(in: line, range: NSRange(location: 0, length: lineNS.length)) else { continue }
+            let (nextPrefix, body) = build(m, lineNS)
+            if body.trimmingCharacters(in: .whitespaces).isEmpty {
+                let cleanRange = NSRange(location: lineRange.location, length: lineNS.length)
+                textStorage?.replaceCharacters(in: cleanRange, with: "")
+                setSelectedRange(NSRange(location: lineRange.location, length: 0))
+                highlightTags()
+                onContentChanged?()
+                return true
+            } else {
+                insertPlainTextAtCursor("\n" + nextPrefix)
+                highlightTags()
+                return true
+            }
+        }
+        return false
     }
 
     override func paste(_ sender: Any?) {
@@ -394,6 +440,33 @@ final class InlineEditorController: ObservableObject {
     weak var textView: WhimNSTextView?
 
     func pasteImage() { _ = textView?.tryPasteClipboardImage() }
+
+    func pickImageFromFinder() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        panel.allowedContentTypes = [.png, .jpeg, .webP, .gif, .heic]
+        panel.prompt = "插入图片"
+        guard panel.runModal() == .OK else { return }
+        for url in panel.urls {
+            guard let raw = try? Data(contentsOf: url),
+                  let img = NSImage(data: raw),
+                  let tiff = img.tiffRepresentation,
+                  let rep = NSBitmapImageRep(data: tiff),
+                  let png = rep.representation(using: .png, properties: [:]),
+                  let saved = try? CoreBridge.shared.saveBlob(data: png, mime: "image/png") else { continue }
+            textView?.insertInlineImage(
+                sha256: saved.sha256,
+                mime: saved.mime,
+                sizeBytes: saved.sizeBytes,
+                localPath: saved.localPath,
+                image: img
+            )
+            textView?.onContentChanged?()
+        }
+    }
+
     func insertSnippet(_ s: String) { textView?.insertPlainTextAtCursor(s) }
     func clear() {
         textView?.textStorage?.setAttributedString(NSAttributedString(string: ""))

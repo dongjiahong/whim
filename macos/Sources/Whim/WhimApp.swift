@@ -567,19 +567,8 @@ struct FlomoComposerView: View {
                     editor.insertSnippet(markdown.isEmpty || markdown.hasSuffix(" ") || markdown.hasSuffix("\n") ? "#" : " #")
                     editor.focus()
                 }
-                toolbarIcon("photo", help: "在光标处粘贴剪贴板图片 (⌘V)") {
-                    editor.pasteImage()
-                }
-                Rectangle()
-                    .fill(FlomoPalette.border(scheme))
-                    .frame(width: 1, height: 14)
-                toolbarIcon("list.bullet", help: "无序列表") {
-                    editor.insertSnippet(markdown.isEmpty || markdown.hasSuffix("\n") ? "- " : "\n- ")
-                    editor.focus()
-                }
-                toolbarIcon("list.number", help: "有序列表") {
-                    editor.insertSnippet(markdown.isEmpty || markdown.hasSuffix("\n") ? "1. " : "\n1. ")
-                    editor.focus()
+                toolbarIcon("photo", help: "从本地选择图片插入光标处（剪贴板图片直接 ⌘V）") {
+                    editor.pickImageFromFinder()
                 }
 
                 Spacer()
@@ -1266,12 +1255,7 @@ private struct FlomoNoteCard: View {
                 ForEach(blocks) { block in
                     switch block {
                     case .text(_, let val):
-                        Text(val)
-                            .font(.system(size: 14))
-                            .lineSpacing(5)
-                            .foregroundColor(FlomoPalette.textPrimary(scheme))
-                            .lineLimit(expanded || !isLongNote ? nil : 6)
-                            .textSelection(.enabled)
+                        MarkdownBlockView(text: val, collapsed: !expanded && isLongNote)
                     case .image(_, _, let path):
                         if let img = NSImage(contentsOfFile: path) {
                             Image(nsImage: img)
@@ -1449,23 +1433,8 @@ struct FloatingQuickCaptureView: View {
                     editor.insertSnippet(markdown.isEmpty || markdown.hasSuffix(" ") || markdown.hasSuffix("\n") ? "#" : " #")
                     editor.focus()
                 }
-                iconBtn("photo", help: "在光标处粘贴剪贴板图片 (⌘V)") {
-                    editor.pasteImage()
-                }
-                Rectangle()
-                    .fill(FlomoPalette.border(scheme))
-                    .frame(width: 1, height: 14)
-                iconBtn("textformat", help: "加粗") {
-                    editor.insertSnippet("****")
-                    editor.focus()
-                }
-                iconBtn("list.bullet", help: "无序列表") {
-                    editor.insertSnippet(markdown.isEmpty || markdown.hasSuffix("\n") ? "- " : "\n- ")
-                    editor.focus()
-                }
-                iconBtn("list.number", help: "有序列表") {
-                    editor.insertSnippet(markdown.isEmpty || markdown.hasSuffix("\n") ? "1. " : "\n1. ")
-                    editor.focus()
+                iconBtn("photo", help: "从本地选择图片插入光标处（剪贴板图片直接 ⌘V）") {
+                    editor.pickImageFromFinder()
                 }
 
                 Spacer()

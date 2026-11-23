@@ -82,13 +82,22 @@ type ListFilter struct {
 	Offset          int    `json:"offset,omitempty"`
 }
 
-// SyncPeer records per-peer sync watermark locally.
+// SyncPeer records per-peer pairing credentials and sync watermark locally.
 type SyncPeer struct {
 	PeerID      string `json:"peer_id"`
 	DisplayName string `json:"display_name"`
 	LastAddr    string `json:"last_addr"`
+	PairCode    string `json:"pair_code,omitempty"`
 	LastHeardAt int64  `json:"last_heard_at"`
 	LastSyncAt  int64  `json:"last_sync_at"`
+}
+
+// DiscoveredPeerInfo describes a LAN peer returned to the UI before or after pairing.
+type DiscoveredPeerInfo struct {
+	PeerID      string `json:"peer_id"`
+	DisplayName string `json:"display_name"`
+	Addr        string `json:"addr"`
+	Paired      bool   `json:"paired"`
 }
 
 // SyncExchangeRequest is sent in POST /sync/exchange.

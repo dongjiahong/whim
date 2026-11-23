@@ -18,9 +18,10 @@ const (
 
 // DiscoveredPeer represents a peer discovered via LAN UDP broadcast.
 type DiscoveredPeer struct {
-	PeerID   string
-	Addr     string // host:port
-	HTTPPort int
+	PeerID      string
+	DisplayName string
+	Addr        string // host:port
+	HTTPPort    int
 }
 
 // DirectedBroadcastAddrs computes per-interface IPv4 directed broadcast addresses
@@ -69,8 +70,8 @@ func DirectedBroadcastAddrs() []net.IP {
 	return out
 }
 
-// ServeDiscovery listens for UDP DISCOVER probes and replies unicast OFFER with our HTTP port.
-func ServeDiscovery(ctx context.Context, discoveryPort int, selfPeerID string, httpPort int) error {
+// ServeDiscovery listens for UDP DISCOVER probes and replies unicast OFFER with our HTTP port & display name.
+func ServeDiscovery(ctx context.Context, discoveryPort int, selfPeerID, displayName string, httpPort int) error {
 	if discoveryPort <= 0 {
 		discoveryPort = DefaultDiscoveryPort
 	}
@@ -82,6 +83,11 @@ func ServeDiscovery(ctx context.Context, discoveryPort int, selfPeerID string, h
 		<-ctx.Done()
 		_ = pc.Close()
 	}()
+
+	cleanName := strings.ReplaceAll(strings.TrimSpace(displayName), "\n", " ")
+	if cleanName == "" {
+		cleanName = "Whim Device"
+	}
 
 	buf := make([]byte, 512)
 	for {
@@ -100,7 +106,7 @@ func ServeDiscovery(ctx context.Context, discoveryPort int, selfPeerID string, h
 		if senderID == selfPeerID {
 			continue
 		}
-		reply := fmt.Sprintf("%s%s %d", offerPrefix, selfPeerID, httpPort)
+		reply := fmt.Sprintf("%s%s %d %s", offerPrefix, selfPeerID, httpPort, cleanName)
 		_, _ = pc.WriteTo([]byte(reply), addr)
 	}
 }
@@ -141,24 +147,30 @@ func DiscoverPeers(ctx context.Context, discoveryPort int, selfPeerID string, ti
 		if !strings.HasPrefix(msg, offerPrefix) {
 			continue
 		}
-		fields := strings.Fields(strings.TrimPrefix(msg, offerPrefix))
-		if len(fields) != 2 {
+		rest := strings.TrimPrefix(msg, offerPrefix)
+		parts := strings.SplitN(rest, " ", 3)
+		if len(parts) < 2 {
 			continue
 		}
-		peerID := fields[0]
+		peerID := parts[0]
 		if peerID == "" || peerID == selfPeerID {
 			continue
 		}
-		port, err := strconv.Atoi(fields[1])
+		port, err := strconv.Atoi(parts[1])
 		if err != nil || port <= 0 || port > 65535 {
 			continue
+		}
+		name := "Whim Device"
+		if len(parts) == 3 && strings.TrimSpace(parts[2]) != "" {
+			name = strings.TrimSpace(parts[2])
 		}
 		// Read peer IP from packet source address (immune to DHCP IP changes).
 		addr := net.JoinHostPort(from.IP.String(), strconv.Itoa(port))
 		seen[peerID] = DiscoveredPeer{
-			PeerID:   peerID,
-			Addr:     addr,
-			HTTPPort: port,
+			PeerID:      peerID,
+			DisplayName: name,
+			Addr:        addr,
+			HTTPPort:    port,
 		}
 	}
 

@@ -203,7 +203,7 @@ func StopPeerServer() error {
 	return e.Peer.StopServer()
 }
 
-// SyncOnce runs a single LAN discovery + bidirectional sync pass and returns JSON SyncSummary.
+// SyncOnce runs a single LAN discovery + bidirectional sync pass across all paired peers.
 func SyncOnce(timeoutSec int) (string, error) {
 	e, err := requireEngine()
 	if err != nil {
@@ -214,7 +214,7 @@ func SyncOnce(timeoutSec int) (string, error) {
 	return string(b), err
 }
 
-// GetPairCode returns the active 6-digit pairing code.
+// GetPairCode returns THIS device's own 6-digit sync code (never overwritten by pairing with other devices).
 func GetPairCode() (string, error) {
 	e, err := requireEngine()
 	if err != nil {
@@ -223,16 +223,7 @@ func GetPairCode() (string, error) {
 	return e.Peer.PairCode(), nil
 }
 
-// SetPairCode updates the active 6-digit pairing code.
-func SetPairCode(code string) (string, error) {
-	e, err := requireEngine()
-	if err != nil {
-		return "", err
-	}
-	return e.SetPairCode(code)
-}
-
-// RegeneratePairCode generates a fresh 6-digit pairing code.
+// RegeneratePairCode generates a fresh random 6-digit sync code for THIS device.
 func RegeneratePairCode() (string, error) {
 	e, err := requireEngine()
 	if err != nil {
@@ -241,19 +232,61 @@ func RegeneratePairCode() (string, error) {
 	return e.RegeneratePairCode()
 }
 
-// SetManualPeers persists fallback peer addresses as JSON string array.
-func SetManualPeers(addrsJSON string) error {
+// DiscoverLAN scans the local Wi-Fi network and returns JSON array of DiscoveredPeerInfo.
+func DiscoverLAN() (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	peers, err := e.DiscoverLAN()
+	if err != nil {
+		return "", err
+	}
+	if peers == nil {
+		peers = []model.DiscoveredPeerInfo{}
+	}
+	b, err := json.Marshal(peers)
+	return string(b), err
+}
+
+// PairAndSync pairs with a remote peer using THAT peer's 6-digit code and saves it.
+func PairAndSync(addr, remoteCode string) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	res, err := e.PairAndSync(addr, remoteCode)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(res)
+	return string(b), err
+}
+
+// ListPairedPeers returns JSON array of already paired remote devices.
+func ListPairedPeers() (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	peers, err := e.ListPairedPeers()
+	if err != nil {
+		return "", err
+	}
+	if peers == nil {
+		peers = []model.SyncPeer{}
+	}
+	b, err := json.Marshal(peers)
+	return string(b), err
+}
+
+// RemovePairedPeer removes a paired remote device by peerID.
+func RemovePairedPeer(peerID string) error {
 	e, err := requireEngine()
 	if err != nil {
 		return err
 	}
-	var addrs []string
-	if addrsJSON != "" {
-		if err := json.Unmarshal([]byte(addrsJSON), &addrs); err != nil {
-			return err
-		}
-	}
-	return e.SetManualPeers(addrs)
+	return e.RemovePairedPeer(peerID)
 }
 
 // ExportMarkdown exports matching notes to outDir and returns JSON export.Result.

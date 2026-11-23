@@ -100,11 +100,24 @@ object WhimCoreBridge {
 
     fun getPairCode(): String = Mobile.getPairCode()
 
-    fun setPairCode(code: String): String = Mobile.setPairCode(code)
-
     fun regeneratePairCode(): String = Mobile.regeneratePairCode()
 
-    fun setManualPeers(addrs: List<String>) {
-        Mobile.setManualPeers(json.encodeToString(addrs))
+    suspend fun discoverLAN(): List<WhimDiscoveredPeer> = withContext(Dispatchers.IO) {
+        val raw = Mobile.discoverLAN()
+        json.decodeFromString(raw)
+    }
+
+    suspend fun pairAndSync(addr: String, remoteCode: String): WhimSyncSummary = withContext(Dispatchers.IO) {
+        val raw = Mobile.pairAndSync(addr, remoteCode)
+        json.decodeFromString(raw)
+    }
+
+    suspend fun listPairedPeers(): List<WhimSyncPeer> = withContext(Dispatchers.IO) {
+        val raw = Mobile.listPairedPeers()
+        json.decodeFromString(raw)
+    }
+
+    suspend fun removePairedPeer(peerId: String) = withContext(Dispatchers.IO) {
+        Mobile.removePairedPeer(peerId)
     }
 }

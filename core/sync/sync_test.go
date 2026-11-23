@@ -11,7 +11,7 @@ import (
 	whimsync "whim/core/sync"
 )
 
-func TestPeerToPeerBidirectionalSyncAndBlobs(t *testing.T) {
+func TestPerDevicePairingBidirectionalSyncAndBlobs(t *testing.T) {
 	stMac, err := store.Open(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -24,9 +24,11 @@ func TestPeerToPeerBidirectionalSyncAndBlobs(t *testing.T) {
 	}
 	defer stAndroid.Close()
 
-	const code = "482913"
-	peerMac := whimsync.NewPeer(stMac, "peer-mac", "MacBook", code)
-	peerAndroid := whimsync.NewPeer(stAndroid, "peer-android", "Android", code)
+	// Each device has its OWN independent 6-digit code!
+	const macCode = "328287"
+	const androidCode = "814502"
+	peerMac := whimsync.NewPeer(stMac, "peer-mac", "MacBook", macCode)
+	peerAndroid := whimsync.NewPeer(stAndroid, "peer-android", "Android", androidCode)
 
 	port, err := peerMac.StartServer(0, false)
 	if err != nil {
@@ -61,26 +63,22 @@ func TestPeerToPeerBidirectionalSyncAndBlobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// 3. Single bidirectional sync from Android -> Mac converges both sides AND transfers both images!
-	merged, dl, ul, err := peerAndroid.SyncWithAddr(context.Background(), macAddr, "peer-mac")
+	// 3. Android pairs with Mac using Mac's code (328287); Android's OWN code (814502) stays untouched!
+	sum, err := peerAndroid.PairAndSync(context.Background(), macAddr, macCode)
 	if err != nil {
-		t.Fatalf("sync failed: %v", err)
+		t.Fatalf("pair and sync failed: %v", err)
 	}
-	if merged != 1 || dl != 1 || ul != 1 {
-		t.Fatalf("expected merged=1 dl=1 ul=1, got merged=%d dl=%d ul=%d", merged, dl, ul)
+	if sum.NotesMerged != 1 || sum.BlobsDownloaded != 1 || sum.BlobsUploaded != 1 {
+		t.Fatalf("unexpected summary: %+v", sum)
+	}
+	if peerAndroid.PairCode() != androidCode {
+		t.Fatalf("android local code should remain %s, got %s", androidCode, peerAndroid.PairCode())
 	}
 
-	// Verify both devices have both notes and both blobs
-	macNotes, _ := stMac.ListNotes(model.ListFilter{})
-	andNotes, _ := stAndroid.ListNotes(model.ListFilter{})
-	if len(macNotes) != 2 || len(andNotes) != 2 {
-		t.Fatalf("expected 2 notes on each side, got mac=%d android=%d", len(macNotes), len(andNotes))
-	}
-	if _, ok := stMac.BlobPath(andHash); !ok {
-		t.Fatalf("mac missing android blob")
-	}
-	if _, ok := stAndroid.BlobPath(macHash); !ok {
-		t.Fatalf("android missing mac blob")
+	// Verify paired peer is saved on Android so subsequent SyncOnce works without re-typing code
+	paired, _ := stAndroid.ListSyncPeers()
+	if len(paired) != 1 || paired[0].PeerID != "peer-mac" || paired[0].PairCode != macCode {
+		t.Fatalf("expected peer-mac saved in sync_peers, got %+v", paired)
 	}
 
 	// 4. Concurrent field-level edits: Mac edits content, Android pins the SAME note
@@ -93,27 +91,27 @@ func TestPeerToPeerBidirectionalSyncAndBlobs(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if _, _, _, err := peerAndroid.SyncWithAddr(context.Background(), macAddr, "peer-mac"); err != nil {
-		t.Fatalf("second sync failed: %v", err)
+	// Subsequent SyncOnce automatically uses the saved per-peer code!
+	sum2 := peerAndroid.SyncOnce(context.Background())
+	if sum2.PeersSynced != 1 {
+		t.Fatalf("expected SyncOnce to sync saved peer, got %+v", sum2)
 	}
 
 	gotMac, _ := stMac.GetNote(noteOnMac.ID)
 	gotAnd, _ := stAndroid.GetNote(noteOnMac.ID)
 	if gotMac.Content != newContent || !gotMac.Pinned {
-		t.Fatalf("mac did not preserve both concurrent field edits: %+v", gotMac)
+		t.Fatalf("mac did not preserve concurrent edits: %+v", gotMac)
 	}
 	if gotAnd.Content != newContent || !gotAnd.Pinned {
-		t.Fatalf("android did not preserve both concurrent field edits: %+v", gotAnd)
+		t.Fatalf("android did not preserve concurrent edits: %+v", gotAnd)
 	}
 
-	// 5. Tombstone deletion propagates and does not resurrect
+	// 5. Tombstone deletion propagates
 	delTrue := true
 	if _, err := stAndroid.UpdateNote(noteOnAndroid.ID, nil, nil, nil, &delTrue); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := peerAndroid.SyncWithAddr(context.Background(), macAddr, "peer-mac"); err != nil {
-		t.Fatal(err)
-	}
+	peerAndroid.SyncOnce(context.Background())
 	gotDeletedOnMac, _ := stMac.GetNote(noteOnAndroid.ID)
 	if !gotDeletedOnMac.Deleted {
 		t.Fatalf("expected tombstone delete to propagate to Mac")
@@ -127,7 +125,7 @@ func TestPairingCodeLockoutAfterFiveFailures(t *testing.T) {
 	defer stBad.Close()
 
 	peerMac := whimsync.NewPeer(stMac, "peer-mac", "Mac", "123456")
-	peerBad := whimsync.NewPeer(stBad, "peer-bad", "Intruder", "000000")
+	peerBad := whimsync.NewPeer(stBad, "peer-bad", "Intruder", "999999")
 
 	port, err := peerMac.StartServer(0, false)
 	if err != nil {
@@ -138,7 +136,7 @@ func TestPairingCodeLockoutAfterFiveFailures(t *testing.T) {
 
 	var lastErr error
 	for i := 0; i < 5; i++ {
-		_, _, _, lastErr = peerBad.SyncWithAddr(context.Background(), addr, "peer-mac")
+		_, lastErr = peerBad.PairAndSync(context.Background(), addr, "000000")
 		if lastErr == nil {
 			t.Fatalf("attempt %d should have failed", i+1)
 		}

@@ -58,6 +58,24 @@ data class WhimSyncSummary(
 )
 
 @Serializable
+data class WhimSyncPeer(
+    @SerialName("peer_id") val peerId: String,
+    @SerialName("display_name") val displayName: String = "",
+    @SerialName("last_addr") val lastAddr: String = "",
+    @SerialName("pair_code") val pairCode: String = "",
+    @SerialName("last_heard_at") val lastHeardAt: Long = 0,
+    @SerialName("last_sync_at") val lastSyncAt: Long = 0
+)
+
+@Serializable
+data class WhimDiscoveredPeer(
+    @SerialName("peer_id") val peerId: String,
+    @SerialName("display_name") val displayName: String = "",
+    val addr: String = "",
+    val paired: Boolean = false
+)
+
+@Serializable
 data class SavedBlob(
     val sha256: String,
     @SerialName("local_path") val localPath: String,

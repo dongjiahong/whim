@@ -168,15 +168,6 @@ func WhimGetPairCode() *C.char {
 	return okString(code)
 }
 
-//export WhimSetPairCode
-func WhimSetPairCode(code *C.char) *C.char {
-	norm, err := mobile.SetPairCode(C.GoString(code))
-	if err != nil {
-		return errJSON(err)
-	}
-	return okString(norm)
-}
-
 //export WhimRegeneratePairCode
 func WhimRegeneratePairCode() *C.char {
 	code, err := mobile.RegeneratePairCode()
@@ -186,12 +177,39 @@ func WhimRegeneratePairCode() *C.char {
 	return okString(code)
 }
 
-//export WhimSetManualPeers
-func WhimSetManualPeers(addrsJSON *C.char) *C.char {
-	if err := mobile.SetManualPeers(C.GoString(addrsJSON)); err != nil {
+//export WhimDiscoverLAN
+func WhimDiscoverLAN() *C.char {
+	res, err := mobile.DiscoverLAN()
+	if err != nil {
 		return errJSON(err)
 	}
-	return okString("ok")
+	return okJSON(res)
+}
+
+//export WhimPairAndSync
+func WhimPairAndSync(addr, remoteCode *C.char) *C.char {
+	res, err := mobile.PairAndSync(C.GoString(addr), C.GoString(remoteCode))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimListPairedPeers
+func WhimListPairedPeers() *C.char {
+	res, err := mobile.ListPairedPeers()
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimRemovePairedPeer
+func WhimRemovePairedPeer(peerID *C.char) *C.char {
+	if err := mobile.RemovePairedPeer(C.GoString(peerID)); err != nil {
+		return errJSON(err)
+	}
+	return okString("removed")
 }
 
 //export WhimExportMarkdown

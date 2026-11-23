@@ -2,7 +2,6 @@ package engine
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"strings"
 	"time"
@@ -14,9 +13,8 @@ import (
 )
 
 const (
-	metaPeerID      = "whim.peer_id"
-	metaPairCode    = "whim.pair_code"
-	metaManualAddrs = "whim.manual_addrs"
+	metaPeerID   = "whim.peer_id"
+	metaPairCode = "whim.pair_code"
 )
 
 // Engine is the high-level unified facade shared by Android (gomobile),
@@ -60,12 +58,6 @@ func Open(dataDir, displayName string) (*Engine, error) {
 	}
 
 	peer := whimsync.NewPeer(st, peerID, displayName, pairCode)
-	if rawManual, _ := st.GetMeta(metaManualAddrs); rawManual != "" {
-		var addrs []string
-		if json.Unmarshal([]byte(rawManual), &addrs) == nil {
-			peer.SetManualAddrs(addrs)
-		}
-	}
 
 	return &Engine{
 		Store: st,
@@ -84,7 +76,7 @@ func (e *Engine) Close() error {
 	return nil
 }
 
-// CreateNoteWithImages saves image blobs (if any) and inserts a new note.
+// ImageInput describes a raw image passed in for saving.
 type ImageInput struct {
 	Data   []byte
 	MIME   string
@@ -92,6 +84,7 @@ type ImageInput struct {
 	Height int
 }
 
+// CreateNoteWithImages saves image blobs (if any) and inserts a new note.
 func (e *Engine) CreateNoteWithImages(content string, images []ImageInput) (*model.Note, error) {
 	var atts []model.Attachment
 	for _, img := range images {
@@ -137,12 +130,9 @@ func (e *Engine) ListTodayNotes() ([]model.Note, error) {
 	})
 }
 
-// SetPairCode persists and applies a new 6-digit pairing code.
-func (e *Engine) SetPairCode(code string) (string, error) {
-	norm := whimsync.NormalizeCode(code)
-	if len(norm) != 6 {
-		return "", errors.New("pairing code must be 6 digits")
-	}
+// RegeneratePairCode generates a fresh random 6-digit sync code for THIS device.
+func (e *Engine) RegeneratePairCode() (string, error) {
+	norm := whimsync.GenerateCode()
 	if err := e.Store.SetMeta(metaPairCode, norm); err != nil {
 		return "", err
 	}
@@ -150,22 +140,28 @@ func (e *Engine) SetPairCode(code string) (string, error) {
 	return norm, nil
 }
 
-// RegeneratePairCode creates and persists a fresh 6-digit pairing code.
-func (e *Engine) RegeneratePairCode() (string, error) {
-	return e.SetPairCode(whimsync.GenerateCode())
+// DiscoverLAN scans the local network for nearby Whim devices.
+func (e *Engine) DiscoverLAN() ([]model.DiscoveredPeerInfo, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	return e.Peer.DiscoverLAN(ctx)
 }
 
-// SetManualPeers persists fallback host:port addresses.
-func (e *Engine) SetManualPeers(addrs []string) error {
-	b, err := json.Marshal(addrs)
-	if err != nil {
-		return err
-	}
-	if err := e.Store.SetMeta(metaManualAddrs, string(b)); err != nil {
-		return err
-	}
-	e.Peer.SetManualAddrs(addrs)
-	return nil
+// PairAndSync connects to a remote device using THAT device's 6-digit code and saves it.
+func (e *Engine) PairAndSync(addr, remoteCode string) (model.SyncSummary, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return e.Peer.PairAndSync(ctx, addr, remoteCode)
+}
+
+// ListPairedPeers lists all paired remote devices.
+func (e *Engine) ListPairedPeers() ([]model.SyncPeer, error) {
+	return e.Store.ListSyncPeers()
+}
+
+// RemovePairedPeer removes a paired remote device.
+func (e *Engine) RemovePairedPeer(peerID string) error {
+	return e.Store.DeleteSyncPeer(peerID)
 }
 
 // ExportMarkdown exports notes to Markdown files under outDir.
@@ -173,7 +169,7 @@ func (e *Engine) ExportMarkdown(f model.ListFilter, outDir string) (*export.Resu
 	return export.Markdown(e.Store, f, outDir)
 }
 
-// SyncOnce runs a single LAN discovery + bidirectional sync pass.
+// SyncOnce runs a single LAN discovery + bidirectional sync pass across all paired peers.
 func (e *Engine) SyncOnce(timeoutSec int) model.SyncSummary {
 	if timeoutSec <= 0 {
 		timeoutSec = 10

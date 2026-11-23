@@ -76,6 +76,39 @@ struct WhimSyncSummary: Codable {
     }
 }
 
+struct WhimSyncPeer: Codable, Identifiable, Equatable {
+    var id: String { peerId }
+    let peerId: String
+    let displayName: String
+    let lastAddr: String
+    let pairCode: String?
+    let lastHeardAt: Int64
+    let lastSyncAt: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case peerId = "peer_id"
+        case displayName = "display_name"
+        case lastAddr = "last_addr"
+        case pairCode = "pair_code"
+        case lastHeardAt = "last_heard_at"
+        case lastSyncAt = "last_sync_at"
+    }
+}
+
+struct WhimDiscoveredPeer: Codable, Identifiable, Equatable {
+    var id: String { peerId }
+    let peerId: String
+    let displayName: String
+    let addr: String
+    let paired: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case peerId = "peer_id"
+        case displayName = "display_name"
+        case addr, paired
+    }
+}
+
 struct SavedBlob: Codable {
     let sha256: String
     let localPath: String
@@ -243,14 +276,33 @@ final class CoreBridge {
         try decodeCString(WhimGetPairCode(), as: String.self)
     }
 
-    func setPairCode(_ code: String) throws -> String {
-        try code.withCString { cCode in
-            try decodeCString(WhimSetPairCode(UnsafeMutablePointer(mutating: cCode)), as: String.self)
+    func regeneratePairCode() throws -> String {
+        try decodeCString(WhimRegeneratePairCode(), as: String.self)
+    }
+
+    func discoverLAN() throws -> [WhimDiscoveredPeer] {
+        try decodeCString(WhimDiscoverLAN(), as: [WhimDiscoveredPeer].self)
+    }
+
+    func pairAndSync(addr: String, remoteCode: String) throws -> WhimSyncSummary {
+        try addr.withCString { cAddr in
+            try remoteCode.withCString { cCode in
+                try decodeCString(
+                    WhimPairAndSync(UnsafeMutablePointer(mutating: cAddr), UnsafeMutablePointer(mutating: cCode)),
+                    as: WhimSyncSummary.self
+                )
+            }
         }
     }
 
-    func regeneratePairCode() throws -> String {
-        try decodeCString(WhimRegeneratePairCode(), as: String.self)
+    func listPairedPeers() throws -> [WhimSyncPeer] {
+        try decodeCString(WhimListPairedPeers(), as: [WhimSyncPeer].self)
+    }
+
+    func removePairedPeer(peerId: String) throws {
+        _ = try peerId.withCString { cId in
+            try decodeCString(WhimRemovePairedPeer(UnsafeMutablePointer(mutating: cId)), as: String.self)
+        }
     }
 
     func exportMarkdown(outDir: String) throws -> ExportResult {

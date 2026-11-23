@@ -24,16 +24,15 @@ const (
 	maxBlobBytes  = 32 * 1024 * 1024     // 32 MB per pasted image
 )
 
-// Peer manages both incoming peer sync requests (HTTP + UDP discovery)
-// and outgoing bidirectional sync exchanges. Both macOS and Android run this exact same Peer.
+// Peer manages both incoming peer sync requests (authenticated against THIS device's own localCode)
+// and outgoing bidirectional sync exchanges (authenticated against EACH remote peer's own code).
 type Peer struct {
 	mu            sync.Mutex
 	store         *store.Store
-	auth          *Auth
+	auth          *Auth // verifies incoming requests using THIS device's own 6-digit code
 	peerID        string
 	displayName   string
 	discoveryPort int
-	manualAddrs   []string
 
 	server      *http.Server
 	httpPort    int
@@ -42,13 +41,13 @@ type Peer struct {
 }
 
 // NewPeer constructs a Peer attached to a local Store.
-func NewPeer(st *store.Store, peerID, displayName, pairCode string) *Peer {
-	if pairCode == "" {
-		pairCode = GenerateCode()
+func NewPeer(st *store.Store, peerID, displayName, localCode string) *Peer {
+	if localCode == "" {
+		localCode = GenerateCode()
 	}
 	return &Peer{
 		store:         st,
-		auth:          NewAuth(pairCode),
+		auth:          NewAuth(localCode),
 		peerID:        peerID,
 		displayName:   displayName,
 		discoveryPort: DefaultDiscoveryPort,
@@ -61,25 +60,14 @@ func NewPeer(st *store.Store, peerID, displayName, pairCode string) *Peer {
 // PeerID returns this device's unique peer ID.
 func (p *Peer) PeerID() string { return p.peerID }
 
-// PairCode returns the current 6-digit pairing code.
+// DisplayName returns this device's display name.
+func (p *Peer) DisplayName() string { return p.displayName }
+
+// PairCode returns THIS device's own 6-digit sync code (never overwritten when pairing with other devices).
 func (p *Peer) PairCode() string { return p.auth.Code() }
 
-// SetPairCode updates the 6-digit pairing code.
+// SetPairCode updates THIS device's own 6-digit sync code (e.g., when regenerating).
 func (p *Peer) SetPairCode(code string) { p.auth.SetCode(code) }
-
-// SetManualAddrs sets fallback host:port addresses when UDP broadcast is blocked.
-func (p *Peer) SetManualAddrs(addrs []string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	clean := make([]string, 0, len(addrs))
-	for _, a := range addrs {
-		a = strings.TrimSpace(a)
-		if a != "" {
-			clean = append(clean, a)
-		}
-	}
-	p.manualAddrs = clean
-}
 
 // SetDiscoveryPort overrides the UDP discovery port (useful for isolated tests).
 func (p *Peer) SetDiscoveryPort(port int) {
@@ -96,7 +84,6 @@ func (p *Peer) HTTPPort() int {
 }
 
 // StartServer starts the HTTP sync server and UDP discovery responder idempotently.
-// Pass httpPort=0 to let the OS assign an ephemeral port (for tests).
 func (p *Peer) StartServer(httpPort int, enableDiscovery bool) (int, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -133,7 +120,7 @@ func (p *Peer) StartServer(httpPort int, enableDiscovery bool) (int, error) {
 	if enableDiscovery {
 		discPort := p.discoveryPort
 		go func() {
-			_ = ServeDiscovery(ctx, discPort, p.peerID, actualPort)
+			_ = ServeDiscovery(ctx, discPort, p.peerID, p.displayName, actualPort)
 		}()
 	}
 
@@ -161,33 +148,101 @@ func (p *Peer) StopServer() error {
 	return nil
 }
 
-// SyncOnce discovers all LAN peers (plus manual fallback addresses) and performs
-// bidirectional metadata + blob sync with each peer. Safe to invoke from Android WorkManager.
+// DiscoverLAN scans the local Wi-Fi network and returns online Whim devices with paired status.
+func (p *Peer) DiscoverLAN(ctx context.Context) ([]model.DiscoveredPeerInfo, error) {
+	p.mu.Lock()
+	discPort := p.discoveryPort
+	p.mu.Unlock()
+
+	discovered, err := DiscoverPeers(ctx, discPort, p.peerID, 700*time.Millisecond)
+	if err != nil {
+		return nil, err
+	}
+	pairedList, _ := p.store.ListSyncPeers()
+	pairedSet := make(map[string]bool, len(pairedList))
+	for _, sp := range pairedList {
+		if sp.PairCode != "" {
+			pairedSet[sp.PeerID] = true
+		}
+	}
+
+	out := make([]model.DiscoveredPeerInfo, 0, len(discovered))
+	for _, d := range discovered {
+		out = append(out, model.DiscoveredPeerInfo{
+			PeerID:      d.PeerID,
+			DisplayName: d.DisplayName,
+			Addr:        d.Addr,
+			Paired:      pairedSet[d.PeerID],
+		})
+	}
+	return out, nil
+}
+
+// PairAndSync connects to a specific remote peer using THAT peer's 6-digit code,
+// performs a full bidirectional sync, and saves that peer + its code in sync_peers.
+// Note: This NEVER modifies THIS device's own local sync code.
+func (p *Peer) PairAndSync(ctx context.Context, addr, remoteCode string) (model.SyncSummary, error) {
+	norm := NormalizeCode(remoteCode)
+	if len(norm) != 6 {
+		return model.SyncSummary{}, errors.New("对方配对码必须是 6 位数字")
+	}
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return model.SyncSummary{}, errors.New("请先选择发现的设备或输入 IP:端口")
+	}
+	if !strings.Contains(addr, ":") {
+		addr = fmt.Sprintf("%s:%d", addr, DefaultHTTPPort)
+	}
+
+	merged, dl, ul, err := p.SyncWithAddr(ctx, addr, "", norm)
+	if err != nil {
+		return model.SyncSummary{}, err
+	}
+	return model.SyncSummary{
+		PeersFound:      1,
+		PeersSynced:     1,
+		NotesMerged:     merged,
+		BlobsDownloaded: dl,
+		BlobsUploaded:   ul,
+	}, nil
+}
+
+// SyncOnce discovers online LAN peers and syncs with every already-paired peer using each peer's saved code.
 func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 	var summary model.SyncSummary
 
 	p.mu.Lock()
 	discPort := p.discoveryPort
-	manuals := append([]string(nil), p.manualAddrs...)
 	p.mu.Unlock()
 
-	targets := make(map[string]string) // addr -> optional known peerID
-	if discovered, err := DiscoverPeers(ctx, discPort, p.peerID, 700*time.Millisecond); err == nil {
-		for _, dp := range discovered {
-			targets[dp.Addr] = dp.PeerID
-		}
+	pairedList, err := p.store.ListSyncPeers()
+	if err != nil || len(pairedList) == 0 {
+		return summary
 	}
-	for _, addr := range manuals {
-		if _, ok := targets[addr]; !ok {
-			targets[addr] = ""
+
+	// Map fresh LAN addresses by peerID (handles DHCP IP changes automatically)
+	liveAddrByID := make(map[string]string)
+	if discovered, derr := DiscoverPeers(ctx, discPort, p.peerID, 700*time.Millisecond); derr == nil {
+		for _, dp := range discovered {
+			liveAddrByID[dp.PeerID] = dp.Addr
 		}
 	}
 
-	summary.PeersFound = len(targets)
-	for addr, knownID := range targets {
-		merged, dl, ul, err := p.SyncWithAddr(ctx, addr, knownID)
-		if err != nil {
-			summary.Errors = append(summary.Errors, fmt.Sprintf("%s: %v", addr, err))
+	for _, sp := range pairedList {
+		if sp.PairCode == "" {
+			continue
+		}
+		addr := liveAddrByID[sp.PeerID]
+		if addr == "" {
+			addr = sp.LastAddr
+		}
+		if addr == "" {
+			continue
+		}
+		summary.PeersFound++
+		merged, dl, ul, serr := p.SyncWithAddr(ctx, addr, sp.PeerID, sp.PairCode)
+		if serr != nil {
+			summary.Errors = append(summary.Errors, fmt.Sprintf("%s (%s): %v", sp.DisplayName, addr, serr))
 			continue
 		}
 		summary.PeersSynced++
@@ -198,8 +253,8 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 	return summary
 }
 
-// SyncWithAddr runs a full authenticated bidirectional sync with one specific peer host:port.
-func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID string) (notesMerged, blobsDown, blobsUp int, err error) {
+// SyncWithAddr runs a full authenticated bidirectional sync with one specific peer using remoteCode.
+func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode string) (notesMerged, blobsDown, blobsUp int, err error) {
 	baseURL := "http://" + addr
 
 	// 1. Determine watermark for this peer
@@ -226,8 +281,8 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID string) (note
 		HaveBlobs:   haveBlobs,
 	}
 
-	// 3. Challenge + HMAC proof -> POST /sync/exchange
-	respBytes, err := p.authedRequest(ctx, http.MethodPost, baseURL+"/sync/exchange", reqBody, "application/json")
+	// 3. Challenge + HMAC proof (using REMOTE peer's code) -> POST /sync/exchange
+	respBytes, err := p.authedRequest(ctx, http.MethodPost, baseURL+"/sync/exchange", reqBody, "application/json", remoteCode)
 	if err != nil {
 		return 0, 0, 0, err
 	}
@@ -245,7 +300,7 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID string) (note
 	// 5. Download any blobs we are missing
 	missing, _ := p.store.MissingBlobs()
 	for _, hash := range missing {
-		data, mime, derr := p.downloadBlob(ctx, baseURL, hash)
+		data, mime, derr := p.downloadBlob(ctx, baseURL, hash, remoteCode)
 		if derr == nil && len(data) > 0 {
 			if _, _, _, serr := p.store.SaveBlob(data, mime); serr == nil {
 				blobsDown++
@@ -259,12 +314,12 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID string) (note
 		if rerr != nil {
 			continue
 		}
-		if uerr := p.uploadBlob(ctx, baseURL, hash, data, mime); uerr == nil {
+		if uerr := p.uploadBlob(ctx, baseURL, hash, data, mime, remoteCode); uerr == nil {
 			blobsUp++
 		}
 	}
 
-	// 7. Record updated watermark
+	// 7. Record updated watermark + save this peer's code in sync_peers
 	now := time.Now().UnixMilli()
 	heard := resp.ServerTime
 	if heard <= 0 {
@@ -275,6 +330,7 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID string) (note
 			PeerID:      resp.PeerID,
 			DisplayName: resp.DisplayName,
 			LastAddr:    addr,
+			PairCode:    NormalizeCode(remoteCode),
 			LastHeardAt: heard,
 			LastSyncAt:  now,
 		})
@@ -308,8 +364,7 @@ func (p *Peer) fetchNonce(ctx context.Context, baseURL string) (string, error) {
 	return payload.Nonce, nil
 }
 
-func (p *Peer) authedRequest(ctx context.Context, method, fullURL string, body any, contentType string) ([]byte, error) {
-	// Extract base URL for /sync/challenge
+func (p *Peer) authedRequest(ctx context.Context, method, fullURL string, body any, contentType, remoteCode string) ([]byte, error) {
 	idx := strings.Index(fullURL, "/sync/")
 	if idx < 0 {
 		return nil, errors.New("invalid sync url")
@@ -342,7 +397,7 @@ func (p *Peer) authedRequest(ctx context.Context, method, fullURL string, body a
 		req.Header.Set("Content-Type", contentType)
 	}
 	req.Header.Set(HeaderNonce, nonce)
-	req.Header.Set(HeaderProof, ComputeProof(p.auth.Code(), nonce))
+	req.Header.Set(HeaderProof, ComputeProof(remoteCode, nonce))
 	req.Header.Set(HeaderPeerID, p.peerID)
 
 	resp, err := p.client.Do(req)
@@ -355,10 +410,10 @@ func (p *Peer) authedRequest(ctx context.Context, method, fullURL string, body a
 		return nil, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
-		return nil, errors.New("unauthorized: pairing code mismatch")
+		return nil, errors.New("配对码不正确")
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		return nil, fmt.Errorf("locked: too many failed attempts (%s)", strings.TrimSpace(string(raw)))
+		return nil, fmt.Errorf("locked: 尝试次数过多，请稍后再试 (%s)", strings.TrimSpace(string(raw)))
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("http %d: %s", resp.StatusCode, strings.TrimSpace(string(raw)))
@@ -366,7 +421,7 @@ func (p *Peer) authedRequest(ctx context.Context, method, fullURL string, body a
 	return raw, nil
 }
 
-func (p *Peer) downloadBlob(ctx context.Context, baseURL, hash string) ([]byte, string, error) {
+func (p *Peer) downloadBlob(ctx context.Context, baseURL, hash, remoteCode string) ([]byte, string, error) {
 	nonce, err := p.fetchNonce(ctx, baseURL)
 	if err != nil {
 		return nil, "", err
@@ -376,7 +431,7 @@ func (p *Peer) downloadBlob(ctx context.Context, baseURL, hash string) ([]byte, 
 		return nil, "", err
 	}
 	req.Header.Set(HeaderNonce, nonce)
-	req.Header.Set(HeaderProof, ComputeProof(p.auth.Code(), nonce))
+	req.Header.Set(HeaderProof, ComputeProof(remoteCode, nonce))
 	req.Header.Set(HeaderPeerID, p.peerID)
 
 	resp, err := p.client.Do(req)
@@ -402,8 +457,8 @@ func (p *Peer) downloadBlob(ctx context.Context, baseURL, hash string) ([]byte, 
 	return data, mime, nil
 }
 
-func (p *Peer) uploadBlob(ctx context.Context, baseURL, hash string, data []byte, mime string) error {
-	_, err := p.authedRequest(ctx, http.MethodPut, baseURL+"/sync/blobs/"+hash, data, mime)
+func (p *Peer) uploadBlob(ctx context.Context, baseURL, hash string, data []byte, mime, remoteCode string) error {
+	_, err := p.authedRequest(ctx, http.MethodPut, baseURL+"/sync/blobs/"+hash, data, mime, remoteCode)
 	return err
 }
 
@@ -461,7 +516,6 @@ func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Determine which blobs we are missing that the sender actually has
 	missing, _ := p.store.MissingBlobs()
 	senderHave := make(map[string]struct{}, len(req.HaveBlobs))
 	for _, h := range req.HaveBlobs {

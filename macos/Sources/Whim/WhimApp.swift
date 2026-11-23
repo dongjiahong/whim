@@ -22,6 +22,8 @@ final class WhimStoreVM: ObservableObject {
     @Published var pairCode: String = ""
     @Published var syncMessage: String = "局域网对等监听已开启"
     @Published var isSyncing: Bool = false
+    @Published var discoveredPeers: [WhimDiscoveredPeer] = []
+    @Published var pairedPeers: [WhimSyncPeer] = []
     @Published var dailyReviewEnabled: Bool = UserDefaults.standard.object(forKey: "whim.review.enabled") as? Bool ?? true
     @Published var reviewHour: Int = UserDefaults.standard.object(forKey: "whim.review.hour") as? Int ?? 21
     @Published var reviewMinute: Int = UserDefaults.standard.object(forKey: "whim.review.minute") as? Int ?? 30
@@ -214,27 +216,62 @@ final class WhimStoreVM: ObservableObject {
                 self.isSyncing = false
                 if let res {
                     self.syncMessage = res.peersSynced > 0
-                        ? "已同步 \(res.peersSynced) 台设备 · 合并 \(res.notesMerged) 条"
-                        : "局域网暂未发现其他设备"
+                        ? "已同步 \(res.peersSynced) 台已配对设备 · 合并 \(res.notesMerged) 条"
+                        : (self.pairedPeers.isEmpty ? "尚未配对设备，请在设置 → 局域网同步中添加" : "已配对设备当前不在线")
                 } else {
                     self.syncMessage = "同步完成"
                 }
+                self.refreshSyncState()
                 self.reload()
             }
         }
     }
 
-    func updatePairCode(_ code: String) {
-        if let updated = try? CoreBridge.shared.setPairCode(code) {
-            pairCode = updated
-            syncMessage = "配对码已更新"
+    func refreshSyncState() {
+        pairCode = (try? CoreBridge.shared.getPairCode()) ?? pairCode
+        pairedPeers = (try? CoreBridge.shared.listPairedPeers()) ?? []
+    }
+
+    func scanLAN() {
+        syncMessage = "正在扫描同 Wi-Fi 下的 Whim 设备..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            let found = (try? CoreBridge.shared.discoverLAN()) ?? []
+            DispatchQueue.main.async {
+                self.discoveredPeers = found
+                self.pairedPeers = (try? CoreBridge.shared.listPairedPeers()) ?? []
+                self.syncMessage = found.isEmpty ? "暂未发现附近在线设备（也可手动填 IP:8788）" : "发现 \(found.count) 台局域网设备"
+            }
         }
+    }
+
+    func pairWithRemote(addr: String, remoteCode: String) {
+        syncMessage = "正在验证对方同步码并同步..."
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let res = try CoreBridge.shared.pairAndSync(addr: addr, remoteCode: remoteCode)
+                DispatchQueue.main.async {
+                    self.syncMessage = "配对成功！已合并 \(res.notesMerged) 条笔记"
+                    self.refreshSyncState()
+                    self.reload()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.syncMessage = "配对失败：\(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func removePairedPeer(_ peerId: String) {
+        try? CoreBridge.shared.removePairedPeer(peerId: peerId)
+        refreshSyncState()
+        syncMessage = "已移除该配对设备"
     }
 
     func regeneratePairCode() {
         if let updated = try? CoreBridge.shared.regeneratePairCode() {
             pairCode = updated
-            syncMessage = "已重新生成配对码"
+            syncMessage = "本机同步码已重新生成，已连此 Mac 的设备需用新码重新配对"
         }
     }
 
@@ -653,9 +690,8 @@ struct MainContentView: View {
     let onToggleWindowPin: (Bool) -> Void
 
     @AppStorage("whim.themeMode") private var themeModeRaw: String = AppThemeMode.system.rawValue
-    @State private var showSyncPopover: Bool = false
     @State private var showSettingsSheet: Bool = false
-    @State private var codeInput: String = ""
+    @State private var settingsInitialSection: SettingsSection = .general
     @State private var previewImagePath: String? = nil
     @State private var editingNoteId: String? = nil
     @State private var mainWindowPinned: Bool = false
@@ -724,36 +760,9 @@ struct MainContentView: View {
                             vm.activeTab = .archived
                             vm.applyFilter()
                         }
-                        navRow(icon: "arrow.triangle.2.circlepath", title: "局域网同步", active: false, badge: vm.pairCode) {
-                            showSyncPopover.toggle()
-                        }
-                        .popover(isPresented: $showSyncPopover, arrowEdge: .trailing) {
-                            VStack(alignment: .leading, spacing: 10) {
-                                Text("局域网对等同步")
-                                    .font(.system(size: 14, weight: .semibold))
-                                Text("6 位配对码：\(vm.pairCode)")
-                                    .font(.system(size: 13, design: .monospaced))
-                                Text(vm.syncMessage)
-                                    .font(.system(size: 12))
-                                    .foregroundColor(.secondary)
-                                HStack(spacing: 6) {
-                                    TextField("输入 6 位码", text: $codeInput)
-                                        .textFieldStyle(.roundedBorder)
-                                        .frame(width: 110)
-                                    Button("应用") {
-                                        vm.updatePairCode(codeInput)
-                                        codeInput = ""
-                                    }
-                                    Button("重生成") { vm.regeneratePairCode() }
-                                }
-                                HStack {
-                                    Button("立即同步") { vm.syncNow() }
-                                    Spacer()
-                                    Button("导出 Markdown") { vm.exportMarkdown() }
-                                }
-                            }
-                            .padding(16)
-                            .frame(width: 280)
+                        navRow(icon: "arrow.triangle.2.circlepath", title: "局域网同步", active: false, badge: vm.pairedPeers.isEmpty ? nil : "\(vm.pairedPeers.count)台") {
+                            settingsInitialSection = .sync
+                            showSettingsSheet = true
                         }
                     }
 
@@ -982,6 +991,7 @@ struct MainContentView: View {
             SettingsModalView(
                 vm: vm,
                 themeModeRaw: $themeModeRaw,
+                initialSection: settingsInitialSection,
                 onApplyTheme: { mode in
                     NSApp.appearance = mode.nsAppearance
                 },

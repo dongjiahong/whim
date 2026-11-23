@@ -119,6 +119,7 @@ CREATE TABLE IF NOT EXISTS sync_peers (
 	peer_id       TEXT PRIMARY KEY,
 	display_name  TEXT NOT NULL DEFAULT '',
 	last_addr     TEXT NOT NULL DEFAULT '',
+	pair_code     TEXT NOT NULL DEFAULT '',
 	last_heard_at INTEGER NOT NULL DEFAULT 0,
 	last_sync_at  INTEGER NOT NULL DEFAULT 0
 );
@@ -129,8 +130,11 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
 	tokenize = 'unicode61'
 );
 `
-	_, err := s.db.Exec(schema)
-	return err
+	if _, err := s.db.Exec(schema); err != nil {
+		return err
+	}
+	_, _ = s.db.Exec(`ALTER TABLE sync_peers ADD COLUMN pair_code TEXT NOT NULL DEFAULT ''`)
+	return nil
 }
 
 // GetMeta retrieves a local key-value setting.
@@ -713,40 +717,49 @@ func mergeNoteFields(local, remote model.Note) (model.Note, bool) {
 	return out, changed
 }
 
-// UpsertSyncPeer updates local watermark for a peer.
+// UpsertSyncPeer updates local pairing credentials and watermark for a peer.
 func (s *Store) UpsertSyncPeer(p model.SyncPeer) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.db.Exec(`
-		INSERT INTO sync_peers(peer_id, display_name, last_addr, last_heard_at, last_sync_at)
-		VALUES(?, ?, ?, ?, ?)
+		INSERT INTO sync_peers(peer_id, display_name, last_addr, pair_code, last_heard_at, last_sync_at)
+		VALUES(?, ?, ?, ?, ?, ?)
 		ON CONFLICT(peer_id) DO UPDATE SET
 			display_name  = CASE WHEN excluded.display_name <> '' THEN excluded.display_name ELSE sync_peers.display_name END,
 			last_addr     = CASE WHEN excluded.last_addr <> '' THEN excluded.last_addr ELSE sync_peers.last_addr END,
+			pair_code     = CASE WHEN excluded.pair_code <> '' THEN excluded.pair_code ELSE sync_peers.pair_code END,
 			last_heard_at = MAX(sync_peers.last_heard_at, excluded.last_heard_at),
 			last_sync_at  = MAX(sync_peers.last_sync_at, excluded.last_sync_at)`,
-		p.PeerID, p.DisplayName, p.LastAddr, p.LastHeardAt, p.LastSyncAt)
+		p.PeerID, p.DisplayName, p.LastAddr, p.PairCode, p.LastHeardAt, p.LastSyncAt)
 	return err
 }
 
-// GetSyncPeer fetches a peer's stored watermark.
+// DeleteSyncPeer removes a paired peer from local storage.
+func (s *Store) DeleteSyncPeer(peerID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, err := s.db.Exec(`DELETE FROM sync_peers WHERE peer_id = ?`, peerID)
+	return err
+}
+
+// GetSyncPeer fetches a peer's stored watermark and pairing code.
 func (s *Store) GetSyncPeer(peerID string) (*model.SyncPeer, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	var p model.SyncPeer
-	err := s.db.QueryRow(`SELECT peer_id, display_name, last_addr, last_heard_at, last_sync_at FROM sync_peers WHERE peer_id = ?`, peerID).
-		Scan(&p.PeerID, &p.DisplayName, &p.LastAddr, &p.LastHeardAt, &p.LastSyncAt)
+	err := s.db.QueryRow(`SELECT peer_id, display_name, last_addr, pair_code, last_heard_at, last_sync_at FROM sync_peers WHERE peer_id = ?`, peerID).
+		Scan(&p.PeerID, &p.DisplayName, &p.LastAddr, &p.PairCode, &p.LastHeardAt, &p.LastSyncAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	return &p, err
 }
 
-// ListSyncPeers lists all known sync peers.
+// ListSyncPeers lists all paired sync peers.
 func (s *Store) ListSyncPeers() ([]model.SyncPeer, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT peer_id, display_name, last_addr, last_heard_at, last_sync_at FROM sync_peers ORDER BY last_sync_at DESC`)
+	rows, err := s.db.Query(`SELECT peer_id, display_name, last_addr, pair_code, last_heard_at, last_sync_at FROM sync_peers WHERE pair_code <> '' ORDER BY last_sync_at DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -754,7 +767,7 @@ func (s *Store) ListSyncPeers() ([]model.SyncPeer, error) {
 	var out []model.SyncPeer
 	for rows.Next() {
 		var p model.SyncPeer
-		if err := rows.Scan(&p.PeerID, &p.DisplayName, &p.LastAddr, &p.LastHeardAt, &p.LastSyncAt); err != nil {
+		if err := rows.Scan(&p.PeerID, &p.DisplayName, &p.LastAddr, &p.PairCode, &p.LastHeardAt, &p.LastSyncAt); err != nil {
 			return nil, err
 		}
 		out = append(out, p)

@@ -27,6 +27,13 @@ final class WhimStoreVM: ObservableObject {
     @Published var dailyReviewEnabled: Bool = UserDefaults.standard.object(forKey: "whim.review.enabled") as? Bool ?? true
     @Published var reviewHour: Int = UserDefaults.standard.object(forKey: "whim.review.hour") as? Int ?? 21
     @Published var reviewMinute: Int = UserDefaults.standard.object(forKey: "whim.review.minute") as? Int ?? 30
+    @Published var reviewWeekdays: Set<Int> = {
+        if let arr = UserDefaults.standard.array(forKey: "whim.review.weekdays") as? [Int], !arr.isEmpty {
+            return Set(arr.filter { (1...7).contains($0) })
+        }
+        return Set(1...7)
+    }()
+    @Published var reviewNotificationStatus: String = ""
 
     // Undo delete toast
     @Published var lastDeletedNoteId: String? = nil
@@ -155,6 +162,7 @@ final class WhimStoreVM: ObservableObject {
                 case .random:
                     page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
                 }
+                ThumbnailCache.shared.prefetch(notes: page.notes)
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.filterRequestGen == gen else { return }
                     self.displayedNotes = page.notes
@@ -220,6 +228,7 @@ final class WhimStoreVM: ObservableObject {
                 case .random:
                     page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
                 }
+                ThumbnailCache.shared.prefetch(notes: page.notes)
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.filterRequestGen == gen else { return }
                     self.isLoadingMore = false
@@ -247,6 +256,7 @@ final class WhimStoreVM: ObservableObject {
         nextCursor = nil
         ioQueue.async { [weak self] in
             let items = (try? CoreBridge.shared.listRandomNotes(query: query, limit: 10)) ?? []
+            ThumbnailCache.shared.prefetch(notes: items)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.filterRequestGen == gen else { return }
                 self.displayedNotes = items
@@ -263,6 +273,12 @@ final class WhimStoreVM: ObservableObject {
     }
 
     func jumpReviewToday() {
+        reviewDate = Calendar.current.startOfDay(for: Date())
+        applyFilter()
+    }
+
+    func openDailyReviewToday() {
+        activeTab = .review
         reviewDate = Calendar.current.startOfDay(for: Date())
         applyFilter()
     }
@@ -534,33 +550,169 @@ final class WhimStoreVM: ObservableObject {
         return out
     }
 
+    static let reviewCategoryId = "WHIM_DAILY_REVIEW"
+    static let reviewActionOpen = "WHIM_REVIEW_OPEN"
+    static let reviewActionSnooze = "WHIM_REVIEW_SNOOZE"
+
+    var reviewScheduleSummary: String {
+        guard dailyReviewEnabled, !reviewWeekdays.isEmpty else { return "提醒已关" }
+        let timeStr = String(format: "%02d:%02d", reviewHour, reviewMinute)
+        let weekdays = reviewWeekdays
+        if weekdays.count == 7 {
+            return "每天 \(timeStr)"
+        } else if weekdays == Set([2, 3, 4, 5, 6]) {
+            return "工作日 \(timeStr)"
+        } else if weekdays == Set([1, 7]) {
+            return "周末 \(timeStr)"
+        }
+        let labels: [(Int, String)] = [(2, "一"), (3, "二"), (4, "三"), (5, "四"), (6, "五"), (7, "六"), (1, "日")]
+        let picked = labels.filter { weekdays.contains($0.0) }.map(\.1).joined(separator: "、")
+        return "周\(picked) \(timeStr)"
+    }
+
+    func toggleReviewWeekday(_ weekday: Int) {
+        if reviewWeekdays.contains(weekday) {
+            if reviewWeekdays.count > 1 {
+                reviewWeekdays.remove(weekday)
+            }
+        } else {
+            reviewWeekdays.insert(weekday)
+        }
+        saveReviewSchedule()
+    }
+
+    func setReviewWeekdayPreset(_ days: Set<Int>) {
+        reviewWeekdays = days
+        saveReviewSchedule()
+    }
+
     func saveReviewSchedule() {
         UserDefaults.standard.set(dailyReviewEnabled, forKey: "whim.review.enabled")
         UserDefaults.standard.set(reviewHour, forKey: "whim.review.hour")
         UserDefaults.standard.set(reviewMinute, forKey: "whim.review.minute")
+        UserDefaults.standard.set(Array(reviewWeekdays).sorted(), forKey: "whim.review.weekdays")
         scheduleDailyReviewNotification()
+    }
+
+    private func registerNotificationCategories(on center: UNUserNotificationCenter) {
+        let openAction = UNNotificationAction(identifier: Self.reviewActionOpen, title: "去复盘", options: [.foreground])
+        let snoozeAction = UNNotificationAction(identifier: Self.reviewActionSnooze, title: "30 分钟后再提醒", options: [])
+        let category = UNNotificationCategory(
+            identifier: Self.reviewCategoryId,
+            actions: [openAction, snoozeAction],
+            intentIdentifiers: [],
+            options: []
+        )
+        center.setNotificationCategories([category])
     }
 
     private func scheduleDailyReviewNotification() {
         guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()
-        center.removePendingNotificationRequests(withIdentifiers: ["whim.daily.review"])
-        guard dailyReviewEnabled else { return }
+        registerNotificationCategories(on: center)
+        var ids = ["whim.daily.review"] + (1...7).map { "whim.daily.review.\($0)" }
+        if !dailyReviewEnabled {
+            ids.append("whim.daily.review.snooze")
+        }
+        center.removePendingNotificationRequests(withIdentifiers: ids)
+        guard dailyReviewEnabled, !reviewWeekdays.isEmpty else {
+            reviewNotificationStatus = "每日复盘提醒已关闭"
+            return
+        }
         let hour = reviewHour
         let minute = reviewMinute
-        center.requestAuthorization(options: [.alert, .sound]) { granted, _ in
-            guard granted else { return }
-            let content = UNMutableNotificationContent()
-            content.title = "晚间复盘 · Whim"
-            content.body = "花 2 分钟回顾今天记录的闪念，整理关键想法。"
-            content.sound = .default
-            var comps = DateComponents()
-            comps.hour = hour
-            comps.minute = minute
-            let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
-            let req = UNNotificationRequest(identifier: "whim.daily.review", content: content, trigger: trigger)
-            center.add(req)
+        let days = reviewWeekdays.sorted()
+        let summary = reviewScheduleSummary
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, err in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if !granted {
+                    self.reviewNotificationStatus = "系统通知权限未开启，请在「系统设置 → 通知 → Whim」中允许通知"
+                    return
+                }
+                if let err {
+                    self.reviewNotificationStatus = "通知注册失败: \(err.localizedDescription)"
+                    return
+                }
+                let content = UNMutableNotificationContent()
+                content.title = "晚间复盘 · Whim"
+                content.body = "花 2 分钟回顾今天记录的闪念，整理关键想法。"
+                content.sound = .default
+                content.categoryIdentifier = Self.reviewCategoryId
+
+                if days.count == 7 {
+                    var comps = DateComponents()
+                    comps.hour = hour
+                    comps.minute = minute
+                    let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
+                    let req = UNNotificationRequest(identifier: "whim.daily.review", content: content, trigger: trigger)
+                    center.add(req)
+                } else {
+                    for wd in days {
+                        var comps = DateComponents()
+                        comps.hour = hour
+                        comps.minute = minute
+                        comps.weekday = wd
+                        let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
+                        let req = UNNotificationRequest(identifier: "whim.daily.review.\(wd)", content: content, trigger: trigger)
+                        center.add(req)
+                    }
+                }
+                self.reviewNotificationStatus = "已开启系统提醒：\(summary)"
+            }
         }
+    }
+
+    func sendTestReviewNotification() {
+        guard Bundle.main.bundleIdentifier != nil else {
+            reviewNotificationStatus = "请通过 Whim.app 启动以启用系统通知"
+            return
+        }
+        let center = UNUserNotificationCenter.current()
+        registerNotificationCategories(on: center)
+        let todayCount = dailyCounts[dayFmt.string(from: Date())] ?? 0
+        center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, err in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if !granted {
+                    self.reviewNotificationStatus = "未获得通知权限，请在「系统设置 → 通知 → Whim」开启"
+                    return
+                }
+                if let err {
+                    self.reviewNotificationStatus = "通知发送失败: \(err.localizedDescription)"
+                    return
+                }
+                let content = UNMutableNotificationContent()
+                content.title = "晚间复盘 · Whim（测试）"
+                content.body = todayCount > 0
+                    ? "今天已记录 \(todayCount) 条闪念，点击这条通知可直达每日回顾。"
+                    : "点击这条通知可直达每日回顾页面，长按/展开还可选择 30 分钟后再提醒。"
+                content.sound = .default
+                content.categoryIdentifier = Self.reviewCategoryId
+                let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 1, repeats: false)
+                let req = UNNotificationRequest(identifier: "whim.daily.review.test", content: content, trigger: trigger)
+                center.add(req) { addErr in
+                    DispatchQueue.main.async {
+                        self.reviewNotificationStatus = addErr == nil ? "测试通知已发出，请留意右上角系统横幅" : "发送失败: \(addErr!.localizedDescription)"
+                    }
+                }
+            }
+        }
+    }
+
+    func scheduleSnoozeReviewNotification(minutes: Int = 30) {
+        guard Bundle.main.bundleIdentifier != nil else { return }
+        let center = UNUserNotificationCenter.current()
+        registerNotificationCategories(on: center)
+        center.removePendingNotificationRequests(withIdentifiers: ["whim.daily.review.snooze"])
+        let content = UNMutableNotificationContent()
+        content.title = "晚间复盘 · Whim"
+        content.body = "稍后提醒时间到了，花 2 分钟回顾今天的闪念吧。"
+        content.sound = .default
+        content.categoryIdentifier = Self.reviewCategoryId
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: TimeInterval(max(1, minutes) * 60), repeats: false)
+        let req = UNNotificationRequest(identifier: "whim.daily.review.snooze", content: content, trigger: trigger)
+        center.add(req)
     }
 }
 
@@ -734,7 +886,7 @@ struct FlomoComposerView: View {
                         return true
                     }
                 )
-                .frame(minHeight: editingNote != nil ? 120 : 86, maxHeight: 240)
+                .frame(height: editingNote != nil ? 120 : (isFocused || !markdown.isEmpty ? 110 : 72))
             }
 
             if !tagSuggestions.isEmpty {
@@ -943,7 +1095,10 @@ struct MainContentView: View {
                     }
 
                     Divider().opacity(0.25)
-                    Button { showSettingsSheet = true } label: {
+                    Button {
+                        settingsInitialSection = .general
+                        showSettingsSheet = true
+                    } label: {
                         HStack(spacing: 8) {
                             Image(systemName: "gearshape")
                                 .font(.system(size: 12))
@@ -1031,7 +1186,10 @@ struct MainContentView: View {
                             Button("注入示例数据") { vm.seedSampleNotes() }
                             Button("清除示例数据") { vm.clearSampleNotes() }
                             Divider()
-                            Button("偏好设置与更新... (⌘,)") { showSettingsSheet = true }
+                            Button("偏好设置与更新... (⌘,)") {
+                                settingsInitialSection = .general
+                                showSettingsSheet = true
+                            }
                         } label: {
                             Image(systemName: "ellipsis")
                                 .font(.system(size: 13))
@@ -1042,16 +1200,7 @@ struct MainContentView: View {
                         .frame(width: 22)
                     }
                     .padding(.top, 14)
-
-                    // Contextual Sub-headers for Daily Review & Random Walk
-                    if vm.activeTab == .review {
-                        dailyReviewBar
-                    } else if vm.activeTab == .random {
-                        randomWalkBar
-                    } else if vm.activeTab != .archived {
-                        // Inline Flomo Composer right at top of feed
-                        FlomoComposerView(vm: vm)
-                    }
+                    .padding(.horizontal, 10)
 
                     // Note Card Feed (NSTableView-backed List for true cell recycling & 120Hz scrolling)
                     ScrollViewReader { scrollProxy in
@@ -1062,6 +1211,24 @@ struct MainContentView: View {
                                 .listRowSeparator(.hidden)
                                 .listRowBackground(Color.clear)
                                 .listRowInsets(EdgeInsets())
+
+                            // Composer / contextual bar inside the same List so width matches note cards 100%
+                            if vm.activeTab == .review {
+                                dailyReviewBar
+                                    .listRowSeparator(.hidden)
+                                    .listRowBackground(Color.clear)
+                                    .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 8, trailing: 4))
+                            } else if vm.activeTab == .random {
+                                randomWalkBar
+                                    .listRowSeparator(.hidden)
+                                    .listRowBackground(Color.clear)
+                                    .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 8, trailing: 4))
+                            } else if vm.activeTab != .archived {
+                                FlomoComposerView(vm: vm)
+                                    .listRowSeparator(.hidden)
+                                    .listRowBackground(Color.clear)
+                                    .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 8, trailing: 4))
+                            }
 
                             if vm.displayedNotes.isEmpty {
                                 VStack(spacing: 8) {
@@ -1160,7 +1327,7 @@ struct MainContentView: View {
                         }
                     }
                 }
-                .padding(.horizontal, 22)
+                .padding(.horizontal, 12)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(FlomoPalette.canvas(scheme))
             }
@@ -1192,7 +1359,10 @@ struct MainContentView: View {
                 .keyboardShortcut("k", modifiers: .command)
                 .opacity(0)
                 .frame(width: 0, height: 0)
-            Button("") { showSettingsSheet = true }
+            Button("") {
+                settingsInitialSection = .general
+                showSettingsSheet = true
+            }
                 .keyboardShortcut(",", modifiers: .command)
                 .opacity(0)
                 .frame(width: 0, height: 0)
@@ -1275,6 +1445,27 @@ struct MainContentView: View {
             Text("当日共 \(vm.displayedNotes.count) 条记录")
                 .font(.system(size: 12))
                 .foregroundColor(FlomoPalette.textSecondary(scheme))
+
+            Button {
+                settingsInitialSection = .review
+                showSettingsSheet = true
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: vm.dailyReviewEnabled ? "bell.fill" : "bell.slash")
+                        .font(.system(size: 10.5))
+                    Text(vm.reviewScheduleSummary)
+                        .font(.system(size: 11.5, weight: .medium).monospacedDigit())
+                }
+                .foregroundColor(vm.dailyReviewEnabled ? FlomoPalette.tagText(scheme) : FlomoPalette.textMuted(scheme))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(vm.dailyReviewEnabled ? FlomoPalette.tagBg(scheme) : FlomoPalette.canvas(scheme))
+                )
+            }
+            .buttonStyle(.plain)
+            .help("设置每日回顾系统提醒时间与星期")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -1464,11 +1655,13 @@ private struct AsyncCardImage: View {
     let path: String
     let onTap: (String) -> Void
 
+    private let displaySize: CGSize
     @State private var image: NSImage?
 
     init(path: String, onTap: @escaping (String) -> Void) {
         self.path = path
         self.onTap = onTap
+        self.displaySize = ThumbnailCache.shared.fittedDisplaySize(forPath: path, maxWidth: 460, maxHeight: 280)
         _image = State(initialValue: ThumbnailCache.shared.cachedImage(forPath: path))
     }
 
@@ -1477,14 +1670,13 @@ private struct AsyncCardImage: View {
             if let img = image {
                 Image(nsImage: img)
                     .resizable()
-                    .scaledToFit()
-                    .frame(maxWidth: 460, maxHeight: 280, alignment: .leading)
+                    .frame(width: displaySize.width, height: displaySize.height)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .onTapGesture { onTap(path) }
             } else {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(FlomoPalette.canvas(scheme))
-                    .frame(width: 240, height: 150)
+                    .frame(width: displaySize.width, height: displaySize.height)
                     .onAppear {
                         ThumbnailCache.shared.loadImage(forPath: path) { loaded in
                             if let loaded {
@@ -1936,13 +2128,16 @@ struct FloatingQuickCaptureView: View {
 // MARK: - AppDelegate & Entry
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     let vm = WhimStoreVM()
     var statusItem: NSStatusItem?
     var quickPanel: QuickCapturePanel?
     var mainWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if Bundle.main.bundleIdentifier != nil {
+            UNUserNotificationCenter.current().delegate = self
+        }
         setupMainMenu()
         vm.boot()
         setupMenuBar()
@@ -1950,6 +2145,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         GlobalHotKeyManager.shared.registerCmdShiftJ { [weak self] in
             self?.toggleQuickCapture()
         }
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        willPresent notification: UNNotification,
+        withCompletionHandler completionHandler: @escaping (UNNotificationPresentationOptions) -> Void
+    ) {
+        completionHandler([.banner, .sound])
+    }
+
+    nonisolated func userNotificationCenter(
+        _ center: UNUserNotificationCenter,
+        didReceive response: UNNotificationResponse,
+        withCompletionHandler completionHandler: @escaping () -> Void
+    ) {
+        let actionId = response.actionIdentifier
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if actionId == WhimStoreVM.reviewActionSnooze {
+                self.vm.scheduleSnoozeReviewNotification(minutes: 30)
+            } else {
+                self.vm.openDailyReviewToday()
+                self.showMainWindow()
+            }
+        }
+        completionHandler()
     }
 
     private func setupMainMenu() {

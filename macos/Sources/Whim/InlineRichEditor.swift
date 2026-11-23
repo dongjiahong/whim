@@ -161,21 +161,121 @@ enum NoteContentParser {
     }
 }
 
+private final class ImageSizeBox: NSObject {
+    let size: CGSize
+    init(_ size: CGSize) { self.size = size }
+}
+
 /// Asynchronous, downsampled in-memory image cache using ImageIO so scrolling never blocks the main thread.
 final class ThumbnailCache {
     static let shared = ThumbnailCache()
     private let cache: NSCache<NSString, NSImage> = {
         let c = NSCache<NSString, NSImage>()
-        c.countLimit = 160
-        c.totalCostLimit = 80 * 1024 * 1024 // ~80 MB cap
+        c.countLimit = 220
+        c.totalCostLimit = 100 * 1024 * 1024 // ~100 MB cap
+        return c
+    }()
+    private let sizeCache: NSCache<NSString, ImageSizeBox> = {
+        let c = NSCache<NSString, ImageSizeBox>()
+        c.countLimit = 500
         return c
     }()
     private let decodeQueue = DispatchQueue(label: "whim.thumbnail.decode", qos: .userInitiated, attributes: .concurrent)
+    private let prefetchQueue = DispatchQueue(label: "whim.thumbnail.prefetch", qos: .utility, attributes: .concurrent)
     private let lock = NSLock()
     private var inFlight: [String: [(NSImage?) -> Void]] = [:]
 
     func cachedImage(forPath path: String) -> NSImage? {
         cache.object(forKey: path as NSString)
+    }
+
+    /// Reads only the image header (< 0.05ms, zero pixel decoding) to return the exact fitted
+    /// display size so placeholder and loaded image share the exact same frame height (0px layout jump).
+    func fittedDisplaySize(forPath path: String, maxWidth: CGFloat = 460, maxHeight: CGFloat = 280) -> CGSize {
+        let raw = rawPixelSize(forPath: path)
+        guard raw.width > 0, raw.height > 0 else {
+            return CGSize(width: 240, height: 150)
+        }
+        let scale = min(maxWidth / raw.width, maxHeight / raw.height, 1.0)
+        let w = max(60, floor(raw.width * scale))
+        let h = max(60, floor(raw.height * scale))
+        return CGSize(width: w, height: h)
+    }
+
+    private func rawPixelSize(forPath path: String) -> CGSize {
+        let key = path as NSString
+        if let hit = sizeCache.object(forKey: key) {
+            return hit.size
+        }
+        if let img = cache.object(forKey: key), img.size.width > 0, img.size.height > 0 {
+            sizeCache.setObject(ImageSizeBox(img.size), forKey: key)
+            return img.size
+        }
+        let url = URL(fileURLWithPath: path)
+        let opts: [CFString: Any] = [kCGImageSourceShouldCache: false]
+        guard let src = CGImageSourceCreateWithURL(url as CFURL, opts as CFDictionary),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let pw = props[kCGImagePropertyPixelWidth] as? CGFloat,
+              let ph = props[kCGImagePropertyPixelHeight] as? CGFloat,
+              pw > 0, ph > 0 else {
+            return .zero
+        }
+        let orientation = (props[kCGImagePropertyOrientation] as? Int) ?? 1
+        // EXIF orientations 5...8 represent 90°/270° rotations where width and height are swapped.
+        let size = (5...8).contains(orientation) ? CGSize(width: ph, height: pw) : CGSize(width: pw, height: ph)
+        sizeCache.setObject(ImageSizeBox(size), forKey: key)
+        return size
+    }
+
+    /// Pre-warms image header dimensions and downsampled thumbnails in the background
+    /// right after a page of notes is fetched, so scrolling onto image cards hits memory on frame 0.
+    func prefetch(notes: [WhimNote], maxImages: Int = 36) {
+        var paths: [String] = []
+        var seen = Set<String>()
+        for note in notes {
+            for att in note.attachments ?? [] {
+                if let p = att.localPath, !p.isEmpty, seen.insert(p).inserted {
+                    paths.append(p)
+                    if paths.count >= maxImages { break }
+                }
+            }
+            if paths.count >= maxImages { break }
+        }
+        guard !paths.isEmpty else { return }
+        for path in paths {
+            prefetchPath(path)
+        }
+    }
+
+    private func prefetchPath(_ path: String, maxPixelSize: CGFloat = 960) {
+        if cachedImage(forPath: path) != nil { return }
+        lock.lock()
+        if inFlight[path] != nil {
+            lock.unlock()
+            return
+        }
+        inFlight[path] = []
+        lock.unlock()
+
+        prefetchQueue.async { [weak self] in
+            guard let self else { return }
+            _ = self.rawPixelSize(forPath: path)
+            let decoded = Self.decodeDownsampled(path: path, maxPixelSize: maxPixelSize)
+            if let decoded {
+                let cost = Int(decoded.size.width * decoded.size.height * 4)
+                self.cache.setObject(decoded, forKey: path as NSString, cost: max(cost, 1))
+            }
+            self.lock.lock()
+            let callbacks = self.inFlight.removeValue(forKey: path) ?? []
+            self.lock.unlock()
+            if !callbacks.isEmpty {
+                DispatchQueue.main.async {
+                    for cb in callbacks {
+                        cb(decoded)
+                    }
+                }
+            }
+        }
     }
 
     func loadImage(forPath path: String, maxPixelSize: CGFloat = 960, completion: @escaping (NSImage?) -> Void) {

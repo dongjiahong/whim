@@ -234,41 +234,123 @@ struct SettingsModalView: View {
     // MARK: - Daily Review
 
     private var reviewTab: some View {
-        settingsCard {
-            VStack(alignment: .leading, spacing: 14) {
-                Toggle("开启每日晚间复盘提醒", isOn: $vm.dailyReviewEnabled)
-                    .font(.system(size: 13.5))
-                    .foregroundColor(FlomoPalette.textPrimary(scheme))
-                    .onChange(of: vm.dailyReviewEnabled) { _, _ in vm.saveReviewSchedule() }
-
-                HStack {
-                    Text("提醒时间")
-                        .font(.system(size: 13.5))
+        let weekdayItems: [(Int, String)] = [(2, "一"), (3, "二"), (4, "三"), (5, "四"), (6, "五"), (7, "六"), (1, "日")]
+        return VStack(spacing: 14) {
+            settingsCard {
+                VStack(alignment: .leading, spacing: 14) {
+                    Toggle("开启每日复盘系统提醒", isOn: $vm.dailyReviewEnabled)
+                        .font(.system(size: 13.5, weight: .medium))
                         .foregroundColor(FlomoPalette.textPrimary(scheme))
-                    Spacer()
-                    Picker("时", selection: $vm.reviewHour) {
-                        ForEach(0..<24, id: \.self) { h in
-                            Text(String(format: "%02d 时", h)).tag(h)
-                        }
-                    }
-                    .frame(width: 86)
-                    .onChange(of: vm.reviewHour) { _, _ in vm.saveReviewSchedule() }
+                        .onChange(of: vm.dailyReviewEnabled) { _, _ in vm.saveReviewSchedule() }
 
-                    Picker("分", selection: $vm.reviewMinute) {
-                        ForEach([0, 15, 30, 45], id: \.self) { m in
-                            Text(String(format: "%02d 分", m)).tag(m)
+                    HStack {
+                        Text("提醒时间")
+                            .font(.system(size: 13.5))
+                            .foregroundColor(FlomoPalette.textPrimary(scheme))
+                        Spacer()
+                        Picker("时", selection: $vm.reviewHour) {
+                            ForEach(0..<24, id: \.self) { h in
+                                Text(String(format: "%02d 时", h)).tag(h)
+                            }
+                        }
+                        .frame(width: 86)
+                        .onChange(of: vm.reviewHour) { _, _ in vm.saveReviewSchedule() }
+
+                        Picker("分", selection: $vm.reviewMinute) {
+                            ForEach(0..<60, id: \.self) { m in
+                                Text(String(format: "%02d 分", m)).tag(m)
+                            }
+                        }
+                        .frame(width: 86)
+                        .onChange(of: vm.reviewMinute) { _, _ in vm.saveReviewSchedule() }
+                    }
+                    .disabled(!vm.dailyReviewEnabled)
+
+                    rowDivider
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack {
+                            Text("重复周期")
+                                .font(.system(size: 13.5))
+                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                            Spacer()
+                            HStack(spacing: 6) {
+                                reviewPresetChip("每天", active: vm.reviewWeekdays == Set(1...7)) {
+                                    vm.setReviewWeekdayPreset(Set(1...7))
+                                }
+                                reviewPresetChip("工作日", active: vm.reviewWeekdays == Set([2, 3, 4, 5, 6])) {
+                                    vm.setReviewWeekdayPreset(Set([2, 3, 4, 5, 6]))
+                                }
+                                reviewPresetChip("周末", active: vm.reviewWeekdays == Set([1, 7])) {
+                                    vm.setReviewWeekdayPreset(Set([1, 7]))
+                                }
+                            }
+                        }
+
+                        HStack(spacing: 8) {
+                            ForEach(weekdayItems, id: \.0) { wd, label in
+                                let selected = vm.reviewWeekdays.contains(wd)
+                                Button {
+                                    vm.toggleReviewWeekday(wd)
+                                } label: {
+                                    Text("周\(label)")
+                                        .font(.system(size: 12, weight: selected ? .semibold : .regular))
+                                        .foregroundColor(selected ? .white : FlomoPalette.textSecondary(scheme))
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 7)
+                                        .background(
+                                            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                                .fill(selected ? FlomoPalette.accent(scheme) : FlomoPalette.canvas(scheme))
+                                        )
+                                }
+                                .buttonStyle(.plain)
+                            }
                         }
                     }
-                    .frame(width: 86)
-                    .onChange(of: vm.reviewMinute) { _, _ in vm.saveReviewSchedule() }
+                    .opacity(vm.dailyReviewEnabled ? 1.0 : 0.45)
+                    .disabled(!vm.dailyReviewEnabled)
+
+                    rowDivider
+
+                    HStack(spacing: 10) {
+                        Button("发送测试通知") {
+                            vm.sendTestReviewNotification()
+                        }
+                        Button("系统通知设置") {
+                            if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+                                NSWorkspace.shared.open(url)
+                            }
+                        }
+                        Spacer()
+                    }
+
+                    if !vm.reviewNotificationStatus.isEmpty {
+                        Text(vm.reviewNotificationStatus)
+                            .font(.system(size: 12))
+                            .foregroundColor(FlomoPalette.accent(scheme))
+                    }
+
+                    Text("提醒由 macOS 系统通知中心托管，App 退出或在后台均会按时送达；点击通知直达「每日回顾」，展开通知可选「30 分钟后再提醒」。")
+                        .font(.system(size: 12))
+                        .foregroundColor(FlomoPalette.textSecondary(scheme))
                 }
-                .disabled(!vm.dailyReviewEnabled)
-
-                Text("提醒通过 macOS 系统通知中心送达，Android 端通过 AlarmManager 即使杀进程也可准时触发。")
-                    .font(.system(size: 12))
-                    .foregroundColor(FlomoPalette.textSecondary(scheme))
             }
         }
+    }
+
+    private func reviewPresetChip(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11.5, weight: active ? .medium : .regular))
+                .foregroundColor(active ? .white : FlomoPalette.textSecondary(scheme))
+                .padding(.horizontal, 9)
+                .padding(.vertical, 4)
+                .background(
+                    RoundedRectangle(cornerRadius: 6, style: .continuous)
+                        .fill(active ? FlomoPalette.accent(scheme) : FlomoPalette.canvas(scheme))
+                )
+        }
+        .buttonStyle(.plain)
     }
 
     // MARK: - LAN Sync (Navigator-style Zero-IP UDP Discovery + Single Library Code)

@@ -5,6 +5,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
+import android.graphics.BitmapFactory
 import android.os.Build
 import android.os.Bundle
 import android.util.LruCache
@@ -27,6 +28,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -56,7 +58,9 @@ import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.KeyboardArrowUp
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.MoreHoriz
+import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material3.DrawerValue
@@ -105,6 +109,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
+import coil.imageLoader
 import coil.request.ImageRequest
 import coil.size.Precision
 import com.whim.app.capture.QuickCaptureActivity
@@ -116,17 +121,22 @@ import com.whim.app.core.WhimNote
 import com.whim.app.core.WhimNoteCursor
 import com.whim.app.core.WhimStats
 import com.whim.app.core.WhimTagNode
+import com.whim.app.review.DailyReviewReceiver
+import com.whim.app.review.DailyReviewScheduler
 import com.whim.app.sync.SyncWorker
+import com.whim.app.ui.MobileSettingsScreen
+import com.whim.app.ui.SettingsFocusSection
 import com.whim.app.ui.theme.WhimTheme
 import com.whim.app.ui.theme.WhimThemeProvider
 import com.whim.app.ui.theme.heatmapColor
 import com.whim.app.update.GitHubUpdater
-import com.whim.app.update.ReleaseInfo
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 import java.text.SimpleDateFormat
 import java.time.Instant
@@ -187,6 +197,8 @@ class MainActivity : ComponentActivity() {
         const val EXTRA_OPEN_REVIEW = "open_review"
     }
 
+    private var openReviewSignal by mutableStateOf(0)
+
     private val notifPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { }
@@ -214,10 +226,16 @@ class MainActivity : ComponentActivity() {
             WhimThemeProvider(darkTheme = useDark) {
                 FlomoMobileApp(
                     initialReviewMode = initialReview,
+                    openReviewSignal = openReviewSignal,
                     themeMode = themeMode,
                     onThemeModeChange = { next ->
                         themeMode = next
                         prefs.edit().putString("theme_mode", next).apply()
+                    },
+                    onRequestNotificationPermission = {
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                            notifPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+                        }
                     },
                     onOpenQuickCapture = {
                         startActivity(Intent(this, QuickCaptureActivity::class.java))
@@ -234,6 +252,14 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra(EXTRA_OPEN_REVIEW, false)) {
+            openReviewSignal++
+        }
+    }
+
     override fun onStart() {
         super.onStart()
         // Mirror Navigator: phone does NOT run a server; it connects to Mac(s) via UDP discovery
@@ -245,8 +271,10 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun FlomoMobileApp(
     initialReviewMode: Boolean,
+    openReviewSignal: Int,
     themeMode: String,
     onThemeModeChange: (String) -> Unit,
+    onRequestNotificationPermission: () -> Unit,
     onOpenQuickCapture: () -> Unit,
     onEditNote: (WhimNote) -> Unit
 ) {
@@ -264,15 +292,14 @@ private fun FlomoMobileApp(
     var reviewOffsetDays by remember { mutableStateOf(0) }
     var searchQuery by remember { mutableStateOf("") }
     var showSearch by remember { mutableStateOf(false) }
-    var showSyncCard by remember { mutableStateOf(false) }
-    var showAboutCard by remember { mutableStateOf(false) }
+    var showSettingsScreen by remember { mutableStateOf(false) }
+    var settingsFocusSection by remember { mutableStateOf(SettingsFocusSection.ALL) }
+    var reviewSchedule by remember { mutableStateOf(DailyReviewScheduler.getSchedule(context)) }
+    var exactAlarmGranted by remember { mutableStateOf(DailyReviewScheduler.canScheduleExactAlarms(context)) }
+    var notifPermissionGranted by remember { mutableStateOf(DailyReviewReceiver.hasNotificationPermission(context)) }
     var previewImagePath by remember { mutableStateOf<String?>(null) }
     var lastDeletedNoteId by remember { mutableStateOf<String?>(null) }
     var undoDismissJob by remember { mutableStateOf<Job?>(null) }
-
-    var updateStatus by remember { mutableStateOf("当前版本 v${GitHubUpdater.CURRENT_VERSION}，点击检查 GitHub 最新版本") }
-    var availableRelease by remember { mutableStateOf<ReleaseInfo?>(null) }
-    var checkingUpdate by remember { mutableStateOf(false) }
     var randomSeed by remember { mutableStateOf(0) }
 
     var stats by remember { mutableStateOf(WhimStats()) }
@@ -285,9 +312,8 @@ private fun FlomoMobileApp(
 
     var tagTree by remember { mutableStateOf<List<WhimTagNode>>(emptyList()) }
     var pairCode by remember { mutableStateOf("") }
-    var syncStatus by remember { mutableStateOf("") }
-    var remoteCodeInput by remember { mutableStateOf("") }
-    var manualAddrInput by remember { mutableStateOf("") }
+    var syncToast by remember { mutableStateOf("") }
+    var syncToastJob by remember { mutableStateOf<Job?>(null) }
     var peerStatuses by remember { mutableStateOf<List<com.whim.app.core.WhimPeerSyncStatus>>(emptyList()) }
 
     fun buildFilterForTab(tab: MobileTab, cursor: WhimNoteCursor?): WhimListFilter? {
@@ -326,9 +352,6 @@ private fun FlomoMobileApp(
             stats = WhimCoreBridge.getStats(90)
             tagTree = WhimCoreBridge.listTagTree()
             pairCode = WhimCoreBridge.getPairCode()
-            if (remoteCodeInput.isEmpty() && pairCode.isNotEmpty()) {
-                remoteCodeInput = pairCode
-            }
         }
     }
 
@@ -396,10 +419,20 @@ private fun FlomoMobileApp(
         refreshMetadata()
     }
 
+    LaunchedEffect(openReviewSignal) {
+        if (openReviewSignal > 0) {
+            activeTab = MobileTab.Review
+            reviewOffsetDays = 0
+        }
+    }
+
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
+                exactAlarmGranted = DailyReviewScheduler.canScheduleExactAlarms(context)
+                notifPermissionGranted = DailyReviewReceiver.hasNotificationPermission(context)
+                reviewSchedule = DailyReviewScheduler.getSchedule(context)
                 reload()
             }
         }
@@ -427,6 +460,32 @@ private fun FlomoMobileApp(
                     loadMore()
                 }
             }
+    }
+
+    // Pre-warm image aspect ratios & Coil memory cache so scrolling onto image cards never hitches
+    LaunchedEffect(displayedNotes) {
+        if (displayedNotes.isEmpty()) return@LaunchedEffect
+        withContext(Dispatchers.IO) {
+            val loader = context.imageLoader
+            var prefetched = 0
+            for (note in displayedNotes) {
+                for (att in note.attachments) {
+                    val path = att.localPath
+                    if (path.isNotEmpty()) {
+                        MobileImageBoundsCache.aspectRatio(path)
+                        loader.enqueue(
+                            ImageRequest.Builder(context)
+                                .data(File(path))
+                                .size(960, 960)
+                                .precision(Precision.INEXACT)
+                                .build()
+                        )
+                        prefetched++
+                        if (prefetched >= 24) return@withContext
+                    }
+                }
+            }
+        }
     }
 
     // Auto-scroll to top when a newly synced note arrives at index 0
@@ -525,14 +584,9 @@ private fun FlomoMobileApp(
                         activeTab = MobileTab.Archived
                         scope.launch { drawerState.close() }
                     }
-                    DrawerNavRow(Icons.Rounded.Sync, "连到 Mac · ${if (pairCode.length == 6) "已配对" else "未配对"}", false) {
-                        showSyncCard = true
-                        showAboutCard = false
-                        scope.launch { drawerState.close() }
-                    }
-                    DrawerNavRow(Icons.Rounded.AutoAwesome, "关于与更新 · v${GitHubUpdater.CURRENT_VERSION}", false) {
-                        showAboutCard = true
-                        showSyncCard = false
+                    DrawerNavRow(Icons.Rounded.Settings, "设置 · ${if (pairCode.length == 6) "已配对" else "未配对"} · v${GitHubUpdater.CURRENT_VERSION}", false) {
+                        settingsFocusSection = SettingsFocusSection.ALL
+                        showSettingsScreen = true
                         scope.launch { drawerState.close() }
                     }
 
@@ -620,20 +674,64 @@ private fun FlomoMobileApp(
                             modifier = Modifier
                                 .size(22.dp)
                                 .clickable {
-                                    showSyncCard = !showSyncCard
-                                    scope.launch {
-                                        syncStatus = "正在通过 UDP 发现并同步..."
-                                        val res = WhimCoreBridge.syncOnce()
-                                        peerStatuses = res.peers
-                                        syncStatus = when {
-                                            res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台设备" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
-                                            res.peers.isNotEmpty() -> res.peers.first().message
-                                            else -> "暂未发现同 Wi-Fi 下的其他 Whim 设备"
+                                    if (pairCode.length != 6) {
+                                        settingsFocusSection = SettingsFocusSection.SYNC
+                                        showSettingsScreen = true
+                                    } else {
+                                        scope.launch {
+                                            syncToast = "正在同步..."
+                                            val res = WhimCoreBridge.syncOnce()
+                                            peerStatuses = res.peers
+                                            syncToast = when {
+                                                res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台设备" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
+                                                res.peers.isNotEmpty() -> res.peers.first().message
+                                                else -> "暂未发现同 Wi-Fi 下的 Mac"
+                                            }
+                                            reload()
+                                            WhimWidgetProvider.refreshAll(context)
+                                            syncToastJob?.cancel()
+                                            syncToastJob = scope.launch {
+                                                delay(2600L)
+                                                syncToast = ""
+                                            }
                                         }
-                                        reload()
-                                        WhimWidgetProvider.refreshAll(context)
                                     }
                                 }
+                        )
+                        Icon(
+                            Icons.Rounded.Settings,
+                            contentDescription = "设置",
+                            tint = c.textSecondary,
+                            modifier = Modifier
+                                .size(22.dp)
+                                .clickable {
+                                    settingsFocusSection = SettingsFocusSection.ALL
+                                    showSettingsScreen = true
+                                }
+                        )
+                    }
+                }
+
+                if (syncToast.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 2.dp)
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.card)
+                            .padding(horizontal = 12.dp, vertical = 7.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(syncToast, style = t.meta, color = c.textSecondary)
+                        Text(
+                            "同步设置",
+                            style = t.meta,
+                            color = c.tagText,
+                            modifier = Modifier.clickable {
+                                settingsFocusSection = SettingsFocusSection.SYNC
+                                showSettingsScreen = true
+                            }
                         )
                     }
                 }
@@ -675,203 +773,6 @@ private fun FlomoMobileApp(
                     }
                 }
 
-                if (showSyncCard) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 6.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(c.card)
-                            .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp)
-                    ) {
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
-                            Text("连到 Mac", style = t.section, color = c.textPrimary)
-                            Text(
-                                "刷新",
-                                style = t.meta,
-                                color = c.tagText,
-                                modifier = Modifier.clickable {
-                                    scope.launch {
-                                        syncStatus = "正在查找同 Wi-Fi 下的 Mac..."
-                                        val res = WhimCoreBridge.syncOnce()
-                                        peerStatuses = res.peers
-                                        syncStatus = when {
-                                            res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台 Mac" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
-                                            res.peers.isNotEmpty() -> res.peers.first().message
-                                            else -> "暂未发现同 Wi-Fi 下的 Mac"
-                                        }
-                                        reload()
-                                    }
-                                }
-                            )
-                        }
-                        Text(
-                            text = "在 Mac 的「设置 → 局域网同步」里找到 6 位数字。同一个 Wi-Fi 下会自动找到每一台 Mac，只要对一次。",
-                            style = t.meta,
-                            color = c.textSecondary
-                        )
-
-                        Box(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(c.canvas).padding(horizontal = 12.dp, vertical = 12.dp)) {
-                            BasicTextField(
-                                value = remoteCodeInput,
-                                onValueChange = { remoteCodeInput = it.filter { ch -> ch.isDigit() }.take(6) },
-                                singleLine = true,
-                                textStyle = t.statNumber.copy(color = c.textPrimary),
-                                cursorBrush = SolidColor(c.accent),
-                                modifier = Modifier.fillMaxWidth(),
-                                decorationBox = { inner ->
-                                    if (remoteCodeInput.isEmpty()) Text("482 913", style = t.statNumber, color = c.textMuted)
-                                    inner()
-                                }
-                            )
-                        }
-
-                        if (peerStatuses.isNotEmpty()) {
-                            Text("设备", style = t.meta, color = c.textMuted)
-                            peerStatuses.forEach { peer ->
-                                Row(
-                                    modifier = Modifier.fillMaxWidth(),
-                                    horizontalArrangement = Arrangement.SpaceBetween,
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        if (peer.displayName.isEmpty()) peer.addr else "${peer.displayName} · ${peer.addr}",
-                                        style = t.body,
-                                        color = c.textPrimary
-                                    )
-                                    Text(
-                                        peer.message,
-                                        style = t.meta,
-                                        color = if (peer.status == "synced") c.accent else Color(0xFFD05A5A)
-                                    )
-                                }
-                            }
-                        }
-
-                        if (syncStatus.isNotEmpty()) {
-                            Text(syncStatus, style = t.meta, color = c.textSecondary)
-                        }
-
-                        val codeReady = remoteCodeInput.filter { it.isDigit() }.length == 6
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(if (codeReady) c.accent else c.canvas)
-                                .clickable(enabled = codeReady) {
-                                    val digits = remoteCodeInput.filter { it.isDigit() }
-                                    val addr = manualAddrInput.trim()
-                                    scope.launch {
-                                        if (addr.isNotEmpty()) {
-                                            runCatching { WhimCoreBridge.setManualPeers(listOf(addr)) }
-                                        }
-                                        runCatching { WhimCoreBridge.setPairCode(digits) }
-                                            .onSuccess { updated ->
-                                                pairCode = updated
-                                                syncStatus = "正在自动发现 Mac 并同步..."
-                                                val res = WhimCoreBridge.syncOnce()
-                                                peerStatuses = res.peers
-                                                syncStatus = when {
-                                                    res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台 Mac" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
-                                                    res.peers.isNotEmpty() -> res.peers.first().message
-                                                    else -> "已保存配对码，未发现同一 Wi-Fi 下的 Mac"
-                                                }
-                                                reload()
-                                                WhimWidgetProvider.refreshAll(context)
-                                            }
-                                            .onFailure { syncStatus = it.message ?: "配对码无效" }
-                                    }
-                                }
-                                .padding(vertical = 12.dp),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Text("配对", style = t.body, color = if (codeReady) Color.White else c.textMuted, fontWeight = FontWeight.SemiBold)
-                        }
-
-                        Text("找不到 Mac 时，才把 Mac 的地址填进来（可选）", style = t.meta, color = c.textMuted)
-                        Box(modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(8.dp)).background(c.canvas).padding(horizontal = 12.dp, vertical = 9.dp)) {
-                            BasicTextField(
-                                value = manualAddrInput,
-                                onValueChange = { manualAddrInput = it },
-                                singleLine = true,
-                                textStyle = t.body.copy(color = c.textPrimary),
-                                cursorBrush = SolidColor(c.accent),
-                                modifier = Modifier.fillMaxWidth(),
-                                decorationBox = { inner ->
-                                    if (manualAddrInput.isEmpty()) Text("192.168.5.111:8788", style = t.meta, color = c.textMuted)
-                                    inner()
-                                }
-                            )
-                        }
-                    }
-                }
-
-                if (showAboutCard) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 6.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(c.card)
-                            .padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("设置与关于 · v${GitHubUpdater.CURRENT_VERSION}", style = t.section, color = c.textPrimary)
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            listOf("system" to "跟随系统", "light" to "浅色", "dark" to "深色").forEach { (key, label) ->
-                                val active = themeMode == key
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(7.dp))
-                                        .background(if (active) c.accent else c.canvas)
-                                        .clickable { onThemeModeChange(key) }
-                                        .padding(horizontal = 12.dp, vertical = 6.dp)
-                                ) {
-                                    Text(label, style = t.meta, color = if (active) Color.White else c.textPrimary)
-                                }
-                            }
-                        }
-                        Text(updateStatus, style = t.meta, color = c.textSecondary)
-                        Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                            Box(
-                                modifier = Modifier
-                                    .clip(RoundedCornerShape(7.dp))
-                                    .background(c.accent)
-                                    .clickable(enabled = !checkingUpdate) {
-                                        checkingUpdate = true
-                                        updateStatus = "正在检查 GitHub Release..."
-                                        scope.launch {
-                                            val res = GitHubUpdater.checkLatest()
-                                            checkingUpdate = false
-                                            updateStatus = res.message
-                                            availableRelease = if (res.hasUpdate) res.release else null
-                                        }
-                                    }
-                                    .padding(horizontal = 14.dp, vertical = 8.dp)
-                            ) {
-                                Text(if (checkingUpdate) "检查中..." else "检查更新", style = t.meta, color = Color.White, fontWeight = FontWeight.Medium)
-                            }
-                            availableRelease?.let { rel ->
-                                Box(
-                                    modifier = Modifier
-                                        .clip(RoundedCornerShape(7.dp))
-                                        .background(c.tagBg)
-                                        .clickable {
-                                            updateStatus = "正在下载 APK..."
-                                            scope.launch {
-                                                updateStatus = GitHubUpdater.downloadAndInstallApk(context, rel)
-                                            }
-                                        }
-                                        .padding(horizontal = 14.dp, vertical = 8.dp)
-                                ) {
-                                    Text("一键下载安装", style = t.meta, color = c.tagText, fontWeight = FontWeight.Medium)
-                                }
-                            }
-                        }
-                    }
-                }
-
                 if (activeTab == MobileTab.Review) {
                     val reviewLabel = remember(reviewOffsetDays) {
                         val (startMs, _) = dayRangeMs(reviewOffsetDays)
@@ -907,15 +808,42 @@ private fun FlomoMobileApp(
                                     .clickable(enabled = reviewOffsetDays < 0) { reviewOffsetDays += 1 }
                             )
                         }
-                        if (reviewOffsetDays < 0) {
-                            Text(
-                                "回到今天",
-                                style = t.meta,
-                                color = c.tagText,
-                                modifier = Modifier.clickable { reviewOffsetDays = 0 }
-                            )
-                        } else {
-                            Text("共 ${displayedNotes.size} 条", style = t.meta, color = c.textSecondary)
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            if (reviewOffsetDays < 0) {
+                                Text(
+                                    "回到今天",
+                                    style = t.meta,
+                                    color = c.tagText,
+                                    modifier = Modifier.clickable { reviewOffsetDays = 0 }
+                                )
+                            } else {
+                                Text("共 ${displayedNotes.size} 条", style = t.meta, color = c.textSecondary)
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .background(if (reviewSchedule.enabled) c.tagBg else c.canvas)
+                                    .clickable {
+                                        settingsFocusSection = SettingsFocusSection.REVIEW
+                                        showSettingsScreen = true
+                                    }
+                                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Notifications,
+                                    contentDescription = "提醒设置",
+                                    tint = if (reviewSchedule.enabled) c.tagText else c.textMuted,
+                                    modifier = Modifier.size(13.dp)
+                                )
+                                Text(
+                                    DailyReviewScheduler.formatSummary(reviewSchedule),
+                                    style = t.meta,
+                                    color = if (reviewSchedule.enabled) c.tagText else c.textMuted,
+                                    fontWeight = FontWeight.Medium
+                                )
+                            }
                         }
                     }
                 }
@@ -1142,6 +1070,25 @@ private fun FlomoMobileApp(
         }
     }
 
+    if (showSettingsScreen) {
+        MobileSettingsScreen(
+            focusSection = settingsFocusSection,
+            themeMode = themeMode,
+            onThemeModeChange = onThemeModeChange,
+            reviewSchedule = reviewSchedule,
+            onReviewScheduleChange = { reviewSchedule = it },
+            notifPermissionGranted = notifPermissionGranted,
+            exactAlarmGranted = exactAlarmGranted,
+            onRequestNotificationPermission = onRequestNotificationPermission,
+            pairCode = pairCode,
+            onPairCodeUpdated = { pairCode = it },
+            peerStatuses = peerStatuses,
+            onPeerStatusesUpdated = { peerStatuses = it },
+            onSyncCompleted = { reload() },
+            onBack = { showSettingsScreen = false }
+        )
+    }
+
     // Full-screen Image Lightbox Dialog
     previewImagePath?.let { path ->
         Dialog(
@@ -1300,6 +1247,23 @@ private fun DrawerTagTree(
 }
 
 private val cardTimeFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+
+private object MobileImageBoundsCache {
+    private val ratioCache = LruCache<String, Float>(320)
+
+    fun aspectRatio(path: String): Float {
+        ratioCache.get(path)?.let { return it }
+        val opts = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(path, opts)
+        val ratio = if (opts.outWidth > 0 && opts.outHeight > 0) {
+            (opts.outWidth.toFloat() / opts.outHeight.toFloat()).coerceIn(0.6f, 2.5f)
+        } else {
+            1.6f
+        }
+        ratioCache.put(path, ratio)
+        return ratio
+    }
+}
 
 @Immutable
 private sealed class MobileMdChunk {
@@ -1677,6 +1641,7 @@ private fun FlomoMobileNoteCard(
             when (block) {
                 is MobileCardBlock.TextBlock -> MobileMarkdownChunksView(chunks = block.chunks)
                 is MobileCardBlock.ImageBlock -> {
+                    val ratio = remember(block.path) { MobileImageBoundsCache.aspectRatio(block.path) }
                     val req = remember(block.path) {
                         ImageRequest.Builder(context)
                             .data(File(block.path))
@@ -1688,10 +1653,11 @@ private fun FlomoMobileNoteCard(
                     AsyncImage(
                         model = req,
                         contentDescription = "内联图片",
-                        contentScale = ContentScale.FillWidth,
+                        contentScale = ContentScale.Fit,
                         modifier = Modifier
                             .fillMaxWidth()
-                            .heightIn(min = 120.dp, max = 280.dp)
+                            .heightIn(max = 280.dp)
+                            .aspectRatio(ratio)
                             .clip(RoundedCornerShape(8.dp))
                             .background(c.canvas)
                             .clickable { onTapImage(block.path) }

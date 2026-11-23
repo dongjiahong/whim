@@ -74,12 +74,13 @@
                 android:resource="@xml/whim_widget_info" />
         </receiver>
 
-        <!-- 晚间复盘系统定时通知接收器 + 开机自恢复 -->
+        <!-- 晚间复盘系统定时通知接收器 + 稍后提醒 + 开机自恢复 -->
         <receiver
             android:name=".review.DailyReviewReceiver"
             android:exported="false">
             <intent-filter>
                 <action android:name="com.whim.app.ACTION_DAILY_REVIEW" />
+                <action android:name="com.whim.app.ACTION_SNOOZE_REVIEW" />
                 <action android:name="android.intent.action.BOOT_COMPLETED" />
             </intent-filter>
         </receiver>

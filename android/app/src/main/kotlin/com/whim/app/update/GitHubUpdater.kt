@@ -36,7 +36,7 @@ data class UpdateCheckResult(
 
 object GitHubUpdater {
     const val REPO = "dongjiahong/whim"
-    const val CURRENT_VERSION = "0.1.2"
+    const val CURRENT_VERSION = "0.1.3"
 
     private val json = Json { ignoreUnknownKeys = true }
 

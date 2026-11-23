@@ -51,7 +51,8 @@ object WhimCoreBridge {
         content: String? = null,
         pinned: Boolean? = null,
         archived: Boolean? = null,
-        deleted: Boolean? = null
+        deleted: Boolean? = null,
+        attachments: List<WhimAttachment>? = null
     ): WhimNote = withContext(Dispatchers.IO) {
         val patch = buildJsonObject {
             put("id", id)
@@ -59,6 +60,9 @@ object WhimCoreBridge {
             pinned?.let { put("pinned", it) }
             archived?.let { put("archived", it) }
             deleted?.let { put("deleted", it) }
+            if (!attachments.isNullOrEmpty()) {
+                put("attachments", json.parseToJsonElement(json.encodeToString(attachments)))
+            }
         }
         val raw = Mobile.updateNote(patch.toString())
         json.decodeFromString(raw)

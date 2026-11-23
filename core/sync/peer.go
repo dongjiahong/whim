@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	clockMarginMs = int64(5 * 60 * 1000) // 5 minutes clock skew margin
-	maxBlobBytes  = 32 * 1024 * 1024     // 32 MB per pasted image
+	clockMarginMs  = int64(5 * 60 * 1000) // 5 minutes clock skew margin
+	maxBlobBytes   = 32 * 1024 * 1024     // 32 MB per pasted image
+	syncBatchLimit = 500                  // max notes per /sync/exchange HTTP batch
 )
 
 // Peer manages both incoming peer sync requests (authenticated against THIS device's own localCode)
@@ -417,6 +418,8 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 }
 
 // SyncWithAddr runs a full authenticated bidirectional sync with one specific peer using remoteCode.
+// Large note libraries are exchanged in bounded batches (syncBatchLimit notes per HTTP request) so initial
+// pairing of 10,000+ notes never hits payload size limits.
 func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode string) (notesMerged, blobsDown, blobsUp int, err error) {
 	baseURL := "http://" + addr
 
@@ -428,39 +431,85 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		}
 	}
 
-	// 2. Collect local changes & local blobs
-	localNotes, localAtts, err := p.store.ListChangesSince(since)
-	if err != nil {
-		return 0, 0, 0, err
-	}
 	haveBlobs, _ := p.store.ListLocalBlobs()
+	wantSet := make(map[string]struct{})
+	var lastResp model.SyncExchangeResponse
+	totalMerged := 0
 
-	reqBody := model.SyncExchangeRequest{
-		PeerID:      p.peerID,
-		DisplayName: p.displayName,
-		Since:       since,
-		Notes:       localNotes,
-		Attachments: localAtts,
-		HaveBlobs:   haveBlobs,
+	// 2. Push local changes in bounded batches; on the final local batch, begin pulling remote changes.
+	localSince := since
+	localAfterID := ""
+	for {
+		localNotes, localAtts, nextLocalSince, nextLocalAfterID, localHasMore, lerr := p.store.ListChangesSincePaged(localSince, localAfterID, syncBatchLimit)
+		if lerr != nil {
+			return 0, 0, 0, lerr
+		}
+		reqBody := model.SyncExchangeRequest{
+			PeerID:      p.peerID,
+			DisplayName: p.displayName,
+			Since:       since,
+			BatchLimit:  syncBatchLimit,
+			SkipPull:    localHasMore,
+			Notes:       localNotes,
+			Attachments: localAtts,
+		}
+		if !localHasMore {
+			reqBody.HaveBlobs = haveBlobs
+		}
+		respBytes, rerr := p.authedRequest(ctx, http.MethodPost, baseURL+"/sync/exchange", reqBody, "application/json", remoteCode)
+		if rerr != nil {
+			return 0, 0, 0, rerr
+		}
+		var resp model.SyncExchangeResponse
+		if uerr := json.Unmarshal(respBytes, &resp); uerr != nil {
+			return 0, 0, 0, fmt.Errorf("decode exchange response: %w", uerr)
+		}
+		lastResp = resp
+		for _, w := range resp.WantBlobs {
+			wantSet[w] = struct{}{}
+		}
+		if len(resp.Notes) > 0 || len(resp.Attachments) > 0 {
+			m, merr := p.store.MergeRemote(resp.Notes, resp.Attachments)
+			if merr != nil {
+				return 0, 0, 0, merr
+			}
+			totalMerged += m
+		}
+		if !localHasMore {
+			break
+		}
+		localSince = nextLocalSince
+		localAfterID = nextLocalAfterID
 	}
 
-	// 3. Challenge + HMAC proof (using REMOTE peer's code) -> POST /sync/exchange
-	respBytes, err := p.authedRequest(ctx, http.MethodPost, baseURL+"/sync/exchange", reqBody, "application/json", remoteCode)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-	var resp model.SyncExchangeResponse
-	if err := json.Unmarshal(respBytes, &resp); err != nil {
-		return 0, 0, 0, fmt.Errorf("decode exchange response: %w", err)
+	// 3. Pull any remaining remote batches until HasMore is false
+	for lastResp.HasMore && lastResp.NextAfterID != "" {
+		reqBody := model.SyncExchangeRequest{
+			PeerID:      p.peerID,
+			DisplayName: p.displayName,
+			Since:       lastResp.NextSince,
+			AfterID:     lastResp.NextAfterID,
+			BatchLimit:  syncBatchLimit,
+		}
+		respBytes, rerr := p.authedRequest(ctx, http.MethodPost, baseURL+"/sync/exchange", reqBody, "application/json", remoteCode)
+		if rerr != nil {
+			return 0, 0, 0, rerr
+		}
+		var resp model.SyncExchangeResponse
+		if uerr := json.Unmarshal(respBytes, &resp); uerr != nil {
+			return 0, 0, 0, fmt.Errorf("decode exchange response: %w", uerr)
+		}
+		lastResp = resp
+		if len(resp.Notes) > 0 || len(resp.Attachments) > 0 {
+			m, merr := p.store.MergeRemote(resp.Notes, resp.Attachments)
+			if merr != nil {
+				return 0, 0, 0, merr
+			}
+			totalMerged += m
+		}
 	}
 
-	// 4. Merge remote delta locally
-	merged, err := p.store.MergeRemote(resp.Notes, resp.Attachments)
-	if err != nil {
-		return 0, 0, 0, err
-	}
-
-	// 5. Download any blobs we are missing
+	// 4. Download any blobs we are missing
 	missing, _ := p.store.MissingBlobs()
 	for _, hash := range missing {
 		data, mime, derr := p.downloadBlob(ctx, baseURL, hash, remoteCode)
@@ -471,8 +520,8 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		}
 	}
 
-	// 6. Upload any blobs the peer asked for
-	for _, hash := range resp.WantBlobs {
+	// 5. Upload any blobs the peer asked for
+	for hash := range wantSet {
 		data, mime, rerr := p.store.ReadBlob(hash)
 		if rerr != nil {
 			continue
@@ -482,16 +531,16 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		}
 	}
 
-	// 7. Record updated watermark + save this peer's code in sync_peers
+	// 6. Record updated watermark + save this peer's code in sync_peers
 	now := time.Now().UnixMilli()
-	heard := resp.ServerTime
+	heard := lastResp.ServerTime
 	if heard <= 0 {
 		heard = now
 	}
-	if resp.PeerID != "" {
+	if lastResp.PeerID != "" {
 		_ = p.store.UpsertSyncPeer(model.SyncPeer{
-			PeerID:      resp.PeerID,
-			DisplayName: resp.DisplayName,
+			PeerID:      lastResp.PeerID,
+			DisplayName: lastResp.DisplayName,
 			LastAddr:    addr,
 			PairCode:    NormalizeCode(remoteCode),
 			LastHeardAt: heard,
@@ -499,7 +548,7 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		})
 	}
 
-	return merged, blobsDown, blobsUp, nil
+	return totalMerged, blobsDown, blobsUp, nil
 }
 
 func (p *Peer) fetchNonce(ctx context.Context, baseURL string) (string, error) {
@@ -673,25 +722,34 @@ func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
 		p.NotifyChanged()
 	}
 
-	since := req.Since
-	if since < 0 {
-		since = 0
-	}
-	outNotes, outAtts, err := p.store.ListChangesSince(since)
-	if err != nil {
-		http.Error(w, "read error", http.StatusInternalServerError)
-		return
+	var (outNotes []model.Note; outAtts []model.Attachment; nextSince int64; nextAfterID string; hasMore bool)
+	if !req.SkipPull {
+		since := req.Since
+		if since < 0 {
+			since = 0
+		}
+		batchLimit := req.BatchLimit
+		if batchLimit <= 0 || batchLimit > syncBatchLimit {
+			batchLimit = syncBatchLimit
+		}
+		outNotes, outAtts, nextSince, nextAfterID, hasMore, err = p.store.ListChangesSincePaged(since, req.AfterID, batchLimit)
+		if err != nil {
+			http.Error(w, "read error", http.StatusInternalServerError)
+			return
+		}
 	}
 
-	missing, _ := p.store.MissingBlobs()
-	senderHave := make(map[string]struct{}, len(req.HaveBlobs))
-	for _, h := range req.HaveBlobs {
-		senderHave[h] = struct{}{}
-	}
 	var want []string
-	for _, m := range missing {
-		if _, ok := senderHave[m]; ok {
-			want = append(want, m)
+	if len(req.HaveBlobs) > 0 {
+		missing, _ := p.store.MissingBlobs()
+		senderHave := make(map[string]struct{}, len(req.HaveBlobs))
+		for _, h := range req.HaveBlobs {
+			senderHave[h] = struct{}{}
+		}
+		for _, m := range missing {
+			if _, ok := senderHave[m]; ok {
+				want = append(want, m)
+			}
 		}
 	}
 
@@ -722,6 +780,9 @@ func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
 		Notes:       outNotes,
 		Attachments: outAtts,
 		WantBlobs:   want,
+		HasMore:     hasMore,
+		NextSince:   nextSince,
+		NextAfterID: nextAfterID,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)

@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 
@@ -22,10 +23,11 @@ import (
 
 // Store manages the local SQLite database and content-addressed image blobs.
 type Store struct {
-	mu       sync.RWMutex
-	db       *sql.DB
-	dataDir  string
-	blobsDir string
+	mu              sync.RWMutex
+	db              *sql.DB
+	dataDir         string
+	blobsDir        string
+	ftsTrigramReady bool
 }
 
 // Open initializes or opens the SQLite database under dataDir/whim.sqlite3.
@@ -136,7 +138,41 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
 		return err
 	}
 	_, _ = s.db.Exec(`ALTER TABLE sync_peers ADD COLUMN pair_code TEXT NOT NULL DEFAULT ''`)
+	s.ensureTrigramFTS()
 	return nil
+}
+
+func (s *Store) ensureTrigramFTS() {
+	var ver string
+	_ = s.db.QueryRow(`SELECT value FROM meta WHERE key = 'whim.fts_version'`).Scan(&ver)
+	if ver == "trigram_v1" {
+		s.ftsTrigramReady = true
+		return
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS notes_fts`); err != nil {
+		return
+	}
+	if _, err := tx.Exec(`CREATE VIRTUAL TABLE notes_fts USING fts5(note_id UNINDEXED, content, tokenize = 'trigram')`); err != nil {
+		return
+	}
+	if _, err := tx.Exec(`INSERT INTO notes_fts(note_id, content) SELECT id, content FROM notes WHERE deleted = 0`); err != nil {
+		return
+	}
+	if _, err := tx.Exec(`INSERT INTO meta(key, value) VALUES('whim.fts_version', 'trigram_v1') ON CONFLICT(key) DO UPDATE SET value=excluded.value`); err != nil {
+		return
+	}
+	if err := tx.Commit(); err == nil {
+		s.ftsTrigramReady = true
+	}
+}
+
+func quoteFTSPhrase(q string) string {
+	return `"` + strings.ReplaceAll(q, `"`, `""`) + `"`
 }
 
 // GetMeta retrieves a local key-value setting.
@@ -481,8 +517,13 @@ func (s *Store) ListNotesPage(f model.ListFilter) (*model.NotePage, error) {
 		args = append(args, tp, tp+"/%")
 	}
 	if q := strings.TrimSpace(f.Query); q != "" {
-		where = append(where, "n.content LIKE ?")
-		args = append(args, "%"+q+"%")
+		if s.ftsTrigramReady && utf8.RuneCountInString(q) >= 3 {
+			where = append(where, "EXISTS (SELECT 1 FROM notes_fts f WHERE f.note_id = n.id AND f.content MATCH ?)")
+			args = append(args, quoteFTSPhrase(q))
+		} else {
+			where = append(where, "n.content LIKE ?")
+			args = append(args, "%"+q+"%")
+		}
 	}
 
 	useCursor := f.Cursor != nil && f.Cursor.ID != ""
@@ -636,8 +677,13 @@ func (s *Store) ListRandomNotes(query string, limit int) ([]model.Note, error) {
 	var args []any
 	where = append(where, "deleted = 0", "archived = 0")
 	if q := strings.TrimSpace(query); q != "" {
-		where = append(where, "content LIKE ?")
-		args = append(args, "%"+q+"%")
+		if s.ftsTrigramReady && utf8.RuneCountInString(q) >= 3 {
+			where = append(where, "EXISTS (SELECT 1 FROM notes_fts f WHERE f.note_id = notes.id AND f.content MATCH ?)")
+			args = append(args, quoteFTSPhrase(q))
+		} else {
+			where = append(where, "content LIKE ?")
+			args = append(args, "%"+q+"%")
+		}
 	}
 	args = append(args, limit)
 
@@ -757,6 +803,117 @@ func (s *Store) ListTagTree() ([]model.TagNode, error) {
 		counts[p] = c
 	}
 	return tags.BuildTree(counts), nil
+}
+
+// ListChangesSincePaged returns a bounded batch of notes (including tombstones) and attachments
+// ordered by (updated_at ASC, id ASC) so initial sync of 10,000+ notes never exceeds payload limits.
+func (s *Store) ListChangesSincePaged(sinceMs int64, afterID string, limit int) ([]model.Note, []model.Attachment, int64, string, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+
+	var (nRows *sql.Rows; err error)
+	if afterID == "" {
+		nRows, err = s.db.Query(`
+			SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
+			FROM notes WHERE updated_at >= ? ORDER BY updated_at ASC, id ASC LIMIT ?`, sinceMs, limit+1)
+	} else {
+		nRows, err = s.db.Query(`
+			SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
+			FROM notes WHERE updated_at > ? OR (updated_at = ? AND id > ?) ORDER BY updated_at ASC, id ASC LIMIT ?`,
+			sinceMs, sinceMs, afterID, limit+1)
+	}
+	if err != nil {
+		return nil, nil, 0, "", false, err
+	}
+	defer nRows.Close()
+
+	notes := make([]model.Note, 0, limit)
+	for nRows.Next() {
+		var n model.Note
+		var pinned, archived, deleted int
+		var stampsRaw string
+		if err := nRows.Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
+			return nil, nil, 0, "", false, err
+		}
+		n.Pinned = pinned != 0
+		n.Archived = archived != 0
+		n.Deleted = deleted != 0
+		_ = json.Unmarshal([]byte(stampsRaw), &n.Stamps)
+		notes = append(notes, n)
+	}
+	if err := nRows.Err(); err != nil {
+		return nil, nil, 0, "", false, err
+	}
+
+	hasMore := false
+	var nextSince int64
+	var nextAfterID string
+	if len(notes) > limit {
+		hasMore = true
+		notes = notes[:limit]
+		last := notes[len(notes)-1]
+		nextSince = last.UpdatedAt
+		nextAfterID = last.ID
+	}
+
+	var atts []model.Attachment
+	seenAtt := make(map[string]struct{})
+	if len(notes) > 0 {
+		placeholders := make([]string, len(notes))
+		args := make([]any, len(notes))
+		for i := range notes {
+			placeholders[i] = "?"
+			args[i] = notes[i].ID
+		}
+		q := fmt.Sprintf(`
+			SELECT id, note_id, sha256, mime, width, height, size_bytes, sort_order, deleted, updated_at
+			FROM note_attachments WHERE note_id IN (%s) ORDER BY updated_at ASC, id ASC`, strings.Join(placeholders, ","))
+		aRows, err := s.db.Query(q, args...)
+		if err != nil {
+			return nil, nil, 0, "", false, err
+		}
+		for aRows.Next() {
+			var a model.Attachment
+			var del int
+			if err := aRows.Scan(&a.ID, &a.NoteID, &a.SHA256, &a.MIME, &a.Width, &a.Height, &a.SizeBytes, &a.SortOrder, &del, &a.UpdatedAt); err != nil {
+				aRows.Close()
+				return nil, nil, 0, "", false, err
+			}
+			a.Deleted = del != 0
+			seenAtt[a.ID] = struct{}{}
+			atts = append(atts, a)
+		}
+		aRows.Close()
+	}
+
+	// On the final batch, also include any standalone attachment updates since watermark
+	if !hasMore {
+		aRows, err := s.db.Query(`
+			SELECT id, note_id, sha256, mime, width, height, size_bytes, sort_order, deleted, updated_at
+			FROM note_attachments WHERE updated_at >= ? ORDER BY updated_at ASC, id ASC`, sinceMs)
+		if err != nil {
+			return nil, nil, 0, "", false, err
+		}
+		defer aRows.Close()
+		for aRows.Next() {
+			var a model.Attachment
+			var del int
+			if err := aRows.Scan(&a.ID, &a.NoteID, &a.SHA256, &a.MIME, &a.Width, &a.Height, &a.SizeBytes, &a.SortOrder, &del, &a.UpdatedAt); err != nil {
+				return nil, nil, 0, "", false, err
+			}
+			if _, ok := seenAtt[a.ID]; ok {
+				continue
+			}
+			a.Deleted = del != 0
+			atts = append(atts, a)
+		}
+	}
+
+	return notes, atts, nextSince, nextAfterID, hasMore, nil
 }
 
 // ListChangesSince returns all notes (including tombstones) and attachments modified at or after sinceMs.

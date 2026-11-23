@@ -662,6 +662,7 @@ struct FlomoComposerView: View {
     @State private var markdown: String = ""
     @State private var attachments: [WhimAttachment] = []
     @State private var isFocused: Bool = false
+    @State private var selectedTagIndex: Int = 0
 
     private var canSubmit: Bool {
         !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
@@ -699,10 +700,25 @@ struct FlomoComposerView: View {
                     onTextChange: { md, atts in
                         markdown = md
                         attachments = atts
+                        selectedTagIndex = 0
                     },
                     onFocusChange: { focused in isFocused = focused },
                     onSubmit: submit,
-                    onEscape: { onFinishEdit?() }
+                    onEscape: { onFinishEdit?() },
+                    onNavigateSuggestion: { delta in
+                        let items = tagSuggestions
+                        guard !items.isEmpty else { return false }
+                        selectedTagIndex = (selectedTagIndex + delta + items.count) % items.count
+                        return true
+                    },
+                    onAcceptSuggestion: {
+                        let items = tagSuggestions
+                        guard !items.isEmpty else { return false }
+                        let safeIdx = min(max(0, selectedTagIndex), items.count - 1)
+                        editor.replaceActiveTag(with: items[safeIdx])
+                        selectedTagIndex = 0
+                        return true
+                    }
                 )
                 .frame(minHeight: editingNote != nil ? 120 : 86, maxHeight: 240)
             }
@@ -710,16 +726,21 @@ struct FlomoComposerView: View {
             if !tagSuggestions.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        ForEach(tagSuggestions, id: \.self) { tag in
+                        ForEach(Array(tagSuggestions.enumerated()), id: \.element) { idx, tag in
+                            let active = idx == min(selectedTagIndex, tagSuggestions.count - 1)
                             Button {
                                 editor.replaceActiveTag(with: tag)
+                                selectedTagIndex = 0
                             } label: {
                                 Text("#\(tag)")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(FlomoPalette.tagText(scheme))
+                                    .font(.system(size: 12, weight: active ? .medium : .regular))
+                                    .foregroundColor(active ? .white : FlomoPalette.tagText(scheme))
                                     .padding(.horizontal, 8)
                                     .padding(.vertical, 3)
-                                    .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(FlomoPalette.tagBg(scheme)))
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                            .fill(active ? FlomoPalette.accent(scheme) : FlomoPalette.tagBg(scheme))
+                                    )
                             }
                             .buttonStyle(.plain)
                         }
@@ -1138,15 +1159,25 @@ struct MainContentView: View {
         .preferredColorScheme((AppThemeMode(rawValue: themeModeRaw) ?? .system).colorScheme)
         .sheet(isPresented: Binding(get: { previewImagePath != nil }, set: { if !$0 { previewImagePath = nil } })) {
             if let path = previewImagePath, let img = NSImage(contentsOfFile: path) {
-                VStack {
+                VStack(spacing: 12) {
                     Image(nsImage: img)
                         .resizable()
                         .scaledToFit()
-                        .frame(maxWidth: 820, maxHeight: 620)
-                        .padding()
-                    Button("关闭") { previewImagePath = nil }
-                        .padding(.bottom, 12)
+                        .frame(minWidth: 420, maxWidth: 960, minHeight: 280, maxHeight: 720)
+                        .padding(.horizontal, 16)
+                        .padding(.top, 16)
+                    HStack(spacing: 14) {
+                        Button("复制图片") {
+                            let pb = NSPasteboard.general
+                            pb.clearContents()
+                            pb.writeObjects([img])
+                        }
+                        Button("关闭") { previewImagePath = nil }
+                            .keyboardShortcut(.cancelAction)
+                    }
+                    .padding(.bottom, 14)
                 }
+                .background(FlomoPalette.canvas(scheme))
             }
         }
         .sheet(isPresented: $showSettingsSheet) {
@@ -1346,6 +1377,45 @@ private struct FlomoTagRow: View {
     }
 }
 
+private struct TagFlowLayout: Layout {
+    var spacing: CGFloat = 6
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        let maxWidth = proposal.width ?? .infinity
+        var x: CGFloat = 0
+        var y: CGFloat = 0
+        var rowHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > 0 && x + size.width > maxWidth {
+                x = 0
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+        return CGSize(width: min(maxWidth, max(x - spacing, 0)), height: y + rowHeight)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        var x = bounds.minX
+        var y = bounds.minY
+        var rowHeight: CGFloat = 0
+        for view in subviews {
+            let size = view.sizeThatFits(.unspecified)
+            if x > bounds.minX && x + size.width > bounds.maxX {
+                x = bounds.minX
+                y += rowHeight + spacing
+                rowHeight = 0
+            }
+            view.place(at: CGPoint(x: x, y: y), proposal: ProposedViewSize(size))
+            x += size.width + spacing
+            rowHeight = max(rowHeight, size.height)
+        }
+    }
+}
+
 private struct FlomoNoteCard: View {
     @Environment(\.colorScheme) private var scheme
     let note: WhimNote
@@ -1357,6 +1427,7 @@ private struct FlomoNoteCard: View {
     let onDelete: () -> Void
 
     @State private var expanded: Bool = false
+    @State private var isHovering: Bool = false
 
     private static let cardTimeFmt: DateFormatter = {
         let f = DateFormatter()
@@ -1380,11 +1451,21 @@ private struct FlomoNoteCard: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             // Meta header row
-            HStack {
+            HStack(spacing: 6) {
                 Text(note.pinned ? "置顶 · \(formattedTime)" : formattedTime)
                     .font(.system(size: 12).monospacedDigit())
                     .foregroundColor(FlomoPalette.textSecondary(scheme))
                 Spacer()
+                if isHovering {
+                    Button(action: onEdit) {
+                        Image(systemName: "pencil")
+                            .font(.system(size: 12))
+                            .foregroundColor(FlomoPalette.textSecondary(scheme))
+                            .frame(width: 24, height: 20)
+                    }
+                    .buttonStyle(.plain)
+                    .help("编辑笔记")
+                }
                 Menu {
                     Button("编辑", action: onEdit)
                     Button(note.pinned ? "取消置顶" : "置顶笔记", action: onPin)
@@ -1406,9 +1487,9 @@ private struct FlomoNoteCard: View {
                 .frame(width: 24)
             }
 
-            // Blue tag pills right below timestamp
+            // Wrapping blue tag pills right below timestamp
             if let tags = note.tags, !tags.isEmpty {
-                HStack(spacing: 6) {
+                TagFlowLayout(spacing: 6) {
                     ForEach(tags, id: \.self) { tag in
                         Button { onTapTag(tag) } label: {
                             Text("#\(tag)")
@@ -1459,7 +1540,7 @@ private struct FlomoNoteCard: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .fill(FlomoPalette.card(scheme))
         )
-        .onTapGesture(count: 2) { onEdit() }
+        .onHover { hovering in isHovering = hovering }
     }
 }
 
@@ -1514,6 +1595,7 @@ struct FloatingQuickCaptureView: View {
     @State private var markdown: String = ""
     @State private var attachments: [WhimAttachment] = []
     @State private var isPinned: Bool = false
+    @State private var selectedTagIndex: Int = 0
 
     private var canSubmit: Bool {
         !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty
@@ -1576,10 +1658,25 @@ struct FloatingQuickCaptureView: View {
                     onTextChange: { md, atts in
                         markdown = md
                         attachments = atts
+                        selectedTagIndex = 0
                     },
                     onFocusChange: { _ in },
                     onSubmit: submit,
-                    onEscape: { if !isPinned { onClose() } }
+                    onEscape: { if !isPinned { onClose() } },
+                    onNavigateSuggestion: { delta in
+                        let items = tagSuggestions
+                        guard !items.isEmpty else { return false }
+                        selectedTagIndex = (selectedTagIndex + delta + items.count) % items.count
+                        return true
+                    },
+                    onAcceptSuggestion: {
+                        let items = tagSuggestions
+                        guard !items.isEmpty else { return false }
+                        let safeIdx = min(max(0, selectedTagIndex), items.count - 1)
+                        editor.replaceActiveTag(with: items[safeIdx])
+                        selectedTagIndex = 0
+                        return true
+                    }
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
@@ -1587,16 +1684,21 @@ struct FloatingQuickCaptureView: View {
             if !tagSuggestions.isEmpty {
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 6) {
-                        ForEach(tagSuggestions, id: \.self) { tag in
+                        ForEach(Array(tagSuggestions.enumerated()), id: \.element) { idx, tag in
+                            let active = idx == min(selectedTagIndex, tagSuggestions.count - 1)
                             Button {
                                 editor.replaceActiveTag(with: tag)
+                                selectedTagIndex = 0
                             } label: {
                                 Text("#\(tag)")
-                                    .font(.system(size: 12))
-                                    .foregroundColor(FlomoPalette.tagText(scheme))
+                                    .font(.system(size: 12, weight: active ? .medium : .regular))
+                                    .foregroundColor(active ? .white : FlomoPalette.tagText(scheme))
                                     .padding(.horizontal, 8)
                                     .padding(.vertical, 3)
-                                    .background(RoundedRectangle(cornerRadius: 5, style: .continuous).fill(FlomoPalette.tagBg(scheme)))
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 5, style: .continuous)
+                                            .fill(active ? FlomoPalette.accent(scheme) : FlomoPalette.tagBg(scheme))
+                                    )
                             }
                             .buttonStyle(.plain)
                         }
@@ -1764,8 +1866,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func toggleQuickCapture() {
-        if let panel = quickPanel, panel.isVisible {
-            panel.orderOut(nil)
+        if let panel = quickPanel {
+            if panel.isVisible {
+                panel.orderOut(nil)
+                return
+            }
+            NSApp.activate(ignoringOtherApps: true)
+            panel.makeKeyAndOrderFront(nil)
             return
         }
         let panel = QuickCapturePanel(vm: vm) { [weak self] in

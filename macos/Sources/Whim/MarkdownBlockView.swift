@@ -1,22 +1,96 @@
 import SwiftUI
 
 /// Lightweight Markdown renderer for Whim note cards:
-/// supports # / ## / ### / #### headings, nested unordered lists (- / *), nested ordered lists (1.),
-/// nested task checkboxes (- [ ] / - [x]), > quotes, **bold**, *italic*, ~~strike~~, `code`, and [links](url).
+/// supports fenced code blocks (```), horizontal rules (---), # / ## / ### / #### headings,
+/// nested unordered lists (- / *), nested ordered lists (1.), nested task checkboxes (- [ ] / - [x]),
+/// > quotes, **bold**, *italic*, ~~strike~~, `code`, and [links](url).
 struct MarkdownBlockView: View {
     @Environment(\.colorScheme) private var scheme
     let text: String
     let collapsed: Bool
 
-    private var lines: [String] {
-        let raw = text.components(separatedBy: "\n")
-        return collapsed ? Array(raw.prefix(6)) : raw
+    private enum Segment: Identifiable {
+        case line(id: Int, text: String)
+        case codeBlock(id: Int, lang: String, code: String)
+
+        var id: Int {
+            switch self {
+            case .line(let id, _): return id
+            case .codeBlock(let id, _, _): return id
+            }
+        }
+    }
+
+    private var segments: [Segment] {
+        let rawLines = text.components(separatedBy: "\n")
+        let effectiveLines = collapsed ? Array(rawLines.prefix(6)) : rawLines
+        var out: [Segment] = []
+        var inCode = false
+        var codeLang = ""
+        var codeBuf: [String] = []
+        var segId = 0
+
+        for line in effectiveLines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            if trimmed.hasPrefix("```") {
+                if !inCode {
+                    inCode = true
+                    codeLang = String(trimmed.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                    codeBuf = []
+                } else {
+                    out.append(.codeBlock(id: segId, lang: codeLang, code: codeBuf.joined(separator: "\n")))
+                    segId += 1
+                    inCode = false
+                    codeLang = ""
+                    codeBuf = []
+                }
+                continue
+            }
+            if inCode {
+                codeBuf.append(line)
+            } else {
+                out.append(.line(id: segId, text: line))
+                segId += 1
+            }
+        }
+        if inCode && !codeBuf.isEmpty {
+            out.append(.codeBlock(id: segId, lang: codeLang, code: codeBuf.joined(separator: "\n")))
+        }
+        return out
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
-            ForEach(Array(lines.enumerated()), id: \.offset) { _, line in
-                renderLine(line)
+            ForEach(segments) { seg in
+                switch seg {
+                case .line(_, let line):
+                    renderLine(line)
+                case .codeBlock(_, let lang, let code):
+                    VStack(alignment: .leading, spacing: 4) {
+                        if !lang.isEmpty {
+                            Text(lang)
+                                .font(.system(size: 10.5, weight: .medium, design: .monospaced))
+                                .foregroundColor(FlomoPalette.textMuted(scheme))
+                        }
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            Text(code)
+                                .font(.system(size: 12.5, design: .monospaced))
+                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .fill(FlomoPalette.canvas(scheme))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 7, style: .continuous)
+                            .stroke(FlomoPalette.border(scheme), lineWidth: 0.8)
+                    )
+                }
             }
         }
         .textSelection(.enabled)
@@ -52,6 +126,11 @@ struct MarkdownBlockView: View {
 
         if trimmed.isEmpty {
             Spacer().frame(height: 4)
+        } else if trimmed == "---" || trimmed == "***" || trimmed == "___" {
+            Rectangle()
+                .fill(FlomoPalette.border(scheme))
+                .frame(height: 1)
+                .padding(.vertical, 4)
         } else if trimmed.hasPrefix("#### ") {
             inlineMarkdownText(String(trimmed.dropFirst(5)), size: 14.5, weight: .semibold)
                 .padding(.top, 2)

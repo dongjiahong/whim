@@ -433,12 +433,25 @@ struct SettingsModalView: View {
 
     // MARK: - MCP & Export
 
+    private var resolvedMCPPath: String {
+        let bundleDir = Bundle.main.bundleURL.deletingLastPathComponent()
+        let sibling = bundleDir.appendingPathComponent("whim-mcp").path
+        if FileManager.default.isExecutableFile(atPath: sibling) {
+            return sibling
+        }
+        let usrLocal = "/usr/local/bin/whim-mcp"
+        if FileManager.default.isExecutableFile(atPath: usrLocal) {
+            return usrLocal
+        }
+        return sibling
+    }
+
     private var mcpTab: some View {
         let mcpSnippet = """
         {
           "mcpServers": {
             "whim": {
-              "command": "/Users/lele/develop/vibe_coding/whim/dist/whim-mcp"
+              "command": "\(resolvedMCPPath)"
             }
           }
         }

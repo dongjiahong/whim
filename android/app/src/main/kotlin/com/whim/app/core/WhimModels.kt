@@ -65,6 +65,8 @@ data class WhimStats(
 data class WhimListFilter(
     val query: String = "",
     @SerialName("tag_prefix") val tagPrefix: String = "",
+    @SerialName("date_from_ms") val dateFromMs: Long = 0,
+    @SerialName("date_to_ms") val dateToMs: Long = 0,
     @SerialName("include_archived") val includeArchived: Boolean = false,
     @SerialName("only_archived") val onlyArchived: Boolean = false,
     val limit: Int = 50,

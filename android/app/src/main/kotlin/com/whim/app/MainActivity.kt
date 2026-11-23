@@ -14,6 +14,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -26,6 +27,7 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
@@ -42,7 +44,11 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Archive
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.ChevronLeft
+import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Menu
 import androidx.compose.material.icons.rounded.MoreHoriz
@@ -65,9 +71,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.lifecycle.Lifecycle
-import androidx.lifecycle.LifecycleEventObserver
-import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -78,6 +81,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
@@ -85,6 +89,11 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import coil.compose.AsyncImage
 import com.whim.app.capture.QuickCaptureActivity
 import com.whim.app.capture.WhimWidgetProvider
@@ -100,6 +109,7 @@ import com.whim.app.ui.theme.WhimThemeProvider
 import com.whim.app.ui.theme.heatmapColor
 import com.whim.app.update.GitHubUpdater
 import com.whim.app.update.ReleaseInfo
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -113,7 +123,46 @@ private sealed class MobileTab {
     data object All : MobileTab()
     data object Review : MobileTab()
     data object Random : MobileTab()
+    data object Archived : MobileTab()
+    data class Day(val dayStr: String) : MobileTab()
     data class Tag(val path: String) : MobileTab()
+}
+
+private val mobileTagStripRegex = Regex(
+    "(^|[\\s(\\[{（【「『，。、；：！？,.;:!?])#([^\\s#,.;:!?，。、；：！？)\\]}）】」』]+)",
+    RegexOption.MULTILINE
+)
+private val mobileBlobRegex = Regex("!\\[[^\\]]*\\]\\(whim://blob/([a-fA-F0-9]{64})\\)")
+private val mobileOrderedListRegex = Regex("^(\\d+)\\. (.*)$")
+private val inlineMdTokenRegex = Regex("(\\*\\*[^*]+\\*\\*|~~[^~]+~~|`[^`]+`|\\*[^*]+\\*)")
+
+private fun dayRangeMs(dayOffsetFromToday: Int): Pair<Long, Long> {
+    val cal = Calendar.getInstance().apply {
+        set(Calendar.HOUR_OF_DAY, 0)
+        set(Calendar.MINUTE, 0)
+        set(Calendar.SECOND, 0)
+        set(Calendar.MILLISECOND, 0)
+        add(Calendar.DAY_OF_YEAR, dayOffsetFromToday)
+    }
+    val start = cal.timeInMillis
+    val end = start + 24L * 3600L * 1000L - 1L
+    return start to end
+}
+
+private fun dayRangeMsFromString(dayStr: String): Pair<Long, Long>? {
+    return runCatching {
+        val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault())
+        val d = fmt.parse(dayStr) ?: return null
+        val cal = Calendar.getInstance().apply {
+            time = d
+            set(Calendar.HOUR_OF_DAY, 0)
+            set(Calendar.MINUTE, 0)
+            set(Calendar.SECOND, 0)
+            set(Calendar.MILLISECOND, 0)
+        }
+        val start = cal.timeInMillis
+        start to (start + 24L * 3600L * 1000L - 1L)
+    }.getOrNull()
 }
 
 class MainActivity : ComponentActivity() {
@@ -155,6 +204,13 @@ class MainActivity : ComponentActivity() {
                     },
                     onOpenQuickCapture = {
                         startActivity(Intent(this, QuickCaptureActivity::class.java))
+                    },
+                    onEditNote = { note ->
+                        val intent = Intent(this, QuickCaptureActivity::class.java).apply {
+                            putExtra(QuickCaptureActivity.EXTRA_EDIT_NOTE_ID, note.id)
+                            putExtra(QuickCaptureActivity.EXTRA_EDIT_CONTENT, note.content)
+                        }
+                        startActivity(intent)
                     }
                 )
             }
@@ -173,7 +229,8 @@ private fun FlomoMobileApp(
     initialReviewMode: Boolean,
     themeMode: String,
     onThemeModeChange: (String) -> Unit,
-    onOpenQuickCapture: () -> Unit
+    onOpenQuickCapture: () -> Unit,
+    onEditNote: (WhimNote) -> Unit
 ) {
     val c = WhimTheme.colors
     val t = WhimTheme.typography
@@ -184,10 +241,15 @@ private fun FlomoMobileApp(
     var previousTopNoteId by remember { mutableStateOf<String?>(null) }
 
     var activeTab by remember { mutableStateOf<MobileTab>(if (initialReviewMode) MobileTab.Review else MobileTab.All) }
+    var reviewOffsetDays by remember { mutableStateOf(0) }
     var searchQuery by remember { mutableStateOf("") }
     var showSearch by remember { mutableStateOf(false) }
     var showSyncCard by remember { mutableStateOf(false) }
     var showAboutCard by remember { mutableStateOf(false) }
+    var previewImagePath by remember { mutableStateOf<String?>(null) }
+    var lastDeletedNoteId by remember { mutableStateOf<String?>(null) }
+    var undoDismissJob by remember { mutableStateOf<Job?>(null) }
+
     var updateStatus by remember { mutableStateOf("当前版本 v${GitHubUpdater.CURRENT_VERSION}，点击检查 GitHub 最新版本") }
     var availableRelease by remember { mutableStateOf<ReleaseInfo?>(null) }
     var checkingUpdate by remember { mutableStateOf(false) }
@@ -208,6 +270,37 @@ private fun FlomoMobileApp(
     var manualAddrInput by remember { mutableStateOf("") }
     var peerStatuses by remember { mutableStateOf<List<com.whim.app.core.WhimPeerSyncStatus>>(emptyList()) }
 
+    fun buildFilterForTab(tab: MobileTab, cursor: WhimNoteCursor?): WhimListFilter? {
+        return when (tab) {
+            MobileTab.All -> WhimListFilter(query = searchQuery, limit = pageSize, cursor = cursor)
+            MobileTab.Archived -> WhimListFilter(query = searchQuery, onlyArchived = true, limit = pageSize, cursor = cursor)
+            MobileTab.Review -> {
+                val (fromMs, toMs) = dayRangeMs(reviewOffsetDays)
+                WhimListFilter(
+                    query = searchQuery,
+                    dateFromMs = fromMs,
+                    dateToMs = toMs,
+                    includeArchived = true,
+                    limit = pageSize,
+                    cursor = cursor
+                )
+            }
+            is MobileTab.Day -> {
+                val range = dayRangeMsFromString(tab.dayStr) ?: return null
+                WhimListFilter(
+                    query = searchQuery,
+                    dateFromMs = range.first,
+                    dateToMs = range.second,
+                    includeArchived = true,
+                    limit = pageSize,
+                    cursor = cursor
+                )
+            }
+            is MobileTab.Tag -> WhimListFilter(query = searchQuery, tagPrefix = tab.path, limit = pageSize, cursor = cursor)
+            MobileTab.Random -> null
+        }
+    }
+
     suspend fun refreshMetadata() {
         runCatching {
             stats = WhimCoreBridge.getStats(90)
@@ -225,39 +318,25 @@ private fun FlomoMobileApp(
         hasMore = false
         isLoadingMore = false
         runCatching {
-            when (val tab = activeTab) {
-                MobileTab.All -> {
-                    val page = WhimCoreBridge.listNotesPage(WhimListFilter(query = searchQuery, limit = pageSize))
-                    if (filterGen == gen) {
-                        displayedNotes = page.notes
-                        hasMore = page.hasMore
-                        nextCursor = page.nextCursor
-                    }
+            val tab = activeTab
+            if (tab == MobileTab.Random) {
+                val rnd = WhimCoreBridge.listRandomNotes(query = searchQuery, limit = 12)
+                if (filterGen == gen) {
+                    displayedNotes = rnd
+                    hasMore = false
+                    nextCursor = null
                 }
-                MobileTab.Review -> {
-                    val today = WhimCoreBridge.listTodayNotes()
-                    val filtered = if (searchQuery.isEmpty()) today else today.filter { it.content.contains(searchQuery, ignoreCase = true) }
-                    if (filterGen == gen) {
-                        displayedNotes = filtered
-                        hasMore = false
-                        nextCursor = null
-                    }
+            } else {
+                val filter = buildFilterForTab(tab, null)
+                if (filter == null) {
+                    if (filterGen == gen) displayedNotes = emptyList()
+                    return@runCatching
                 }
-                MobileTab.Random -> {
-                    val rnd = WhimCoreBridge.listRandomNotes(query = searchQuery, limit = 12)
-                    if (filterGen == gen) {
-                        displayedNotes = rnd
-                        hasMore = false
-                        nextCursor = null
-                    }
-                }
-                is MobileTab.Tag -> {
-                    val page = WhimCoreBridge.listNotesPage(WhimListFilter(query = searchQuery, tagPrefix = tab.path, limit = pageSize))
-                    if (filterGen == gen) {
-                        displayedNotes = page.notes
-                        hasMore = page.hasMore
-                        nextCursor = page.nextCursor
-                    }
+                val page = WhimCoreBridge.listNotesPage(filter)
+                if (filterGen == gen) {
+                    displayedNotes = page.notes
+                    hasMore = page.hasMore
+                    nextCursor = page.nextCursor
                 }
             }
         }
@@ -266,17 +345,11 @@ private fun FlomoMobileApp(
     fun loadMore() {
         val cursor = nextCursor ?: return
         if (!hasMore || isLoadingMore) return
-        val tab = activeTab
-        if (tab == MobileTab.Review || tab == MobileTab.Random) return
+        val filter = buildFilterForTab(activeTab, cursor) ?: return
         isLoadingMore = true
         val gen = filterGen
         scope.launch {
             runCatching {
-                val filter = when (tab) {
-                    MobileTab.All -> WhimListFilter(query = searchQuery, limit = pageSize, cursor = cursor)
-                    is MobileTab.Tag -> WhimListFilter(query = searchQuery, tagPrefix = tab.path, limit = pageSize, cursor = cursor)
-                    else -> return@launch
-                }
                 val page = WhimCoreBridge.listNotesPage(filter)
                 if (filterGen == gen) {
                     val existing = displayedNotes.map { it.id }.toHashSet()
@@ -314,7 +387,7 @@ private fun FlomoMobileApp(
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
-    LaunchedEffect(activeTab, searchQuery, randomSeed) {
+    LaunchedEffect(activeTab, reviewOffsetDays, searchQuery, randomSeed) {
         if (searchQuery.isNotEmpty()) {
             delay(180L)
         }
@@ -344,13 +417,14 @@ private fun FlomoMobileApp(
                         WhimWidgetProvider.refreshAll(context)
                     }
                 }
-                // Block on SSE push stream until Mac broadcasts `event: changed` (or 15s keepalive fallback)
                 WhimCoreBridge.waitForChange(timeoutSec = 15)
             } else {
                 delay(2000L)
             }
         }
     }
+
+    val selectedHeatmapDay = (activeTab as? MobileTab.Day)?.dayStr
 
     ModalNavigationDrawer(
         drawerState = drawerState,
@@ -366,7 +440,6 @@ private fun FlomoMobileApp(
                         .statusBarsPadding()
                         .padding(horizontal = 18.dp, vertical = 14.dp)
                 ) {
-                    // Header: Whim + LOCAL pill
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                         Text("Whim", style = t.title, color = c.textPrimary)
                         Box(
@@ -381,7 +454,6 @@ private fun FlomoMobileApp(
 
                     Spacer(Modifier.height(16.dp))
 
-                    // 3-Column Stats (笔记 / 标签 / 天)
                     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
                         StatBlock("${stats.totalNotes}", "笔记")
                         StatBlock("${stats.totalTags}", "标签")
@@ -391,12 +463,17 @@ private fun FlomoMobileApp(
 
                     Spacer(Modifier.height(14.dp))
 
-                    // 12-week Activity Heatmap
-                    MobileHeatmap(dailyCounts = stats.dailyCounts)
+                    MobileHeatmap(
+                        dailyCounts = stats.dailyCounts,
+                        selectedDay = selectedHeatmapDay,
+                        onSelectDay = { dayStr ->
+                            activeTab = MobileTab.Day(dayStr)
+                            scope.launch { drawerState.close() }
+                        }
+                    )
 
                     Spacer(Modifier.height(16.dp))
 
-                    // Primary Flomo Navigation Pills
                     DrawerNavRow(Icons.Rounded.GridView, "全部笔记", activeTab == MobileTab.All) {
                         activeTab = MobileTab.All
                         scope.launch { drawerState.close() }
@@ -407,6 +484,10 @@ private fun FlomoMobileApp(
                     }
                     DrawerNavRow(Icons.Rounded.Shuffle, "随机漫步", activeTab == MobileTab.Random) {
                         activeTab = MobileTab.Random
+                        scope.launch { drawerState.close() }
+                    }
+                    DrawerNavRow(Icons.Rounded.Archive, "已归档", activeTab == MobileTab.Archived) {
+                        activeTab = MobileTab.Archived
                         scope.launch { drawerState.close() }
                     }
                     DrawerNavRow(Icons.Rounded.Sync, "连到 Mac · ${if (pairCode.length == 6) "已配对" else "未配对"}", false) {
@@ -455,7 +536,7 @@ private fun FlomoMobileApp(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                         Icon(
                             Icons.Rounded.Menu,
                             contentDescription = "菜单",
@@ -469,6 +550,8 @@ private fun FlomoMobileApp(
                                 MobileTab.All -> "全部笔记"
                                 MobileTab.Review -> "每日回顾"
                                 MobileTab.Random -> "随机漫步"
+                                MobileTab.Archived -> "已归档"
+                                is MobileTab.Day -> "日期 · ${tab.dayStr}"
                                 is MobileTab.Tag -> "#${tab.path}"
                             },
                             style = t.title,
@@ -476,6 +559,14 @@ private fun FlomoMobileApp(
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
+                        if (activeTab is MobileTab.Day) {
+                            Text(
+                                "清除",
+                                style = t.meta,
+                                color = c.tagText,
+                                modifier = Modifier.clickable { activeTab = MobileTab.All }
+                            )
+                        }
                     }
 
                     Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -530,17 +621,26 @@ private fun FlomoMobileApp(
                             singleLine = true,
                             textStyle = t.body.copy(color = c.textPrimary),
                             cursorBrush = SolidColor(c.accent),
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier.weight(1f),
                             decorationBox = { inner ->
                                 if (searchQuery.isEmpty()) Text("搜索笔记或 #标签...", style = t.body, color = c.textMuted)
                                 inner()
                             }
                         )
+                        if (searchQuery.isNotEmpty()) {
+                            Icon(
+                                Icons.Rounded.Close,
+                                contentDescription = "清空",
+                                tint = c.textMuted,
+                                modifier = Modifier
+                                    .size(16.dp)
+                                    .clickable { searchQuery = "" }
+                            )
+                        }
                     }
                 }
 
                 if (showSyncCard) {
-                    // Mirror Navigator PhoneHome LinkSheet: phone does NOT generate a code; it enters Mac's 6-digit code.
                     Column(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -737,6 +837,54 @@ private fun FlomoMobileApp(
                     }
                 }
 
+                if (activeTab == MobileTab.Review) {
+                    val reviewLabel = remember(reviewOffsetDays) {
+                        val (startMs, _) = dayRangeMs(reviewOffsetDays)
+                        val ds = SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()).format(Date(startMs))
+                        if (reviewOffsetDays == 0) "$ds · 今天" else ds
+                    }
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(c.card)
+                            .padding(horizontal = 12.dp, vertical = 8.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Icon(
+                                Icons.Rounded.ChevronLeft,
+                                contentDescription = "前一天",
+                                tint = c.textPrimary,
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .clickable { reviewOffsetDays -= 1 }
+                            )
+                            Text(reviewLabel, style = t.body, color = c.textPrimary, fontWeight = FontWeight.Medium)
+                            Icon(
+                                Icons.Rounded.ChevronRight,
+                                contentDescription = "后一天",
+                                tint = if (reviewOffsetDays < 0) c.textPrimary else c.textMuted,
+                                modifier = Modifier
+                                    .size(24.dp)
+                                    .clickable(enabled = reviewOffsetDays < 0) { reviewOffsetDays += 1 }
+                            )
+                        }
+                        if (reviewOffsetDays < 0) {
+                            Text(
+                                "回到今天",
+                                style = t.meta,
+                                color = c.tagText,
+                                modifier = Modifier.clickable { reviewOffsetDays = 0 }
+                            )
+                        } else {
+                            Text("共 ${displayedNotes.size} 条", style = t.meta, color = c.textSecondary)
+                        }
+                    }
+                }
+
                 if (activeTab == MobileTab.Random) {
                     Row(
                         modifier = Modifier
@@ -802,9 +950,19 @@ private fun FlomoMobileApp(
                             FlomoMobileNoteCard(
                                 note = note,
                                 onTapTag = { path -> activeTab = MobileTab.Tag(path) },
+                                onTapImage = { path -> previewImagePath = path },
+                                onEdit = { onEditNote(note) },
                                 onTogglePin = {
                                     scope.launch {
                                         WhimCoreBridge.updateNote(note.id, pinned = !note.pinned)
+                                        reload()
+                                        runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
+                                        SyncWorker.enqueueImmediate(context)
+                                    }
+                                },
+                                onToggleArchive = {
+                                    scope.launch {
+                                        WhimCoreBridge.updateNote(note.id, archived = !note.archived)
                                         reload()
                                         runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
                                         SyncWorker.enqueueImmediate(context)
@@ -818,6 +976,12 @@ private fun FlomoMobileApp(
                                     scope.launch {
                                         WhimCoreBridge.updateNote(note.id, deleted = true)
                                         reload()
+                                        lastDeletedNoteId = note.id
+                                        undoDismissJob?.cancel()
+                                        undoDismissJob = scope.launch {
+                                            delay(6000L)
+                                            lastDeletedNoteId = null
+                                        }
                                         runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
                                         SyncWorker.enqueueImmediate(context)
                                     }
@@ -847,6 +1011,39 @@ private fun FlomoMobileApp(
                 }
             }
 
+            // 6-second Undo Delete Snackbar
+            lastDeletedNoteId?.let { deletedId ->
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 32.dp)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(c.card)
+                        .border(1.dp, c.border, RoundedCornerShape(10.dp))
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("已删除一条笔记", style = t.body, color = c.textPrimary)
+                    Text(
+                        "撤销",
+                        style = t.body,
+                        color = c.accent,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.clickable {
+                            undoDismissJob?.cancel()
+                            lastDeletedNoteId = null
+                            scope.launch {
+                                WhimCoreBridge.updateNote(deletedId, deleted = false)
+                                reload()
+                                runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
+                                SyncWorker.enqueueImmediate(context)
+                            }
+                        }
+                    )
+                }
+            }
+
             // Sage-green floating capture button (flomo mobile style)
             Box(
                 modifier = Modifier
@@ -859,6 +1056,44 @@ private fun FlomoMobileApp(
                 contentAlignment = Alignment.Center
             ) {
                 Icon(Icons.Rounded.Add, contentDescription = "新建笔记", tint = Color.White, modifier = Modifier.size(26.dp))
+            }
+        }
+    }
+
+    // Full-screen Image Lightbox Dialog
+    previewImagePath?.let { path ->
+        Dialog(
+            onDismissRequest = { previewImagePath = null },
+            properties = DialogProperties(usePlatformDefaultWidth = false)
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color(0xE6000000))
+                    .clickable { previewImagePath = null },
+                contentAlignment = Alignment.Center
+            ) {
+                AsyncImage(
+                    model = File(path),
+                    contentDescription = "图片大图预览",
+                    contentScale = ContentScale.Fit,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp)
+                )
+                Box(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .statusBarsPadding()
+                        .padding(16.dp)
+                        .size(36.dp)
+                        .clip(CircleShape)
+                        .background(Color(0x88000000))
+                        .clickable { previewImagePath = null },
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(Icons.Rounded.Close, contentDescription = "关闭", tint = Color.White, modifier = Modifier.size(20.dp))
+                }
             }
         }
     }
@@ -875,7 +1110,11 @@ private fun StatBlock(value: String, label: String) {
 }
 
 @Composable
-private fun MobileHeatmap(dailyCounts: Map<String, Int>) {
+private fun MobileHeatmap(
+    dailyCounts: Map<String, Int>,
+    selectedDay: String?,
+    onSelectDay: (String) -> Unit
+) {
     val c = WhimTheme.colors
     val dayFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()) }
     val todayKey = remember { dayFmt.format(Date()) }
@@ -899,15 +1138,20 @@ private fun MobileHeatmap(dailyCounts: Map<String, Int>) {
                 col.forEach { key ->
                     val cnt = dailyCounts[key] ?: 0
                     val isToday = key == todayKey
+                    val isSelected = key == selectedDay
                     Box(
                         modifier = Modifier
                             .size(14.dp)
                             .clip(RoundedCornerShape(3.dp))
                             .background(c.heatmapColor(cnt))
                             .then(
-                                if (isToday) Modifier.border(1.dp, c.textSecondary, RoundedCornerShape(3.dp))
-                                else Modifier
+                                when {
+                                    isSelected -> Modifier.border(1.5.dp, c.tagText, RoundedCornerShape(3.dp))
+                                    isToday -> Modifier.border(1.dp, c.textSecondary, RoundedCornerShape(3.dp))
+                                    else -> Modifier
+                                }
                             )
+                            .clickable { onSelectDay(key) }
                     )
                 }
             }
@@ -978,7 +1222,10 @@ private fun DrawerTagTree(
 private fun FlomoMobileNoteCard(
     note: WhimNote,
     onTapTag: (String) -> Unit,
+    onTapImage: (String) -> Unit,
+    onEdit: () -> Unit,
     onTogglePin: () -> Unit,
+    onToggleArchive: () -> Unit,
     onCopy: () -> Unit,
     onDelete: () -> Unit
 ) {
@@ -1000,7 +1247,6 @@ private fun FlomoMobileNoteCard(
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(9.dp)
     ) {
-        // Header: 置顶 · YYYY-MM-DD HH:mm + ···
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -1022,8 +1268,16 @@ private fun FlomoMobileNoteCard(
                 )
                 DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
                     DropdownMenuItem(
+                        text = { Text("编辑") },
+                        onClick = { menuExpanded = false; onEdit() }
+                    )
+                    DropdownMenuItem(
                         text = { Text(if (note.pinned) "取消置顶" else "置顶") },
                         onClick = { menuExpanded = false; onTogglePin() }
+                    )
+                    DropdownMenuItem(
+                        text = { Text(if (note.archived) "取消归档" else "归档") },
+                        onClick = { menuExpanded = false; onToggleArchive() }
                     )
                     DropdownMenuItem(
                         text = { Text("复制内容") },
@@ -1037,7 +1291,6 @@ private fun FlomoMobileNoteCard(
             }
         }
 
-        // Cool blue tag pills right below timestamp
         if (note.tags.isNotEmpty()) {
             FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(6.dp),
@@ -1057,17 +1310,12 @@ private fun FlomoMobileNoteCard(
             }
         }
 
-        // Interleaved inline Text + Image blocks (strip #tags already shown as top pills, preserve leading indent!)
         val displayBody = remember(note.content, note.tags) {
             val tagSet = note.tags.map { it.trim() }.toSet()
             val stripped = if (tagSet.isEmpty()) {
                 note.content
             } else {
-                val tagPattern = Regex(
-                    "(^|[\\s(\\[{（【「『，。、；：！？,.;:!?])#([^\\s#,.;:!?，。；：！？)\\]}）】」』]+)",
-                    RegexOption.MULTILINE
-                )
-                tagPattern.replace(note.content) { m ->
+                mobileTagStripRegex.replace(note.content) { m ->
                     val rawTag = m.groupValues[2]
                     val normalized = rawTag.split("/")
                         .map { it.trim() }
@@ -1082,9 +1330,8 @@ private fun FlomoMobileNoteCard(
                 .dropLastWhile { it.isEmpty() }
                 .joinToString("\n")
         }
-        val blobRegex = remember { Regex("!\\[[^\\]]*\\]\\(whim://blob/([a-fA-F0-9]{64})\\)") }
         val pathByHash = remember(note.attachments) { note.attachments.associate { it.sha256 to it.localPath } }
-        val matches = remember(displayBody) { blobRegex.findAll(displayBody).toList() }
+        val matches = remember(displayBody) { mobileBlobRegex.findAll(displayBody).toList() }
         var cursor = 0
         val referenced = mutableSetOf<String>()
 
@@ -1102,11 +1349,12 @@ private fun FlomoMobileNoteCard(
                 AsyncImage(
                     model = File(path),
                     contentDescription = "内联图片",
-                    contentScale = ContentScale.Crop,
+                    contentScale = ContentScale.FillWidth,
                     modifier = Modifier
                         .fillMaxWidth()
-                        .height(180.dp)
+                        .heightIn(max = 280.dp)
                         .clip(RoundedCornerShape(8.dp))
+                        .clickable { onTapImage(path) }
                 )
             }
             cursor = m.range.last + 1
@@ -1127,7 +1375,6 @@ private fun FlomoMobileNoteCard(
             )
         }
 
-        // Legacy fallback for any attachment not inline-referenced
         val trailing = note.attachments.filter { it.sha256 !in referenced && it.localPath.isNotEmpty() }
         if (trailing.isNotEmpty()) {
             LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1139,6 +1386,7 @@ private fun FlomoMobileNoteCard(
                         modifier = Modifier
                             .size(104.dp)
                             .clip(RoundedCornerShape(8.dp))
+                            .clickable { onTapImage(att.localPath) }
                     )
                 }
             }
@@ -1146,100 +1394,160 @@ private fun FlomoMobileNoteCard(
     }
 }
 
+private sealed class MobileMdSegment {
+    data class Line(val text: String) : MobileMdSegment()
+    data class CodeBlock(val lang: String, val code: String) : MobileMdSegment()
+}
+
 @Composable
 private fun MobileMarkdownBlock(text: String, collapsed: Boolean) {
     val c = WhimTheme.colors
     val t = WhimTheme.typography
-    val lines = remember(text, collapsed) {
+    val segments = remember(text, collapsed) {
         val raw = text.lines()
-        if (collapsed) raw.take(6) else raw
+        val effective = if (collapsed) raw.take(6) else raw
+        val out = mutableListOf<MobileMdSegment>()
+        var inCode = false
+        var codeLang = ""
+        val buf = mutableListOf<String>()
+        for (line in effective) {
+            val trimmed = line.trim()
+            if (trimmed.startsWith("```")) {
+                if (!inCode) {
+                    inCode = true
+                    codeLang = trimmed.drop(3).trim()
+                    buf.clear()
+                } else {
+                    out.add(MobileMdSegment.CodeBlock(codeLang, buf.joinToString("\n")))
+                    inCode = false
+                    codeLang = ""
+                    buf.clear()
+                }
+                continue
+            }
+            if (inCode) buf.add(line) else out.add(MobileMdSegment.Line(line))
+        }
+        if (inCode && buf.isNotEmpty()) {
+            out.add(MobileMdSegment.CodeBlock(codeLang, buf.joinToString("\n")))
+        }
+        out
     }
-    val orderedRegex = remember { Regex("^(\\d+)\\. (.*)$") }
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        lines.forEach { line ->
-            var spaces = 0
-            for (ch in line) {
-                if (ch == ' ') spaces++ else if (ch == '\t') spaces += 2 else break
-            }
-            val level = (spaces / 2).coerceAtMost(6)
-            val indentDp = (level * 18).dp
-            val trimmed = line.trim()
-            val bulletGlyph = when (level % 3) {
-                0 -> "•"
-                1 -> "◦"
-                else -> "▪"
-            }
-
-            when {
-                trimmed.isEmpty() -> Spacer(Modifier.height(4.dp))
-                trimmed.startsWith("#### ") -> Text(
-                    text = parseInlineMarkdown(trimmed.drop(5), c.tagBg, c.tagText),
-                    style = t.body.copy(fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold),
-                    color = c.textPrimary
-                )
-                trimmed.startsWith("### ") -> Text(
-                    text = parseInlineMarkdown(trimmed.drop(4), c.tagBg, c.tagText),
-                    style = t.body.copy(fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold),
-                    color = c.textPrimary
-                )
-                trimmed.startsWith("## ") -> Text(
-                    text = parseInlineMarkdown(trimmed.drop(3), c.tagBg, c.tagText),
-                    style = t.body.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold),
-                    color = c.textPrimary
-                )
-                trimmed.startsWith("# ") -> Text(
-                    text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText),
-                    style = t.body.copy(fontSize = 18.5.sp, fontWeight = FontWeight.Bold),
-                    color = c.textPrimary
-                )
-                trimmed.startsWith("- [ ] ") || trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ") -> {
-                    val done = !trimmed.startsWith("- [ ] ")
-                    Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text(if (done) "☑" else "☐", style = t.body, color = if (done) c.accent else c.textMuted)
+        segments.forEach { seg ->
+            when (seg) {
+                is MobileMdSegment.CodeBlock -> {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(7.dp))
+                            .background(c.canvas)
+                            .border(0.8.dp, c.border, RoundedCornerShape(7.dp))
+                            .padding(horizontal = 10.dp, vertical = 8.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        if (seg.lang.isNotEmpty()) {
+                            Text(seg.lang, fontSize = 11.sp, fontFamily = FontFamily.Monospace, color = c.textMuted)
+                        }
                         Text(
-                            text = parseInlineMarkdown(trimmed.drop(6), c.tagBg, c.tagText),
-                            style = t.body.copy(textDecoration = if (done) TextDecoration.LineThrough else TextDecoration.None),
-                            color = if (done) c.textSecondary else c.textPrimary
+                            text = seg.code,
+                            fontSize = 12.5.sp,
+                            fontFamily = FontFamily.Monospace,
+                            color = c.textPrimary,
+                            modifier = Modifier.horizontalScroll(rememberScrollState())
                         )
                     }
                 }
-                trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
-                    Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
-                        Text(bulletGlyph, style = t.body.copy(fontWeight = FontWeight.Bold), color = c.textSecondary)
-                        Text(text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText), style = t.body, color = c.textPrimary)
+                is MobileMdSegment.Line -> {
+                    val line = seg.text
+                    var spaces = 0
+                    for (ch in line) {
+                        if (ch == ' ') spaces++ else if (ch == '\t') spaces += 2 else break
+                    }
+                    val level = (spaces / 2).coerceAtMost(6)
+                    val indentDp = (level * 18).dp
+                    val trimmed = line.trim()
+                    val bulletGlyph = when (level % 3) {
+                        0 -> "•"
+                        1 -> "◦"
+                        else -> "▪"
+                    }
+
+                    when {
+                        trimmed.isEmpty() -> Spacer(Modifier.height(4.dp))
+                        trimmed == "---" || trimmed == "***" || trimmed == "___" -> Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp)
+                                .height(1.dp)
+                                .background(c.border)
+                        )
+                        trimmed.startsWith("#### ") -> Text(
+                            text = parseInlineMarkdown(trimmed.drop(5), c.tagBg, c.tagText),
+                            style = t.body.copy(fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold),
+                            color = c.textPrimary
+                        )
+                        trimmed.startsWith("### ") -> Text(
+                            text = parseInlineMarkdown(trimmed.drop(4), c.tagBg, c.tagText),
+                            style = t.body.copy(fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold),
+                            color = c.textPrimary
+                        )
+                        trimmed.startsWith("## ") -> Text(
+                            text = parseInlineMarkdown(trimmed.drop(3), c.tagBg, c.tagText),
+                            style = t.body.copy(fontSize = 17.sp, fontWeight = FontWeight.Bold),
+                            color = c.textPrimary
+                        )
+                        trimmed.startsWith("# ") -> Text(
+                            text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText),
+                            style = t.body.copy(fontSize = 18.5.sp, fontWeight = FontWeight.Bold),
+                            color = c.textPrimary
+                        )
+                        trimmed.startsWith("- [ ] ") || trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ") -> {
+                            val done = !trimmed.startsWith("- [ ] ")
+                            Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text(if (done) "☑" else "☐", style = t.body, color = if (done) c.accent else c.textMuted)
+                                Text(
+                                    text = parseInlineMarkdown(trimmed.drop(6), c.tagBg, c.tagText),
+                                    style = t.body.copy(textDecoration = if (done) TextDecoration.LineThrough else TextDecoration.None),
+                                    color = if (done) c.textSecondary else c.textPrimary
+                                )
+                            }
+                        }
+                        trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
+                            Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(7.dp)) {
+                                Text(bulletGlyph, style = t.body.copy(fontWeight = FontWeight.Bold), color = c.textSecondary)
+                                Text(text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText), style = t.body, color = c.textPrimary)
+                            }
+                        }
+                        mobileOrderedListRegex.matches(trimmed) -> {
+                            val m = mobileOrderedListRegex.matchEntire(trimmed)!!
+                            Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                Text("${m.groupValues[1]}.", style = t.body, color = c.textSecondary)
+                                Text(text = parseInlineMarkdown(m.groupValues[2], c.tagBg, c.tagText), style = t.body, color = c.textPrimary)
+                            }
+                        }
+                        trimmed.startsWith("> ") -> {
+                            Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Box(modifier = Modifier.width(3.dp).height(18.dp).clip(RoundedCornerShape(2.dp)).background(c.accent.copy(alpha = 0.75f)))
+                                Text(text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText), style = t.body, color = c.textSecondary)
+                            }
+                        }
+                        else -> Text(
+                            text = parseInlineMarkdown(trimmed, c.tagBg, c.tagText),
+                            style = t.body,
+                            color = c.textPrimary,
+                            modifier = Modifier.padding(start = indentDp)
+                        )
                     }
                 }
-                orderedRegex.matches(trimmed) -> {
-                    val m = orderedRegex.matchEntire(trimmed)!!
-                    Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                        Text("${m.groupValues[1]}.", style = t.body, color = c.textSecondary)
-                        Text(text = parseInlineMarkdown(m.groupValues[2], c.tagBg, c.tagText), style = t.body, color = c.textPrimary)
-                    }
-                }
-                trimmed.startsWith("> ") -> {
-                    Row(modifier = Modifier.padding(start = indentDp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Box(modifier = Modifier.width(3.dp).height(18.dp).clip(RoundedCornerShape(2.dp)).background(c.accent.copy(alpha = 0.75f)))
-                        Text(text = parseInlineMarkdown(trimmed.drop(2), c.tagBg, c.tagText), style = t.body, color = c.textSecondary)
-                    }
-                }
-                else -> Text(
-                    text = parseInlineMarkdown(trimmed, c.tagBg, c.tagText),
-                    style = t.body,
-                    color = c.textPrimary,
-                    modifier = Modifier.padding(start = indentDp)
-                )
             }
         }
     }
 }
 
-private val inlineMdTokenRegex = Regex("(\\*\\*[^*]+\\*\\*|~~[^~]+~~|`[^`]+`|\\*[^*]+\\*)")
-
 private fun parseInlineMarkdown(raw: String, codeBg: Color, codeFg: Color) = buildAnnotatedString {
-    val tokenRegex = inlineMdTokenRegex
     var idx = 0
-    for (m in tokenRegex.findAll(raw)) {
+    for (m in inlineMdTokenRegex.findAll(raw)) {
         if (m.range.first > idx) append(raw.substring(idx, m.range.first))
         val tok = m.value
         when {

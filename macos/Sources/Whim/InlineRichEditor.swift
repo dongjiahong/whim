@@ -209,6 +209,8 @@ final class WhimNSTextView: NSTextView {
     var onInsertBlob: ((WhimAttachment) -> Void)?
     var onContentChanged: (() -> Void)?
     var onFocusChanged: ((Bool) -> Void)?
+    var onNavigateSuggestion: ((Int) -> Bool)?
+    var onAcceptSuggestion: (() -> Bool)?
 
     override func becomeFirstResponder() -> Bool {
         let ok = super.becomeFirstResponder()
@@ -233,16 +235,29 @@ final class WhimNSTextView: NSTextView {
             onEscape?()
             return
         }
-        // Tab / Shift+Tab: indent or outdent current list line for multi-level lists
+        // Up / Down arrows navigate tag autocomplete suggestions when visible
+        if !hasMarkedText() && (event.keyCode == 126 || event.keyCode == 125) {
+            let delta = event.keyCode == 126 ? -1 : 1
+            if onNavigateSuggestion?(delta) == true {
+                return
+            }
+        }
+        // Tab: accept tag suggestion first, else indent/outdent list
         if event.keyCode == 48 && !hasMarkedText() {
             let isShift = event.modifierFlags.contains(.shift)
+            if !isShift, onAcceptSuggestion?() == true {
+                return
+            }
             if handleListIndent(outdent: isShift) {
                 return
             }
         }
-        // Plain Return: smart Markdown list continuation (- , 1. , - [ ] )
+        // Plain Return: accept tag suggestion first, else smart Markdown list continuation
         let mods = event.modifierFlags.intersection([.command, .option, .control, .shift])
         if mods.isEmpty && (event.keyCode == 36 || event.keyCode == 76) && !hasMarkedText() {
+            if onAcceptSuggestion?() == true {
+                return
+            }
             if handleSmartListReturn() {
                 return
             }
@@ -606,6 +621,8 @@ struct InlineRichEditor: NSViewRepresentable {
     var onFocusChange: (Bool) -> Void
     var onSubmit: () -> Void
     var onEscape: () -> Void
+    var onNavigateSuggestion: ((Int) -> Bool)? = nil
+    var onAcceptSuggestion: (() -> Bool)? = nil
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -636,6 +653,8 @@ struct InlineRichEditor: NSViewRepresentable {
         tv.onCommandReturn = onSubmit
         tv.onEscape = onEscape
         tv.onFocusChanged = onFocusChange
+        tv.onNavigateSuggestion = onNavigateSuggestion
+        tv.onAcceptSuggestion = onAcceptSuggestion
         tv.onContentChanged = { [weak tv] in
             guard let tv else { return }
             let (md, atts) = tv.serializeMarkdown()
@@ -664,6 +683,8 @@ struct InlineRichEditor: NSViewRepresentable {
             tv.applyTheme(isDark: isDark)
             tv.onCommandReturn = onSubmit
             tv.onEscape = onEscape
+            tv.onNavigateSuggestion = onNavigateSuggestion
+            tv.onAcceptSuggestion = onAcceptSuggestion
         }
     }
 

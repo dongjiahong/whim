@@ -191,4 +191,41 @@ func TestPaginationStatsRandomAndBatchExport(t *testing.T) {
 	if res.NotesExported != totalActive {
 		t.Fatalf("expected %d exported notes, got %d", totalActive, res.NotesExported)
 	}
+
+	// Verify ListChangesSincePaged traverses all 567 notes (active + archived + deleted) across batches of 200
+	syncSeen := make(map[string]bool)
+	var sinceMs int64
+	afterID := ""
+	batches := 0
+	for {
+		batchNotes, _, nextSince, nextAfterID, hasMore, err := st.ListChangesSincePaged(sinceMs, afterID, 200)
+		if err != nil {
+			t.Fatalf("sync batch %d: %v", batches, err)
+		}
+		batches++
+		for _, n := range batchNotes {
+			if syncSeen[n.ID] {
+				t.Fatalf("duplicate note %s in sync batch", n.ID)
+			}
+			syncSeen[n.ID] = true
+		}
+		if !hasMore {
+			break
+		}
+		sinceMs = nextSince
+		afterID = nextAfterID
+	}
+	if len(syncSeen) != totalActive+5+2 || batches < 3 {
+		t.Fatalf("expected %d synced notes across >=3 batches, got %d in %d batches", totalActive+7, len(syncSeen), batches)
+	}
+
+	// Verify both >=3-char (FTS5 trigram) and 2-char (LIKE) Chinese substring searches work
+	hits3, err := st.ListNotes(model.ListFilter{Query: "笔记内容", Limit: 20})
+	if err != nil || len(hits3) != 20 {
+		t.Fatalf("expected 20 trigram hits for '笔记内容', got %d (%v)", len(hits3), err)
+	}
+	hits2, err := st.ListNotes(model.ListFilter{Query: "偶数", Limit: 20})
+	if err != nil || len(hits2) != 20 {
+		t.Fatalf("expected 20 short-query hits for '偶数', got %d (%v)", len(hits2), err)
+	}
 }

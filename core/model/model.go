@@ -129,6 +129,9 @@ type SyncExchangeRequest struct {
 	PeerID      string       `json:"peer_id"`
 	DisplayName string       `json:"display_name"`
 	Since       int64        `json:"since"`
+	AfterID     string       `json:"after_id,omitempty"`
+	BatchLimit  int          `json:"batch_limit,omitempty"`
+	SkipPull    bool         `json:"skip_pull,omitempty"`
 	Notes       []Note       `json:"notes"`
 	Attachments []Attachment `json:"attachments"`
 	HaveBlobs   []string     `json:"have_blobs,omitempty"`
@@ -142,6 +145,9 @@ type SyncExchangeResponse struct {
 	Notes       []Note       `json:"notes"`
 	Attachments []Attachment `json:"attachments"`
 	WantBlobs   []string     `json:"want_blobs,omitempty"`
+	HasMore     bool         `json:"has_more,omitempty"`
+	NextSince   int64        `json:"next_since,omitempty"`
+	NextAfterID string       `json:"next_after_id,omitempty"`
 }
 
 // PeerSyncStatus reports the latest sync outcome for one discovered LAN peer.

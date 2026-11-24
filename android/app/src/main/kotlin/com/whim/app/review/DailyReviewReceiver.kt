@@ -23,7 +23,8 @@ import com.whim.app.core.WhimCoreBridge
 class DailyReviewReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
-            Intent.ACTION_BOOT_COMPLETED -> {
+            Intent.ACTION_BOOT_COMPLETED,
+            android.app.AlarmManager.ACTION_SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED -> {
                 DailyReviewScheduler.scheduleNext(context)
                 return
             }
@@ -51,7 +52,7 @@ class DailyReviewReceiver : BroadcastReceiver() {
     }
 
     companion object {
-        private const val CHANNEL_ID = "whim_daily_review"
+        private const val CHANNEL_ID = "whim_daily_review_v2"
         private const val NOTIF_ID = 2049
         private const val REQ_OPEN = 2049
         private const val REQ_SNOOZE_ACTION = 2051
@@ -72,9 +73,10 @@ class DailyReviewReceiver : BroadcastReceiver() {
                 val channel = NotificationChannel(
                     CHANNEL_ID,
                     "每日复盘提醒",
-                    NotificationManager.IMPORTANCE_DEFAULT
+                    NotificationManager.IMPORTANCE_HIGH
                 ).apply {
-                    description = "按设定时间与星期提醒复盘当天记录的闪念"
+                    description = "按设定时间与星期准时弹出复盘提醒"
+                    enableVibration(true)
                 }
                 nm.createNotificationChannel(channel)
             }
@@ -117,6 +119,9 @@ class DailyReviewReceiver : BroadcastReceiver() {
                 .setContentTitle(title)
                 .setContentText(body)
                 .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                .setPriority(NotificationCompat.PRIORITY_HIGH)
+                .setCategory(NotificationCompat.CATEGORY_REMINDER)
+                .setDefaults(NotificationCompat.DEFAULT_ALL)
                 .setAutoCancel(true)
                 .setContentIntent(openPi)
                 .addAction(0, "去复盘", openPi)

@@ -43,8 +43,10 @@ type Peer struct {
 	streamClient *http.Client // no timeout for long-lived SSE push streams
 
 	sseMu           sync.Mutex
-	sseSubs         map[chan struct{}]struct{}
-	activeSSEPeers  map[string]int64 // peerID -> connected unix ms
+	sseSubs         map[*sseSubscriber]struct{}
+	activeSSEPeers  map[string]int64           // peerID -> connected unix ms
+	peerLiveness    map[string]*peerLiveRecord // peerID -> last verified ping/pong
+	pendingPings    map[string]*pendingPing    // pingID -> in-flight SSE ping waiter
 	localChanged    chan struct{}
 	remoteChanged   chan struct{}
 	sseReconnect    chan struct{}
@@ -86,8 +88,10 @@ func NewPeer(st *store.Store, peerID, displayName, localCode string) *Peer {
 		streamClient: &http.Client{
 			Transport: streamTransport,
 		},
-		sseSubs:        make(map[chan struct{}]struct{}),
+		sseSubs:        make(map[*sseSubscriber]struct{}),
 		activeSSEPeers: make(map[string]int64),
+		peerLiveness:   make(map[string]*peerLiveRecord),
+		pendingPings:   make(map[string]*pendingPing),
 		localChanged:   make(chan struct{}, 1),
 		remoteChanged:  make(chan struct{}, 1),
 		sseReconnect:   make(chan struct{}, 1),
@@ -122,9 +126,9 @@ func (p *Peer) NotifyChanged() {
 	default:
 	}
 	p.sseMu.Lock()
-	for ch := range p.sseSubs {
+	for sub := range p.sseSubs {
 		select {
-		case ch <- struct{}{}:
+		case sub.changedCh <- struct{}{}:
 		default:
 		}
 	}
@@ -196,6 +200,8 @@ func (p *Peer) StartServer(httpPort int, enableDiscovery bool) (int, error) {
 	mux.HandleFunc("/sync/challenge", p.handleChallenge)
 	mux.HandleFunc("/sync/exchange", p.handleExchange)
 	mux.HandleFunc("/sync/events", p.handleEvents)
+	mux.HandleFunc("/sync/ping", p.handlePing)
+	mux.HandleFunc("/sync/pong", p.handlePong)
 	mux.HandleFunc("/sync/blobs/", p.handleBlob)
 
 	srv := &http.Server{
@@ -618,6 +624,7 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 			LastHeardAt: heard,
 			LastSyncAt:  now,
 		})
+		p.recordPeerAlive(lastResp.PeerID, lastResp.DisplayName, addr, -1)
 	}
 
 	// Notify local UI listeners (and bump dataVersion) whenever an outgoing sync
@@ -844,6 +851,7 @@ func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
 			LastHeardAt: now,
 			LastSyncAt:  now,
 		})
+		p.recordPeerAlive(req.PeerID, req.DisplayName, clientIP, -1)
 		// Wake Mac UI so newly connected phone shows up immediately in Settings
 		select {
 		case p.localChanged <- struct{}{}:

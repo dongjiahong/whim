@@ -186,6 +186,15 @@ func WhimSyncOnce(timeoutSec C.int) *C.char {
 	return okJSON(res)
 }
 
+//export WhimCheckSyncHealth
+func WhimCheckSyncHealth(activeProbe C.int) *C.char {
+	res, err := mobile.CheckSyncHealth(activeProbe != 0)
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
 //export WhimWaitForChange
 func WhimWaitForChange(timeoutSec C.int) *C.char {
 	changed, err := mobile.WaitForChange(int(timeoutSec))

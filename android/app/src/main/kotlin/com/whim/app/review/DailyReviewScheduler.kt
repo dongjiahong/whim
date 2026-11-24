@@ -172,9 +172,21 @@ object DailyReviewScheduler {
         val am = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !am.canScheduleExactAlarms()) {
             am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pi)
-        } else {
-            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMs, pi)
+            return
         }
+        // Use setAlarmClock so Doze mode, App Standby Buckets, and OEM ROM background freezes
+        // never batch or defer the reminder until the user manually reopens the app.
+        val showIntent = Intent(context, com.whim.app.MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+            putExtra(com.whim.app.MainActivity.EXTRA_OPEN_REVIEW, true)
+        }
+        val showPi = PendingIntent.getActivity(
+            context,
+            REQ_DAILY + 1,
+            showIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        am.setAlarmClock(AlarmManager.AlarmClockInfo(triggerAtMs, showPi), pi)
     }
 
     private fun dailyPendingIntent(context: Context): PendingIntent {

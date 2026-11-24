@@ -206,3 +206,10 @@ func (e *Engine) SyncOnce(timeoutSec int) model.SyncSummary {
 	defer cancel()
 	return e.Peer.SyncOnce(ctx)
 }
+
+// CheckSyncHealth verifies real-time bidirectional connectivity via ping/pong.
+func (e *Engine) CheckSyncHealth(activeProbe bool) model.SyncHealthStatus {
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	return e.Peer.CheckSyncHealth(ctx, activeProbe)
+}

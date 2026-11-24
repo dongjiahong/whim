@@ -170,6 +170,33 @@ type SyncSummary struct {
 	Errors          []string         `json:"errors,omitempty"`
 }
 
+// LivePeerStatus represents a peer's real-time verified connectivity via ping/pong.
+type LivePeerStatus struct {
+	PeerID      string `json:"peer_id"`
+	DisplayName string `json:"display_name"`
+	Addr        string `json:"addr"`
+	Online      bool   `json:"online"`
+	RTTMs       int64  `json:"rtt_ms"`
+	LastPongAt  int64  `json:"last_pong_at"`
+	LastSyncAt  int64  `json:"last_sync_at"`
+	Status      string `json:"status"` // "connected" | "wrong_code" | "offline"
+	Message     string `json:"message,omitempty"`
+}
+
+// SyncHealthStatus summarizes real-time verified sync connection state for the UI indicator.
+type SyncHealthStatus struct {
+	State        string           `json:"state"` // "connected" | "offline" | "unpaired" | "wrong_code"
+	Connected    bool             `json:"connected"`
+	OnlinePeers  int              `json:"online_peers"`
+	TotalPeers   int              `json:"total_peers"`
+	RTTMs        int64            `json:"rtt_ms"`
+	LastPongAt   int64            `json:"last_pong_at"`
+	LastSyncAt   int64            `json:"last_sync_at"`
+	PeerName     string           `json:"peer_name,omitempty"`
+	ErrorMessage string           `json:"error_message,omitempty"`
+	Peers        []LivePeerStatus `json:"peers,omitempty"`
+}
+
 // StorageCleanupResult reports orphan image blobs inspected or removed during cleanup.
 type StorageCleanupResult struct {
 	RemovedFiles int   `json:"removed_files"`

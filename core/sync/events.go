@@ -16,6 +16,7 @@ const sseIdleTimeout = 35 * time.Second
 // handleEvents serves an authenticated Server-Sent Events (SSE) stream on /sync/events.
 // Whenever a note is created, updated, deleted, or merged on this host, all connected
 // clients receive an instant `event: changed` frame (< 50ms latency) over the existing HTTP port.
+// It also drives real bidirectional ping/pong heartbeats (`event: ping` -> client `POST /sync/pong`).
 func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -37,10 +38,18 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	_, _ = fmt.Fprint(w, ": connected\n\n")
 	flusher.Flush()
 
-	ch := make(chan struct{}, 1)
 	clientPeerID := r.Header.Get(HeaderPeerID)
+	clientIP := clientIPFromAddr(r.RemoteAddr)
+	sub := &sseSubscriber{
+		peerID:    clientPeerID,
+		remoteIP:  clientIP,
+		changedCh: make(chan struct{}, 1),
+		pingCh:    make(chan ssePingMsg, 4),
+		closeCh:   make(chan struct{}),
+	}
+
 	p.sseMu.Lock()
-	p.sseSubs[ch] = struct{}{}
+	p.sseSubs[sub] = struct{}{}
 	if clientPeerID != "" {
 		p.activeSSEPeers[clientPeerID] = time.Now().UnixMilli()
 	}
@@ -55,28 +64,93 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	defer func() {
+		sub.close()
 		p.sseMu.Lock()
-		delete(p.sseSubs, ch)
+		delete(p.sseSubs, sub)
 		if clientPeerID != "" {
-			delete(p.activeSSEPeers, clientPeerID)
+			// Only clear activeSSEPeers if no other subscriber for the same peerID remains
+			stillActive := false
+			for s := range p.sseSubs {
+				if s.peerID == clientPeerID {
+					stillActive = true
+					break
+				}
+			}
+			if !stillActive {
+				delete(p.activeSSEPeers, clientPeerID)
+				if rec, ok := p.peerLiveness[clientPeerID]; ok {
+					rec.Status = "offline"
+					rec.LastPongAt = 0
+					rec.Message = "连接已断开"
+				}
+			}
 		}
 		p.sseMu.Unlock()
 		log.Printf("[whim-sync] sse client disconnected peer=%s", clientPeerID)
 	}()
 
-	keepalive := time.NewTicker(20 * time.Second)
-	defer keepalive.Stop()
+	writePing := func(msg ssePingMsg) error {
+		payload, _ := json.Marshal(msg)
+		if _, err := fmt.Fprintf(w, "event: ping\ndata: %s\n\n", payload); err != nil {
+			return err
+		}
+		flusher.Flush()
+		return nil
+	}
+
+	// Send an immediate ping challenge upon connection so liveness & RTT are verified right away.
+	initPing := ssePingMsg{ID: newPingID(), TS: time.Now().UnixMilli()}
+	p.registerPendingPing(initPing.ID, clientPeerID)
+	if err := writePing(initPing); err != nil {
+		p.clearPendingPing(initPing.ID)
+		return
+	}
+
+	pingTicker := time.NewTicker(pingHeartbeatInterval)
+	defer pingTicker.Stop()
+
+	lastPingSentAt := time.Now().UnixMilli()
+	missedPings := 0
 
 	for {
 		select {
 		case <-r.Context().Done():
 			return
-		case <-ch:
-			_, _ = fmt.Fprintf(w, "event: changed\ndata: %d\n\n", time.Now().UnixMilli())
+		case <-sub.closeCh:
+			return
+		case <-sub.changedCh:
+			if _, err := fmt.Fprintf(w, "event: changed\ndata: %d\n\n", time.Now().UnixMilli()); err != nil {
+				return
+			}
 			flusher.Flush()
-		case <-keepalive.C:
-			_, _ = fmt.Fprint(w, ": keepalive\n\n")
-			flusher.Flush()
+		case msg := <-sub.pingCh:
+			if err := writePing(msg); err != nil {
+				return
+			}
+		case <-pingTicker.C:
+			// Check whether the client replied to our previous ping
+			if clientPeerID != "" {
+				p.sseMu.Lock()
+				rec := p.peerLiveness[clientPeerID]
+				gotPong := rec != nil && rec.LastPongAt >= lastPingSentAt
+				p.sseMu.Unlock()
+				if gotPong {
+					missedPings = 0
+				} else {
+					missedPings++
+					if missedPings >= 2 {
+						log.Printf("[whim-sync] sse client peer=%s missed %d consecutive pings, closing stale stream", clientPeerID, missedPings)
+						return
+					}
+				}
+			}
+			msg := ssePingMsg{ID: newPingID(), TS: time.Now().UnixMilli()}
+			lastPingSentAt = msg.TS
+			p.registerPendingPing(msg.ID, clientPeerID)
+			if err := writePing(msg); err != nil {
+				p.clearPendingPing(msg.ID)
+				return
+			}
 		}
 	}
 }
@@ -232,6 +306,9 @@ func (p *Peer) subscribeOneSSE(ctx context.Context, addr, code string) error {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
+		if resp.StatusCode == http.StatusUnauthorized {
+			p.recordPeerFailure("", "", addr, "wrong_code", "配对码不匹配")
+		}
 		return fmt.Errorf("sse status %d", resp.StatusCode)
 	}
 	log.Printf("[whim-sync] sse subscribed to %s", addr)
@@ -243,7 +320,7 @@ func (p *Peer) subscribeOneSSE(ctx context.Context, addr, code string) error {
 	default:
 	}
 
-	// Watchdog: server sends `: keepalive` every 20s. If no bytes arrive for 35s
+	// Watchdog: server sends `event: ping` every 10s. If no bytes arrive for 35s
 	// (e.g. half-open TCP socket after Android Doze/Wi-Fi sleep), close body to force reconnect.
 	done := make(chan struct{})
 	defer close(done)
@@ -262,14 +339,32 @@ func (p *Peer) subscribeOneSSE(ctx context.Context, addr, code string) error {
 	defer watchdog.Stop()
 
 	scanner := bufio.NewScanner(resp.Body)
+	currentEvent := ""
 	for scanner.Scan() {
 		watchdog.Reset(sseIdleTimeout)
 		line := scanner.Text()
-		if strings.HasPrefix(line, "event: changed") {
-			log.Printf("[whim-sync] sse received change from %s", addr)
-			select {
-			case p.remoteChanged <- struct{}{}:
-			default:
+		if line == "" {
+			currentEvent = ""
+			continue
+		}
+		if strings.HasPrefix(line, "event:") {
+			currentEvent = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			if currentEvent == "changed" {
+				log.Printf("[whim-sync] sse received change from %s", addr)
+				select {
+				case p.remoteChanged <- struct{}{}:
+				default:
+				}
+			}
+		} else if strings.HasPrefix(line, "data:") && currentEvent == "ping" {
+			rawData := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+			var pingMsg ssePingMsg
+			if json.Unmarshal([]byte(rawData), &pingMsg) == nil && pingMsg.ID != "" {
+				go func(msg ssePingMsg) {
+					pongCtx, cancel := context.WithTimeout(ctx, pingReplyTimeout)
+					defer cancel()
+					_ = p.sendPong(pongCtx, addr, code, msg.ID, msg.TS)
+				}(pingMsg)
 			}
 		}
 		// If local pairing code changed while stream is open, drop & reconnect with new code

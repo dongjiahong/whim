@@ -270,6 +270,17 @@ func SyncOnce(timeoutSec int) (string, error) {
 	return string(b), err
 }
 
+// CheckSyncHealth returns JSON model.SyncHealthStatus verified by real ping/pong round-trips.
+func CheckSyncHealth(activeProbe bool) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	status := e.CheckSyncHealth(activeProbe)
+	b, err := json.Marshal(status)
+	return string(b), err
+}
+
 // WaitForChange blocks until a real-time SSE push or incoming sync change occurs (or timeoutSec elapses).
 func WaitForChange(timeoutSec int) (bool, error) {
 	e, err := requireEngine()

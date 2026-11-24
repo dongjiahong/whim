@@ -114,6 +114,11 @@ object WhimCoreBridge {
         json.decodeFromString(raw)
     }
 
+    suspend fun checkSyncHealth(activeProbe: Boolean = false): WhimSyncHealthStatus = withContext(Dispatchers.IO) {
+        val raw = Mobile.checkSyncHealth(activeProbe)
+        json.decodeFromString(raw)
+    }
+
     suspend fun waitForChange(timeoutSec: Int = 25): Boolean = withContext(Dispatchers.IO) {
         runCatching { Mobile.waitForChange(timeoutSec.toLong()) }.getOrDefault(false)
     }

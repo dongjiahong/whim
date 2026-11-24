@@ -23,6 +23,8 @@ final class WhimStoreVM: ObservableObject {
     @Published var pairCode: String = ""
     @Published var syncMessage: String = ""
     @Published var isSyncing: Bool = false
+    @Published var isCheckingSyncHealth: Bool = false
+    @Published var syncHealth: WhimSyncHealthStatus = .initial
     @Published var peerStatuses: [WhimPeerSyncStatus] = []
     @Published var dailyReviewEnabled: Bool = UserDefaults.standard.object(forKey: "whim.review.enabled") as? Bool ?? true
     @Published var reviewHour: Int = UserDefaults.standard.object(forKey: "whim.review.hour") as? Int ?? 21
@@ -66,6 +68,7 @@ final class WhimStoreVM: ObservableObject {
             reload()
             scheduleDailyReviewNotification()
             startAutoSyncTimer()
+            startSyncHealthMonitor()
             syncNow()
         } catch {
             syncMessage = "初始化失败: \(error.localizedDescription)"
@@ -357,14 +360,49 @@ final class WhimStoreVM: ObservableObject {
         }
     }
 
+    private func startSyncHealthMonitor() {
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            var tick = 0
+            while self != nil {
+                let activeProbe = (tick % 3 == 0)
+                tick += 1
+                if let health = try? CoreBridge.shared.checkSyncHealth(activeProbe: activeProbe) {
+                    DispatchQueue.main.async { [weak self] in
+                        self?.syncHealth = health
+                    }
+                }
+                Thread.sleep(forTimeInterval: 6.0)
+            }
+        }
+    }
+
+    func refreshSyncHealth(activeProbe: Bool = true) {
+        guard !isCheckingSyncHealth else { return }
+        isCheckingSyncHealth = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let health = try? CoreBridge.shared.checkSyncHealth(activeProbe: activeProbe)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isCheckingSyncHealth = false
+                if let health {
+                    self.syncHealth = health
+                }
+            }
+        }
+    }
+
     func syncNow() {
         guard !isSyncing else { return }
         isSyncing = true
         syncMessage = ""
         DispatchQueue.global(qos: .userInitiated).async {
             let res = try? CoreBridge.shared.syncOnce(timeoutSec: 6)
+            let health = try? CoreBridge.shared.checkSyncHealth(activeProbe: true)
             DispatchQueue.main.async {
                 self.isSyncing = false
+                if let health {
+                    self.syncHealth = health
+                }
                 var hasRemoteUpdates = false
                 if let res {
                     self.peerStatuses = res.peers ?? []
@@ -886,7 +924,7 @@ struct FlomoComposerView: View {
                         return true
                     }
                 )
-                .frame(height: editingNote != nil ? 120 : (isFocused || !markdown.isEmpty ? 110 : 72))
+                .frame(height: editingNote != nil ? 340 : ((!attachments.isEmpty || markdown.count > 160) ? 300 : (isFocused || !markdown.isEmpty ? 180 : 72)))
             }
 
             if !tagSuggestions.isEmpty {
@@ -1095,22 +1133,53 @@ struct MainContentView: View {
                     }
 
                     Divider().opacity(0.25)
-                    Button {
-                        settingsInitialSection = .general
-                        showSettingsSheet = true
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "gearshape")
-                                .font(.system(size: 12))
-                            Text("设置 · v\(GitHubUpdater.currentVersion)")
-                                .font(.system(size: 12))
-                            Spacer()
+                    HStack(spacing: 8) {
+                        Button {
+                            settingsInitialSection = .general
+                            showSettingsSheet = true
+                        } label: {
+                            HStack(spacing: 6) {
+                                Image(systemName: "gearshape")
+                                    .font(.system(size: 12))
+                                Text("设置")
+                                    .font(.system(size: 12))
+                            }
+                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 4)
                         }
-                        .foregroundColor(FlomoPalette.textMuted(scheme))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 4)
+                        .buttonStyle(.plain)
+
+                        Spacer()
+
+                        Button {
+                            if vm.syncHealth.state == "unpaired" || vm.syncHealth.state == "wrong_code" {
+                                settingsInitialSection = .sync
+                                showSettingsSheet = true
+                            } else {
+                                vm.syncNow()
+                            }
+                        } label: {
+                            HStack(spacing: 5) {
+                                Circle()
+                                    .fill(syncStatusDotColor)
+                                    .frame(width: 6.5, height: 6.5)
+                                Text(syncStatusLabel)
+                                    .font(.system(size: 11.5, weight: vm.syncHealth.connected ? .medium : .regular).monospacedDigit())
+                                    .foregroundColor(syncStatusTextColor)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3.5)
+                            .background(
+                                Capsule()
+                                    .fill(vm.syncHealth.connected ? FlomoPalette.accent(scheme).opacity(0.16) : FlomoPalette.border(scheme).opacity(0.7))
+                            )
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(vm.isSyncing)
+                        .help(syncStatusTooltip)
                     }
-                    .buttonStyle(.plain)
                 }
                 .padding(.horizontal, 16)
                 .padding(.bottom, 14)
@@ -1178,30 +1247,54 @@ struct MainContentView: View {
                         .buttonStyle(.plain)
                         .help(mainWindowPinned ? "取消主窗口置顶" : "主窗口置顶")
 
-                        Menu {
-                            Button("新建浮窗 (⌘⇧J)", action: onOpenQuickCapture)
-                            Button("立即局域网同步") { vm.syncNow() }
-                            Button("导出 Markdown") { vm.exportMarkdown() }
-                            Divider()
-                            Button("注入示例数据") { vm.seedSampleNotes() }
-                            Button("清除示例数据") { vm.clearSampleNotes() }
-                            Divider()
-                            Button("偏好设置与更新... (⌘,)") {
-                                settingsInitialSection = .general
-                                showSettingsSheet = true
-                            }
+                        Button {
+                            vm.syncNow()
                         } label: {
-                            Image(systemName: "ellipsis")
-                                .font(.system(size: 13))
+                            Image(systemName: "arrow.triangle.2.circlepath")
+                                .font(.system(size: 12.5))
+                                .foregroundColor(vm.isSyncing ? FlomoPalette.accent(scheme) : FlomoPalette.textSecondary(scheme))
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(vm.isSyncing)
+                        .help("立即局域网同步")
+
+                        Button(action: onOpenQuickCapture) {
+                            Image(systemName: "square.and.pencil")
+                                .font(.system(size: 12.5))
                                 .foregroundColor(FlomoPalette.textSecondary(scheme))
                         }
-                        .menuStyle(.borderlessButton)
-                        .menuIndicator(.hidden)
-                        .frame(width: 22)
+                        .buttonStyle(.plain)
+                        .help("新建浮窗 (⌘⇧J)")
                     }
                     .padding(.top, 14)
                     .padding(.horizontal, 10)
 
+                    if vm.activeTab == .review || vm.activeTab == .random {
+                        VStack(spacing: 14) {
+                            if vm.activeTab == .review {
+                                dailyReviewBar
+                            } else {
+                                randomWalkBar
+                            }
+                            FlomoCardDeckView(
+                                vm: vm,
+                                notes: vm.displayedNotes,
+                                isRandomMode: vm.activeTab == .random,
+                                resetKey: "\(vm.activeTab)|\(vm.dayFmt.string(from: vm.reviewDate))|\(vm.displayedNotes.first?.id ?? "")|\(vm.displayedNotes.count)",
+                                editingNoteId: $editingNoteId,
+                                searchFocused: searchFocused,
+                                onTapTag: { path in
+                                    vm.activeTab = .tag(path)
+                                    vm.applyFilter()
+                                },
+                                onTapImage: { path in previewImagePath = path },
+                                onReshuffle: { vm.reshuffleRandom() }
+                            )
+                        }
+                        .padding(.horizontal, 4)
+                        .padding(.bottom, 16)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else {
                     // Note Card Feed (NSTableView-backed List for true cell recycling & 120Hz scrolling)
                     ScrollViewReader { scrollProxy in
                         List {
@@ -1212,18 +1305,7 @@ struct MainContentView: View {
                                 .listRowBackground(Color.clear)
                                 .listRowInsets(EdgeInsets())
 
-                            // Composer / contextual bar inside the same List so width matches note cards 100%
-                            if vm.activeTab == .review {
-                                dailyReviewBar
-                                    .listRowSeparator(.hidden)
-                                    .listRowBackground(Color.clear)
-                                    .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 8, trailing: 4))
-                            } else if vm.activeTab == .random {
-                                randomWalkBar
-                                    .listRowSeparator(.hidden)
-                                    .listRowBackground(Color.clear)
-                                    .listRowInsets(EdgeInsets(top: 2, leading: 0, bottom: 8, trailing: 4))
-                            } else if vm.activeTab != .archived {
+                            if vm.activeTab != .archived {
                                 FlomoComposerView(vm: vm)
                                     .listRowSeparator(.hidden)
                                     .listRowBackground(Color.clear)
@@ -1325,6 +1407,7 @@ struct MainContentView: View {
                         .onChange(of: vm.activeTab) { _, _ in
                             scrollProxy.scrollTo("__feed_top__", anchor: .top)
                         }
+                    }
                     }
                 }
                 .padding(.horizontal, 12)
@@ -1495,6 +1578,44 @@ struct MainContentView: View {
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(FlomoPalette.card(scheme)))
+    }
+
+    private var syncStatusDotColor: Color {
+        if vm.isSyncing || vm.isCheckingSyncHealth { return Color(hex: 0xF59E0B) }
+        if vm.syncHealth.connected { return Color(hex: 0x34D399) }
+        if vm.syncHealth.state == "wrong_code" { return Color(hex: 0xF59E0B) }
+        return FlomoPalette.textMuted(scheme)
+    }
+
+    private var syncStatusTextColor: Color {
+        if vm.syncHealth.connected { return Color(hex: 0x34D399) }
+        if vm.syncHealth.state == "wrong_code" { return Color(hex: 0xF59E0B) }
+        return FlomoPalette.textMuted(scheme)
+    }
+
+    private var syncStatusLabel: String {
+        if vm.isSyncing { return "同步中" }
+        if vm.syncHealth.connected {
+            return vm.syncHealth.rttMs > 0 ? "已同步 · \(vm.syncHealth.rttMs)ms" : "已同步"
+        }
+        switch vm.syncHealth.state {
+        case "wrong_code": return "配对码错"
+        case "unpaired": return "未配对"
+        default: return "未连接"
+        }
+    }
+
+    private var syncStatusTooltip: String {
+        if vm.isSyncing { return "正在进行双向同步与心跳探测..." }
+        if vm.syncHealth.connected {
+            let name = vm.syncHealth.peerName ?? "局域网设备"
+            return "实时心跳正常：\(name)（\(vm.syncHealth.onlinePeers) 台在线 · 延迟 \(vm.syncHealth.rttMs)ms）· 点击立即同步"
+        }
+        switch vm.syncHealth.state {
+        case "wrong_code": return "局域网设备配对码不匹配 · 点击打开同步设置"
+        case "unpaired": return "尚未配置配对码 · 点击打开同步设置"
+        default: return "当前无在线设备响应心跳 · 点击立即 Ping 检测并同步"
+        }
     }
 
     private var currentTitle: String {
@@ -1751,61 +1872,37 @@ private struct FlomoNoteCardBody: View, Equatable {
     let noteId: String
     let updatedAt: Int64
     let content: String
-    let tags: [String]
     let attachments: [WhimAttachment]
-    let collapsed: Bool
     let onTapTag: (String) -> Void
     let onTapImage: (String) -> Void
 
     static func == (lhs: FlomoNoteCardBody, rhs: FlomoNoteCardBody) -> Bool {
         lhs.noteId == rhs.noteId &&
         lhs.updatedAt == rhs.updatedAt &&
-        lhs.collapsed == rhs.collapsed &&
         lhs.content == rhs.content &&
-        lhs.tags == rhs.tags &&
         lhs.attachments == rhs.attachments
     }
 
     var body: some View {
-        let cacheKey = "\(noteId):\(updatedAt):\(tags.count):\(attachments.count)"
+        let cacheKey = "\(noteId):\(updatedAt):\(attachments.count):inline"
         let blocks = NoteContentParser.parseCached(
             cacheKey: cacheKey,
             content: content,
             attachments: attachments,
-            stripTags: tags
+            stripTags: []
         )
         VStack(alignment: .leading, spacing: 10) {
-            if !tags.isEmpty {
-                TagFlowLayout(spacing: 6) {
-                    ForEach(tags, id: \.self) { tag in
-                        Button { onTapTag(tag) } label: {
-                            Text("#\(tag)")
-                                .font(.system(size: 12))
-                                .foregroundColor(FlomoPalette.tagText(scheme))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 5, style: .continuous)
-                                        .fill(FlomoPalette.tagBg(scheme))
-                                )
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-
-            VStack(alignment: .leading, spacing: 10) {
-                ForEach(blocks) { block in
-                    switch block {
-                    case .text(_, let val):
-                        MarkdownBlockView(text: val, collapsed: collapsed)
-                            .equatable()
-                    case .image(_, _, let path):
-                        AsyncCardImage(path: path, onTap: onTapImage)
-                    }
+            ForEach(blocks) { block in
+                switch block {
+                case .text(_, let val):
+                    MarkdownBlockView(text: val, onTapTag: onTapTag)
+                        .equatable()
+                case .image(_, _, let path):
+                    AsyncCardImage(path: path, onTap: onTapImage)
                 }
             }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -1820,6 +1917,9 @@ private struct FlomoNoteCard: View {
     let onDelete: () -> Void
 
     @State private var expanded: Bool = false
+    @State private var naturalHeight: CGFloat = 0
+
+    private static let maxCollapsedHeight: CGFloat = 340
 
     private static let cardTimeFmt: DateFormatter = {
         let f = DateFormatter()
@@ -1832,11 +1932,12 @@ private struct FlomoNoteCard: View {
         return Self.cardTimeFmt.string(from: d)
     }
 
-    private var isLongNote: Bool {
-        note.content.count > 280 || note.content.reduce(0) { $0 + ($1 == "\n" ? 1 : 0) } > 6
+    private var needsCollapse: Bool {
+        naturalHeight > Self.maxCollapsedHeight + 16
     }
 
     var body: some View {
+        let isCollapsed = needsCollapse && !expanded
         VStack(alignment: .leading, spacing: 10) {
             // Meta header row (fixed positions, zero hover layout jitter)
             HStack(spacing: 6) {
@@ -1859,20 +1960,47 @@ private struct FlomoNoteCard: View {
                 noteId: note.id,
                 updatedAt: note.updatedAt,
                 content: note.content,
-                tags: note.tags ?? [],
                 attachments: note.attachments ?? [],
-                collapsed: !expanded && isLongNote,
                 onTapTag: onTapTag,
                 onTapImage: onTapImage
             )
             .equatable()
+            .fixedSize(horizontal: false, vertical: true)
+            .background(
+                GeometryReader { geo in
+                    Color.clear
+                        .onAppear {
+                            if abs(naturalHeight - geo.size.height) > 2 {
+                                naturalHeight = geo.size.height
+                            }
+                        }
+                        .onChange(of: geo.size.height) { _, h in
+                            if abs(naturalHeight - h) > 2 {
+                                naturalHeight = h
+                            }
+                        }
+                }
+            )
+            .frame(maxHeight: isCollapsed ? Self.maxCollapsedHeight : nil, alignment: .top)
+            .clipped()
+            .overlay(alignment: .bottom) {
+                if isCollapsed {
+                    LinearGradient(
+                        colors: [FlomoPalette.card(scheme).opacity(0), FlomoPalette.card(scheme)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                    .frame(height: 52)
+                    .allowsHitTesting(false)
+                }
+            }
 
-            if isLongNote {
-                Button(expanded ? "收起" : "展开") {
+            if needsCollapse {
+                Button(expanded ? "收起" : "展开全文") {
                     expanded.toggle()
                 }
                 .buttonStyle(.plain)
-                .font(.system(size: 12.5))
+                .font(.system(size: 12.5, weight: .medium))
                 .foregroundColor(FlomoPalette.tagText(scheme))
             }
         }
@@ -1896,6 +2024,292 @@ private struct FlomoNoteCard: View {
             Divider()
             Button("删除", role: .destructive, action: onDelete)
         }
+    }
+}
+
+// MARK: - Stacked Swipeable Card Gallery (Daily Review & Random Walk)
+
+private struct FlomoCardDeckView: View {
+    @Environment(\.colorScheme) private var scheme
+    @ObservedObject var vm: WhimStoreVM
+    let notes: [WhimNote]
+    let isRandomMode: Bool
+    let resetKey: String
+    @Binding var editingNoteId: String?
+    let searchFocused: Bool
+    let onTapTag: (String) -> Void
+    let onTapImage: (String) -> Void
+    let onReshuffle: () -> Void
+
+    @State private var currentIndex: Int = 0
+    @State private var dragOffset: CGSize = .zero
+    @State private var isAnimatingOut: Bool = false
+
+    private static let cardTimeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    private var shortcutsEnabled: Bool {
+        editingNoteId == nil && !searchFocused
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            if notes.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
+                    Image(systemName: isRandomMode ? "shuffle" : "sparkles")
+                        .font(.system(size: 28))
+                        .foregroundColor(FlomoPalette.textMuted(scheme))
+                    Text(isRandomMode ? "暂无可随机漫步的历史笔记" : "这一天还没有记录笔记")
+                        .font(.system(size: 14))
+                        .foregroundColor(FlomoPalette.textMuted(scheme))
+                }
+                Spacer()
+            } else if currentIndex >= notes.count {
+                Spacer()
+                VStack(spacing: 14) {
+                    Image(systemName: "checkmark.circle.fill")
+                        .font(.system(size: 36))
+                        .foregroundColor(FlomoPalette.accent(scheme))
+                    Text(isRandomMode ? "本批 \(notes.count) 条灵感已漫步完毕" : "今日 \(notes.count) 条记录已全部回顾")
+                        .font(.system(size: 15.5, weight: .semibold))
+                        .foregroundColor(FlomoPalette.textPrimary(scheme))
+                    HStack(spacing: 12) {
+                        if currentIndex > 0 {
+                            Button("回看上一张") {
+                                withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+                                    currentIndex = max(0, notes.count - 1)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 13))
+                            .foregroundColor(FlomoPalette.textSecondary(scheme))
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 7)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(FlomoPalette.card(scheme)))
+                        }
+                        Button(isRandomMode ? "换一批" : "重新回顾") {
+                            if isRandomMode {
+                                currentIndex = 0
+                                onReshuffle()
+                            } else {
+                                withAnimation(.spring(response: 0.32, dampingFraction: 0.85)) {
+                                    currentIndex = 0
+                                }
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 7)
+                        .background(RoundedRectangle(cornerRadius: 8).fill(FlomoPalette.accent(scheme)))
+                    }
+                }
+                .padding(32)
+                .frame(maxWidth: 420)
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(FlomoPalette.card(scheme)))
+                .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous).stroke(FlomoPalette.border(scheme), lineWidth: 0.8))
+                Spacer()
+            } else {
+                let visibleEnd = min(notes.count, currentIndex + 3)
+                let visibleIndices = Array((currentIndex..<visibleEnd).reversed())
+                let dragProgress = min(abs(dragOffset.width) / 140.0, 1.0)
+
+                ZStack {
+                    ForEach(visibleIndices, id: \.self) { idx in
+                        let depth = idx - currentIndex
+                        let note = notes[idx]
+                        let isTop = depth == 0
+                        let scale: CGFloat = isTop ? 1.0 : (1.0 - CGFloat(depth) * 0.045 + CGFloat(dragProgress) * 0.045)
+                        let yOffset: CGFloat = isTop ? 0 : (CGFloat(depth) * 16.0 - CGFloat(dragProgress) * 16.0)
+                        let opacity: Double = isTop ? 1.0 : max(0.45, 1.0 - Double(depth) * 0.22 + dragProgress * 0.22)
+
+                        deckCard(note: note, isTop: isTop)
+                            .scaleEffect(scale)
+                            .offset(x: isTop ? dragOffset.width : 0, y: yOffset)
+                            .rotationEffect(.degrees(isTop ? Double(dragOffset.width / 28.0) : 0))
+                            .opacity(opacity)
+                            .zIndex(Double(notes.count - idx))
+                            .allowsHitTesting(isTop)
+                            .gesture(
+                                isTop && editingNoteId != note.id ?
+                                DragGesture(minimumDistance: 16)
+                                    .onChanged { val in
+                                        if abs(val.translation.width) > abs(val.translation.height) * 1.1 {
+                                            dragOffset = CGSize(width: val.translation.width, height: 0)
+                                        }
+                                    }
+                                    .onEnded { val in
+                                        if abs(val.translation.width) > 95 && abs(val.translation.width) > abs(val.translation.height) {
+                                            swipeOut(direction: val.translation.width >= 0 ? 1 : -1)
+                                        } else {
+                                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                                dragOffset = .zero
+                                            }
+                                        }
+                                    }
+                                : nil
+                            )
+                    }
+                }
+                .frame(maxWidth: 660, maxHeight: .infinity)
+                .padding(.top, 4)
+                .padding(.bottom, 22)
+
+                HStack(spacing: 14) {
+                    Button {
+                        goPrev()
+                    } label: {
+                        HStack(spacing: 5) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 11.5, weight: .semibold))
+                            Text("上一张")
+                                .font(.system(size: 12.5))
+                        }
+                        .foregroundColor(currentIndex > 0 ? FlomoPalette.textPrimary(scheme) : FlomoPalette.textMuted(scheme))
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(FlomoPalette.card(scheme)))
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(currentIndex == 0)
+
+                    Text("\(currentIndex + 1) / \(notes.count)")
+                        .font(.system(size: 12.5, weight: .medium).monospacedDigit())
+                        .foregroundColor(FlomoPalette.textSecondary(scheme))
+                        .frame(minWidth: 56)
+
+                    Button {
+                        swipeOut(direction: -1)
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(currentIndex + 1 >= notes.count ? "完成" : "下一张")
+                                .font(.system(size: 12.5, weight: .medium))
+                            Image(systemName: "chevron.right")
+                                .font(.system(size: 11.5, weight: .semibold))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 6)
+                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(FlomoPalette.accent(scheme)))
+                    }
+                    .buttonStyle(.plain)
+
+                    Text("左右拖拽或按 ← / → / 空格切卡")
+                        .font(.system(size: 11))
+                        .foregroundColor(FlomoPalette.textMuted(scheme))
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: resetKey) { _, _ in
+            currentIndex = 0
+            dragOffset = .zero
+        }
+        .background(
+            Group {
+                if shortcutsEnabled && !notes.isEmpty {
+                    Button("") { goPrev() }
+                        .keyboardShortcut(.leftArrow, modifiers: [])
+                        .opacity(0)
+                        .frame(width: 0, height: 0)
+                    Button("") { if currentIndex < notes.count { swipeOut(direction: -1) } }
+                        .keyboardShortcut(.rightArrow, modifiers: [])
+                        .opacity(0)
+                        .frame(width: 0, height: 0)
+                    Button("") { if currentIndex < notes.count { swipeOut(direction: -1) } }
+                        .keyboardShortcut(.space, modifiers: [])
+                        .opacity(0)
+                        .frame(width: 0, height: 0)
+                }
+            }
+        )
+    }
+
+    private func formattedTime(_ ms: Int64) -> String {
+        Self.cardTimeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000.0))
+    }
+
+    private func goPrev() {
+        guard currentIndex > 0, !isAnimatingOut else { return }
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
+            currentIndex -= 1
+            dragOffset = .zero
+        }
+    }
+
+    private func swipeOut(direction: CGFloat) {
+        guard !isAnimatingOut, currentIndex < notes.count else { return }
+        isAnimatingOut = true
+        withAnimation(.easeOut(duration: 0.2)) {
+            dragOffset = CGSize(width: direction * 560, height: 0)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.19) {
+            currentIndex += 1
+            dragOffset = .zero
+            isAnimatingOut = false
+        }
+    }
+
+    @ViewBuilder
+    private func deckCard(note: WhimNote, isTop: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text(note.pinned ? "置顶 · \(formattedTime(note.createdAt))" : formattedTime(note.createdAt))
+                    .font(.system(size: 12.5).monospacedDigit())
+                    .foregroundColor(FlomoPalette.textSecondary(scheme))
+
+                Spacer()
+
+                if isTop {
+                    CardHeaderActions(
+                        pinned: note.pinned,
+                        archived: note.archived,
+                        content: note.content,
+                        onEdit: { editingNoteId = note.id },
+                        onPin: { vm.togglePin(note) },
+                        onArchive: { vm.toggleArchive(note) },
+                        onDelete: { vm.deleteNote(note) }
+                    )
+                }
+            }
+
+            Divider().opacity(0.25)
+
+            if editingNoteId == note.id && isTop {
+                FlomoComposerView(vm: vm, editingNote: note) {
+                    editingNoteId = nil
+                }
+            } else {
+                ScrollView(showsIndicators: true) {
+                    FlomoNoteCardBody(
+                        noteId: note.id,
+                        updatedAt: note.updatedAt,
+                        content: note.content,
+                        attachments: note.attachments ?? [],
+                        onTapTag: onTapTag,
+                        onTapImage: onTapImage
+                    )
+                    .equatable()
+                    .padding(.trailing, 4)
+                }
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(FlomoPalette.card(scheme))
+                .shadow(color: Color.black.opacity(scheme == .dark ? 0.35 : 0.08), radius: 14, y: 6)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(FlomoPalette.border(scheme), lineWidth: 0.8)
+        )
     }
 }
 
@@ -2213,10 +2627,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         menu.addItem(withTitle: "新建闪念 (⌘⇧J)", action: #selector(toggleQuickCapture), keyEquivalent: "")
         menu.addItem(withTitle: "打开主窗口", action: #selector(showMainWindow), keyEquivalent: "")
         menu.addItem(withTitle: "立即同步", action: #selector(triggerSync), keyEquivalent: "")
-        menu.addItem(withTitle: "导出 Markdown", action: #selector(triggerExport), keyEquivalent: "")
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "注入示例数据", action: #selector(triggerSeed), keyEquivalent: "")
-        menu.addItem(withTitle: "清除示例数据", action: #selector(triggerClearSeed), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "退出 Whim", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.menu = menu

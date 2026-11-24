@@ -129,6 +129,67 @@ struct WhimSyncSummary: Codable {
     }
 }
 
+struct WhimLivePeerStatus: Codable, Identifiable, Equatable {
+    var id: String { peerId.isEmpty ? addr : peerId }
+    let peerId: String
+    let displayName: String
+    let addr: String
+    let online: Bool
+    let rttMs: Int64
+    let lastPongAt: Int64
+    let lastSyncAt: Int64
+    let status: String
+    let message: String?
+
+    enum CodingKeys: String, CodingKey {
+        case peerId = "peer_id"
+        case displayName = "display_name"
+        case addr, online
+        case rttMs = "rtt_ms"
+        case lastPongAt = "last_pong_at"
+        case lastSyncAt = "last_sync_at"
+        case status, message
+    }
+}
+
+struct WhimSyncHealthStatus: Codable, Equatable {
+    let state: String // "connected" | "offline" | "unpaired" | "wrong_code"
+    let connected: Bool
+    let onlinePeers: Int
+    let totalPeers: Int
+    let rttMs: Int64
+    let lastPongAt: Int64
+    let lastSyncAt: Int64
+    let peerName: String?
+    let errorMessage: String?
+    let peers: [WhimLivePeerStatus]?
+
+    static let initial = WhimSyncHealthStatus(
+        state: "offline",
+        connected: false,
+        onlinePeers: 0,
+        totalPeers: 0,
+        rttMs: 0,
+        lastPongAt: 0,
+        lastSyncAt: 0,
+        peerName: nil,
+        errorMessage: nil,
+        peers: nil
+    )
+
+    enum CodingKeys: String, CodingKey {
+        case state, connected
+        case onlinePeers = "online_peers"
+        case totalPeers = "total_peers"
+        case rttMs = "rtt_ms"
+        case lastPongAt = "last_pong_at"
+        case lastSyncAt = "last_sync_at"
+        case peerName = "peer_name"
+        case errorMessage = "error_message"
+        case peers
+    }
+}
+
 struct WhimSyncPeer: Codable, Identifiable, Equatable {
     var id: String { peerId }
     let peerId: String
@@ -371,6 +432,10 @@ final class CoreBridge {
 
     func syncOnce(timeoutSec: Int32 = 8) throws -> WhimSyncSummary {
         try decodeCString(WhimSyncOnce(timeoutSec), as: WhimSyncSummary.self)
+    }
+
+    func checkSyncHealth(activeProbe: Bool = false) throws -> WhimSyncHealthStatus {
+        try decodeCString(WhimCheckSyncHealth(activeProbe ? 1 : 0), as: WhimSyncHealthStatus.self)
     }
 
     func waitForChange(timeoutSec: Int32 = 25) -> Bool {

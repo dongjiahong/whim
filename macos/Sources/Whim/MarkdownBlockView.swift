@@ -28,13 +28,18 @@ private enum MarkdownRenderCache {
         interpretedSyntax: .inlineOnlyPreservingWhitespace
     )
 
-    static func chunks(for text: String, collapsed: Bool, scheme: ColorScheme) -> [MarkdownChunk] {
+    private static let inlineTagRegex = try! NSRegularExpression(
+        pattern: #"(^|[\s(\[{（【「『，。、；：！？,.;:!?])(#([^\s#,.;:!?，。、；：！？)\]}）】」』]+))"#,
+        options: [.anchorsMatchLines]
+    )
+
+    static func chunks(for text: String, scheme: ColorScheme) -> [MarkdownChunk] {
         let isDark = scheme == .dark
-        let key = "\(isDark ? "d" : "l")|\(collapsed ? "1" : "0")|\(text)" as NSString
+        let key = "\(isDark ? "d" : "l")|\(text)" as NSString
         if let hit = chunkCache.object(forKey: key) {
             return hit.chunks
         }
-        let parsed = buildChunks(text: text, collapsed: collapsed, scheme: scheme)
+        let parsed = buildChunks(text: text, scheme: scheme)
         chunkCache.setObject(MarkdownBlockBox(parsed), forKey: key)
         return parsed
     }
@@ -71,11 +76,42 @@ private enum MarkdownRenderCache {
         return (String(prefix), body)
     }
 
+    private static func applyInlineTags(to attr: inout AttributedString, scheme: ColorScheme) {
+        let plain = String(attr.characters)
+        guard plain.contains("#") else { return }
+        let ns = plain as NSString
+        let matches = inlineTagRegex.matches(in: plain, options: [], range: NSRange(location: 0, length: ns.length))
+        guard !matches.isEmpty else { return }
+
+        let tagFg = FlomoPalette.tagText(scheme)
+        let tagBg = FlomoPalette.tagBg(scheme)
+
+        for m in matches {
+            let tokenNSRange = m.range(at: 2)
+            let rawTag = ns.substring(with: m.range(at: 3))
+            let normalized = rawTag
+                .split(separator: "/")
+                .map { $0.trimmingCharacters(in: .whitespaces) }
+                .filter { !$0.isEmpty }
+                .joined(separator: "/")
+            guard !normalized.isEmpty,
+                  let swiftRange = Range(tokenNSRange, in: plain),
+                  let attrRange = Range(swiftRange, in: attr) else { continue }
+            attr[attrRange].foregroundColor = tagFg
+            attr[attrRange].backgroundColor = tagBg
+            if let encoded = normalized.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed),
+               let url = URL(string: "whim-tag://tag/\(encoded)") {
+                attr[attrRange].link = url
+            }
+        }
+    }
+
     private static func inlineAttributed(
         _ raw: String,
         size: CGFloat = 14,
         weight: Font.Weight = .regular,
         color: Color,
+        scheme: ColorScheme,
         strikethrough: Bool = false
     ) -> AttributedString {
         var attr: AttributedString
@@ -90,12 +126,12 @@ private enum MarkdownRenderCache {
         if strikethrough {
             attr.strikethroughStyle = .single
         }
+        applyInlineTags(to: &attr, scheme: scheme)
         return attr
     }
 
-    private static func buildChunks(text: String, collapsed: Bool, scheme: ColorScheme) -> [MarkdownChunk] {
+    private static func buildChunks(text: String, scheme: ColorScheme) -> [MarkdownChunk] {
         let rawLines = text.components(separatedBy: "\n")
-        let effectiveLines = collapsed ? Array(rawLines.prefix(6)) : rawLines
         var out: [MarkdownChunk] = []
         var chunkId = 0
 
@@ -128,7 +164,7 @@ private enum MarkdownRenderCache {
         var codeLang = ""
         var codeBuf: [String] = []
 
-        for line in effectiveLines {
+        for line in rawLines {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.hasPrefix("```") {
                 if !inCode {
@@ -161,41 +197,41 @@ private enum MarkdownRenderCache {
                 rule.foregroundColor = muted.opacity(0.45)
                 appendLine(rule)
             } else if trimmed.hasPrefix("#### ") {
-                appendLine(inlineAttributed(String(trimmed.dropFirst(5)), size: 14.5, weight: .semibold, color: primary))
+                appendLine(inlineAttributed(String(trimmed.dropFirst(5)), size: 14.5, weight: .semibold, color: primary, scheme: scheme))
             } else if trimmed.hasPrefix("### ") {
-                appendLine(inlineAttributed(String(trimmed.dropFirst(4)), size: 15, weight: .semibold, color: primary))
+                appendLine(inlineAttributed(String(trimmed.dropFirst(4)), size: 15, weight: .semibold, color: primary, scheme: scheme))
             } else if trimmed.hasPrefix("## ") {
-                appendLine(inlineAttributed(String(trimmed.dropFirst(3)), size: 16.5, weight: .bold, color: primary))
+                appendLine(inlineAttributed(String(trimmed.dropFirst(3)), size: 16.5, weight: .bold, color: primary, scheme: scheme))
             } else if trimmed.hasPrefix("# ") {
-                appendLine(inlineAttributed(String(trimmed.dropFirst(2)), size: 18, weight: .bold, color: primary))
+                appendLine(inlineAttributed(String(trimmed.dropFirst(2)), size: 18, weight: .bold, color: primary, scheme: scheme))
             } else if trimmed.hasPrefix("- [ ] ") || trimmed.hasPrefix("- [x] ") || trimmed.hasPrefix("- [X] ") {
                 let done = !trimmed.hasPrefix("- [ ] ")
                 var row = AttributedString("\(indentStr)\(done ? "☑" : "☐") ")
                 row.font = .system(size: 14)
                 row.foregroundColor = done ? accent : muted
-                row.append(inlineAttributed(String(trimmed.dropFirst(6)), color: done ? secondary : primary, strikethrough: done))
+                row.append(inlineAttributed(String(trimmed.dropFirst(6)), color: done ? secondary : primary, scheme: scheme, strikethrough: done))
                 appendLine(row)
             } else if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
                 var row = AttributedString("\(indentStr)\(bulletSymbol(for: level)) ")
                 row.font = .system(size: 14, weight: .bold)
                 row.foregroundColor = secondary
-                row.append(inlineAttributed(String(trimmed.dropFirst(2)), color: primary))
+                row.append(inlineAttributed(String(trimmed.dropFirst(2)), color: primary, scheme: scheme))
                 appendLine(row)
             } else if let (num, bodyText) = parseOrderedList(trimmed) {
                 var row = AttributedString("\(indentStr)\(num). ")
                 row.font = .system(size: 13.5).monospacedDigit()
                 row.foregroundColor = secondary
-                row.append(inlineAttributed(bodyText, color: primary))
+                row.append(inlineAttributed(bodyText, color: primary, scheme: scheme))
                 appendLine(row)
             } else if trimmed.hasPrefix("> ") {
                 var row = AttributedString("\(indentStr)▎ ")
                 row.font = .system(size: 14, weight: .semibold)
                 row.foregroundColor = accent.opacity(0.8)
-                row.append(inlineAttributed(String(trimmed.dropFirst(2)), color: secondary))
+                row.append(inlineAttributed(String(trimmed.dropFirst(2)), color: secondary, scheme: scheme))
                 appendLine(row)
             } else {
                 var row = indentStr.isEmpty ? AttributedString() : AttributedString(indentStr)
-                row.append(inlineAttributed(trimmed, color: primary))
+                row.append(inlineAttributed(trimmed, color: primary, scheme: scheme))
                 appendLine(row)
             }
         }
@@ -209,19 +245,19 @@ private enum MarkdownRenderCache {
     }
 }
 
-/// High-performance Markdown renderer: merges contiguous text lines into a single cached
-/// AttributedString + Text view so scrolling renders 1 view per block instead of 10-25.
+/// High-performance Markdown renderer: keeps `#tag/subtag` inline at its exact original position
+/// with blue tag highlight and click-to-filter support.
 struct MarkdownBlockView: View, Equatable {
     @Environment(\.colorScheme) private var scheme
     let text: String
-    let collapsed: Bool
+    var onTapTag: ((String) -> Void)? = nil
 
     static func == (lhs: MarkdownBlockView, rhs: MarkdownBlockView) -> Bool {
-        lhs.text == rhs.text && lhs.collapsed == rhs.collapsed
+        lhs.text == rhs.text
     }
 
     var body: some View {
-        let chunks = MarkdownRenderCache.chunks(for: text, collapsed: collapsed, scheme: scheme)
+        let chunks = MarkdownRenderCache.chunks(for: text, scheme: scheme)
         VStack(alignment: .leading, spacing: 6) {
             ForEach(chunks) { chunk in
                 switch chunk {
@@ -230,6 +266,17 @@ struct MarkdownBlockView: View, Equatable {
                         .lineSpacing(5)
                         .fixedSize(horizontal: false, vertical: true)
                         .textSelection(.enabled)
+                        .environment(\.openURL, OpenURLAction { url in
+                            if url.scheme == "whim-tag" {
+                                let rawPath = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                                let decoded = rawPath.removingPercentEncoding ?? rawPath
+                                if !decoded.isEmpty {
+                                    onTapTag?(decoded)
+                                }
+                                return .handled
+                            }
+                            return .systemAction
+                        })
                 case .codeBlock(_, let lang, let code):
                     VStack(alignment: .leading, spacing: 4) {
                         if !lang.isEmpty {

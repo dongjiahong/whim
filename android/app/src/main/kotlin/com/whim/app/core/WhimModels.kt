@@ -105,6 +105,35 @@ data class WhimSyncSummary(
 
 @Immutable
 @Serializable
+data class WhimLivePeerStatus(
+    @SerialName("peer_id") val peerId: String = "",
+    @SerialName("display_name") val displayName: String = "",
+    val addr: String = "",
+    val online: Boolean = false,
+    @SerialName("rtt_ms") val rttMs: Long = 0,
+    @SerialName("last_pong_at") val lastPongAt: Long = 0,
+    @SerialName("last_sync_at") val lastSyncAt: Long = 0,
+    val status: String = "offline",
+    val message: String = ""
+)
+
+@Immutable
+@Serializable
+data class WhimSyncHealthStatus(
+    val state: String = "offline", // "connected" | "offline" | "unpaired" | "wrong_code"
+    val connected: Boolean = false,
+    @SerialName("online_peers") val onlinePeers: Int = 0,
+    @SerialName("total_peers") val totalPeers: Int = 0,
+    @SerialName("rtt_ms") val rttMs: Long = 0,
+    @SerialName("last_pong_at") val lastPongAt: Long = 0,
+    @SerialName("last_sync_at") val lastSyncAt: Long = 0,
+    @SerialName("peer_name") val peerName: String = "",
+    @SerialName("error_message") val errorMessage: String = "",
+    val peers: List<WhimLivePeerStatus> = emptyList()
+)
+
+@Immutable
+@Serializable
 data class WhimSyncPeer(
     @SerialName("peer_id") val peerId: String,
     @SerialName("display_name") val displayName: String = "",

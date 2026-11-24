@@ -34,6 +34,7 @@ import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.Sync
 import androidx.compose.material.icons.rounded.Update
 import androidx.compose.material3.Icon
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
@@ -90,6 +91,8 @@ fun MobileSettingsScreen(
     onPairCodeUpdated: (String) -> Unit,
     peerStatuses: List<WhimPeerSyncStatus>,
     onPeerStatusesUpdated: (List<WhimPeerSyncStatus>) -> Unit,
+    initialRelease: ReleaseInfo? = null,
+    onUpdateBadgeDismissed: () -> Unit = {},
     onSyncCompleted: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -105,9 +108,16 @@ fun MobileSettingsScreen(
     var isSyncing by remember { mutableStateOf(false) }
 
     var reviewSettingsMsg by remember { mutableStateOf("") }
-    var updateStatus by remember { mutableStateOf("当前版本 v${GitHubUpdater.CURRENT_VERSION}，点击检查 GitHub 最新版本") }
-    var availableRelease by remember { mutableStateOf<ReleaseInfo?>(null) }
+    var updateStatus by remember(initialRelease) {
+        mutableStateOf(
+            if (initialRelease != null) "发现新版本 ${initialRelease.tagName}"
+            else "当前版本 v${GitHubUpdater.CURRENT_VERSION}，点击检查 GitHub 最新版本"
+        )
+    }
+    var availableRelease by remember(initialRelease) { mutableStateOf(initialRelease) }
     var checkingUpdate by remember { mutableStateOf(false) }
+    var downloadingUpdate by remember { mutableStateOf(false) }
+    var downloadProgress by remember { mutableStateOf(0f) }
     var storageTotalBytes by remember { mutableStateOf(0L) }
     var storageDbBytes by remember { mutableStateOf(0L) }
     var storageBlobsBytes by remember { mutableStateOf(0L) }
@@ -746,20 +756,45 @@ fun MobileSettingsScreen(
                 title = "关于与更新 · v${GitHubUpdater.CURRENT_VERSION}",
                 highlighted = focusSection == SettingsFocusSection.ABOUT
             ) {
-                Text(updateStatus, style = t.meta, color = c.textSecondary)
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    updateStatus,
+                    style = t.meta,
+                    color = if (availableRelease != null) c.accent else c.textSecondary
+                )
+                if (downloadingUpdate) {
+                    LinearProgressIndicator(
+                        progress = { downloadProgress },
+                        modifier = Modifier.fillMaxWidth().height(4.dp).clip(RoundedCornerShape(2.dp)),
+                        color = c.accent,
+                        trackColor = c.canvas
+                    )
+                }
+                availableRelease?.body?.takeIf { it.isNotBlank() }?.let { notes ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(8.dp))
+                            .background(c.canvas)
+                            .padding(10.dp)
+                    ) {
+                        Text(notes, style = t.meta, color = c.textPrimary)
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), verticalAlignment = Alignment.CenterVertically) {
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(7.dp))
                             .background(c.accent)
-                            .clickable(enabled = !checkingUpdate) {
+                            .clickable(enabled = !checkingUpdate && !downloadingUpdate) {
                                 checkingUpdate = true
                                 updateStatus = "正在检查 GitHub Release..."
+                                GitHubUpdater.clearSkippedVersion(context)
                                 scope.launch {
                                     val res = GitHubUpdater.checkLatest()
                                     checkingUpdate = false
                                     updateStatus = res.message
                                     availableRelease = if (res.hasUpdate) res.release else null
+                                    if (!res.hasUpdate) onUpdateBadgeDismissed()
                                 }
                             }
                             .padding(horizontal = 14.dp, vertical = 8.dp)
@@ -771,15 +806,34 @@ fun MobileSettingsScreen(
                             modifier = Modifier
                                 .clip(RoundedCornerShape(7.dp))
                                 .background(c.tagBg)
-                                .clickable {
+                                .clickable(enabled = !downloadingUpdate) {
+                                    downloadingUpdate = true
+                                    downloadProgress = 0f
                                     updateStatus = "正在下载 APK..."
                                     scope.launch {
-                                        updateStatus = GitHubUpdater.downloadAndInstallApk(context, rel)
+                                        updateStatus = GitHubUpdater.downloadAndInstallApk(context, rel) { p ->
+                                            downloadProgress = p
+                                            updateStatus = "正在下载 APK（${(p * 100).toInt()}%）..."
+                                        }
+                                        downloadingUpdate = false
                                     }
                                 }
                                 .padding(horizontal = 14.dp, vertical = 8.dp)
                         ) {
-                            Text("一键下载安装", style = t.meta, color = c.tagText, fontWeight = FontWeight.Medium)
+                            Text(if (downloadingUpdate) "下载中..." else "一键下载安装", style = t.meta, color = c.tagText, fontWeight = FontWeight.Medium)
+                        }
+                        if (!downloadingUpdate) {
+                            Text(
+                                "跳过",
+                                style = t.meta,
+                                color = c.textMuted,
+                                modifier = Modifier.clickable {
+                                    GitHubUpdater.skipVersion(context, rel.tagName)
+                                    availableRelease = null
+                                    updateStatus = "已跳过 ${rel.tagName} 提醒，可随时手动检查更新"
+                                    onUpdateBadgeDismissed()
+                                }
+                            )
                         }
                     }
                 }

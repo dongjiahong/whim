@@ -335,6 +335,8 @@ private fun FlomoMobileApp(
     var peerStatuses by remember { mutableStateOf<List<com.whim.app.core.WhimPeerSyncStatus>>(emptyList()) }
     var syncHealth by remember { mutableStateOf(WhimSyncHealthStatus()) }
     var isSyncingNow by remember { mutableStateOf(false) }
+    var latestUpdateRelease by remember { mutableStateOf<com.whim.app.update.ReleaseInfo?>(null) }
+    var hasAppUpdate by remember { mutableStateOf(false) }
     var lastLoadedVersion by remember { mutableStateOf(-1L) }
     var foregroundSyncTrigger by remember { mutableStateOf(0) }
 
@@ -445,6 +447,15 @@ private fun FlomoMobileApp(
 
     LaunchedEffect(Unit) {
         refreshMetadata()
+        delay(3000L)
+        if (GitHubUpdater.shouldAutoCheck(context)) {
+            GitHubUpdater.markAutoChecked(context)
+            val res = GitHubUpdater.checkLatest()
+            if (res.hasUpdate && res.release != null && !GitHubUpdater.isVersionSkipped(context, res.release.tagName)) {
+                latestUpdateRelease = res.release
+                hasAppUpdate = true
+            }
+        }
     }
 
     LaunchedEffect(openReviewSignal) {
@@ -855,17 +866,28 @@ private fun FlomoMobileApp(
                                 .size(22.dp)
                                 .clickable { showSearch = !showSearch }
                         )
-                        Icon(
-                            Icons.Rounded.Settings,
-                            contentDescription = "设置",
-                            tint = c.textSecondary,
-                            modifier = Modifier
-                                .size(22.dp)
-                                .clickable {
-                                    settingsFocusSection = SettingsFocusSection.ALL
-                                    showSettingsScreen = true
-                                }
-                        )
+                        Box(
+                            modifier = Modifier.clickable {
+                                settingsFocusSection = if (hasAppUpdate) SettingsFocusSection.ABOUT else SettingsFocusSection.ALL
+                                showSettingsScreen = true
+                            }
+                        ) {
+                            Icon(
+                                Icons.Rounded.Settings,
+                                contentDescription = "设置",
+                                tint = c.textSecondary,
+                                modifier = Modifier.size(22.dp)
+                            )
+                            if (hasAppUpdate) {
+                                Box(
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .size(7.dp)
+                                        .clip(CircleShape)
+                                        .background(Color(0xFFEF4444))
+                                )
+                            }
+                        }
                     }
                 }
 
@@ -1289,6 +1311,11 @@ private fun FlomoMobileApp(
             onPairCodeUpdated = { pairCode = it },
             peerStatuses = peerStatuses,
             onPeerStatusesUpdated = { peerStatuses = it },
+            initialRelease = latestUpdateRelease,
+            onUpdateBadgeDismissed = {
+                hasAppUpdate = false
+                latestUpdateRelease = null
+            },
             onSyncCompleted = { reload() },
             onBack = { showSettingsScreen = false }
         )

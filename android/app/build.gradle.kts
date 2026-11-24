@@ -1,9 +1,34 @@
+import java.io.File
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
     id("org.jetbrains.kotlin.plugin.serialization")
 }
+
+val keystorePropsFile = rootProject.file("keystore.properties")
+val keystoreProps = Properties().apply {
+    if (keystorePropsFile.exists()) {
+        keystorePropsFile.inputStream().use { load(it) }
+    }
+}
+
+fun signingProp(envKey: String, propKey: String): String {
+    return System.getenv(envKey)?.takeIf { it.isNotBlank() }
+        ?: keystoreProps.getProperty(propKey)?.takeIf { it.isNotBlank() }
+        ?: ""
+}
+
+val releaseStorePath = signingProp("WHIM_KEYSTORE_PATH", "storeFile")
+val releaseStorePassword = signingProp("WHIM_KEYSTORE_PASSWORD", "storePassword")
+val releaseKeyAlias = signingProp("WHIM_KEY_ALIAS", "keyAlias")
+val releaseKeyPassword = signingProp("WHIM_KEY_PASSWORD", "keyPassword")
+val releaseKeystoreFile: File? = releaseStorePath.takeIf { it.isNotEmpty() }?.let { raw ->
+    val f = File(raw)
+    if (f.isAbsolute) f else rootProject.file(raw)
+}?.takeIf { it.exists() }
 
 android {
     namespace = "com.whim.app"
@@ -17,6 +42,17 @@ android {
         versionName = "0.1.3"
     }
 
+    signingConfigs {
+        if (releaseKeystoreFile != null && releaseStorePassword.isNotEmpty() && releaseKeyAlias.isNotEmpty() && releaseKeyPassword.isNotEmpty()) {
+            create("release") {
+                storeFile = releaseKeystoreFile
+                storePassword = releaseStorePassword
+                keyAlias = releaseKeyAlias
+                keyPassword = releaseKeyPassword
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = true
@@ -25,9 +61,9 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
-            // Sign with debug keystore by default so local `adb install -r` & GitHub Release
-            // APKs upgrade seamlessly without signature mismatch.
-            signingConfig = signingConfigs.getByName("debug")
+            // Use persistent release keystore when configured (local keystore.properties or CI secrets)
+            // so local builds and GitHub Release APKs share the exact same signature for seamless upgrades.
+            signingConfig = signingConfigs.findByName("release") ?: signingConfigs.getByName("debug")
         }
     }
 

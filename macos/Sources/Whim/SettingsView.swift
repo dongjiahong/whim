@@ -78,7 +78,7 @@ struct SettingsModalView: View {
     @State private var storageCleanupMsg: String = ""
     @State private var isCleaningStorage: Bool = false
     @State private var storageLoaded: Bool = false
-    @StateObject private var updater = GitHubUpdater()
+    @ObservedObject private var updater = GitHubUpdater.shared
 
     private var themeMode: AppThemeMode {
         AppThemeMode(rawValue: themeModeRaw) ?? .system
@@ -106,6 +106,11 @@ struct SettingsModalView: View {
                                 .font(.system(size: 13.5, weight: active ? .medium : .regular))
                                 .foregroundColor(active ? .white : FlomoPalette.textPrimary(scheme))
                             Spacer()
+                            if sec == .about && updater.hasUpdate {
+                                Circle()
+                                    .fill(Color(hex: 0xEF4444))
+                                    .frame(width: 7, height: 7)
+                            }
                         }
                         .padding(.horizontal, 12)
                         .padding(.vertical, 9)
@@ -727,7 +732,12 @@ struct SettingsModalView: View {
 
                 Text(updater.status)
                     .font(.system(size: 12.5))
-                    .foregroundColor(FlomoPalette.textSecondary(scheme))
+                    .foregroundColor(updater.hasUpdate ? FlomoPalette.accent(scheme) : FlomoPalette.textSecondary(scheme))
+
+                if updater.downloading {
+                    ProgressView(value: updater.downloadProgress)
+                        .tint(FlomoPalette.accent(scheme))
+                }
 
                 if let notes = updater.latestRelease?.body, !notes.isEmpty, updater.hasUpdate {
                     ScrollView {
@@ -754,6 +764,15 @@ struct SettingsModalView: View {
                         .disabled(updater.downloading)
                         .buttonStyle(.borderedProminent)
                         .tint(FlomoPalette.accent(scheme))
+
+                        if !updater.downloading {
+                            Button("跳过此版本") {
+                                updater.skipCurrentRelease()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 12))
+                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                        }
                     }
                 }
             }

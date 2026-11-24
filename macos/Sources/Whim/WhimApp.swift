@@ -1043,6 +1043,7 @@ struct MainContentView: View {
     let onToggleWindowPin: (Bool) -> Void
 
     @AppStorage("whim.themeMode") private var themeModeRaw: String = AppThemeMode.system.rawValue
+    @ObservedObject private var updater = GitHubUpdater.shared
     @State private var showSettingsSheet: Bool = false
     @State private var settingsInitialSection: SettingsSection = .general
     @State private var previewImagePath: String? = nil
@@ -1135,7 +1136,7 @@ struct MainContentView: View {
                     Divider().opacity(0.25)
                     HStack(spacing: 8) {
                         Button {
-                            settingsInitialSection = .general
+                            settingsInitialSection = updater.hasUpdate ? .about : .general
                             showSettingsSheet = true
                         } label: {
                             HStack(spacing: 6) {
@@ -1143,12 +1144,18 @@ struct MainContentView: View {
                                     .font(.system(size: 12))
                                 Text("设置")
                                     .font(.system(size: 12))
+                                if updater.hasUpdate {
+                                    Circle()
+                                        .fill(Color(hex: 0xEF4444))
+                                        .frame(width: 6.5, height: 6.5)
+                                }
                             }
                             .foregroundColor(FlomoPalette.textMuted(scheme))
                             .padding(.horizontal, 6)
                             .padding(.vertical, 4)
                         }
                         .buttonStyle(.plain)
+                        .help(updater.hasUpdate ? "发现新版本 \(updater.latestRelease?.tagName ?? "")，点击查看更新" : "打开偏好设置 (⌘,)")
 
                         Spacer()
 
@@ -1453,6 +1460,9 @@ struct MainContentView: View {
         .frame(minWidth: 880, minHeight: 620)
         .background(FlomoPalette.canvas(scheme))
         .preferredColorScheme((AppThemeMode(rawValue: themeModeRaw) ?? .system).colorScheme)
+        .onAppear {
+            GitHubUpdater.shared.silentCheckOnLaunch()
+        }
         .sheet(isPresented: Binding(get: { previewImagePath != nil }, set: { if !$0 { previewImagePath = nil } })) {
             if let path = previewImagePath, let img = NSImage(contentsOfFile: path) {
                 VStack(spacing: 12) {

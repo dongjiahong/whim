@@ -187,9 +187,11 @@ func (e *Engine) ListPairedPeers() ([]model.SyncPeer, error) {
 	return e.Store.ListSyncPeers()
 }
 
-// RemovePairedPeer removes a paired remote device.
+// RemovePairedPeer bidirectionally unpairs a remote device and stops all reconnect attempts.
 func (e *Engine) RemovePairedPeer(peerID string) error {
-	return e.Store.DeleteSyncPeer(peerID)
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	return e.Peer.UnpairPeer(ctx, peerID)
 }
 
 // ExportMarkdown exports notes to Markdown files under outDir.

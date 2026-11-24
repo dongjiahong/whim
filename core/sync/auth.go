@@ -13,31 +13,37 @@ import (
 )
 
 const (
-	nonceTTL      = 30 * time.Second
-	maxNonces     = 64
-	maxFailures   = 5
-	lockDuration  = 60 * time.Second
-	HeaderNonce   = "X-Whim-Nonce"
-	HeaderProof   = "X-Whim-Proof"
-	HeaderPeerID  = "X-Whim-Peer-ID"
+	nonceTTL         = 30 * time.Second
+	maxNonces        = 64
+	maxFailures      = 5
+	lockDuration     = 60 * time.Second
+	HeaderNonce      = "X-Whim-Nonce"
+	HeaderProof      = "X-Whim-Proof"
+	HeaderPeerID     = "X-Whim-Peer-ID"
+	HeaderPairIntent = "X-Whim-Pair"
 )
 
-// Auth manages 6-digit pairing code verification with one-time nonces and lockout.
+type clientAuthState struct {
+	failures    int
+	lockedUntil time.Time
+}
+
+// Auth manages 6-digit pairing code verification with one-time nonces and per-client lockout.
 type Auth struct {
-	mu           sync.Mutex
-	code         string
-	nonces       map[string]time.Time
-	failures     int
-	lockedUntil  time.Time
-	nowFn        func() time.Time
+	mu      sync.Mutex
+	code    string
+	nonces  map[string]time.Time
+	clients map[string]*clientAuthState
+	nowFn   func() time.Time
 }
 
 // NewAuth creates an Auth instance with the given 6-digit code.
 func NewAuth(code string) *Auth {
 	return &Auth{
-		code:   NormalizeCode(code),
-		nonces: make(map[string]time.Time),
-		nowFn:  time.Now,
+		code:    NormalizeCode(code),
+		nonces:  make(map[string]time.Time),
+		clients: make(map[string]*clientAuthState),
+		nowFn:   time.Now,
 	}
 }
 
@@ -73,8 +79,7 @@ func (a *Auth) SetCode(code string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.code = NormalizeCode(code)
-	a.failures = 0
-	a.lockedUntil = time.Time{}
+	a.clients = make(map[string]*clientAuthState)
 	a.nonces = make(map[string]time.Time)
 }
 
@@ -97,7 +102,6 @@ func (a *Auth) IssueNonce() string {
 		}
 	}
 	if len(a.nonces) >= maxNonces {
-		// Evict oldest
 		var oldestKey string
 		var oldestExp time.Time
 		for k, exp := range a.nonces {
@@ -125,39 +129,54 @@ type VerifyResult struct {
 	RetryAfterSecond int
 }
 
-// Verify checks a one-time nonce and HMAC proof in constant time.
+// Verify checks a one-time nonce and HMAC proof in constant time using the default client bucket.
 func (a *Auth) Verify(nonce, proof string) VerifyResult {
+	return a.VerifyFrom("default", nonce, proof)
+}
+
+// VerifyFrom checks a one-time nonce and HMAC proof with per-client lockout isolation
+// so one misconfigured device never locks out other paired devices.
+func (a *Auth) VerifyFrom(clientKey, nonce, proof string) VerifyResult {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
+	if clientKey == "" {
+		clientKey = "default"
+	}
+	st, ok := a.clients[clientKey]
+	if !ok {
+		st = &clientAuthState{}
+		a.clients[clientKey] = st
+	}
+
 	now := a.nowFn()
-	if now.Before(a.lockedUntil) {
-		rem := int(a.lockedUntil.Sub(now).Seconds()) + 1
+	if now.Before(st.lockedUntil) {
+		rem := int(st.lockedUntil.Sub(now).Seconds()) + 1
 		return VerifyResult{OK: false, Locked: true, RetryAfterSecond: rem}
 	}
 
 	exp, exists := a.nonces[nonce]
 	if !exists || now.After(exp) {
 		delete(a.nonces, nonce)
-		return a.recordFailureLocked(now)
+		return a.recordFailureLocked(st, now)
 	}
 	// One-time use: consume immediately.
 	delete(a.nonces, nonce)
 
 	expected := ComputeProof(a.code, nonce)
 	if !hmac.Equal([]byte(strings.ToLower(strings.TrimSpace(proof))), []byte(expected)) {
-		return a.recordFailureLocked(now)
+		return a.recordFailureLocked(st, now)
 	}
 
-	a.failures = 0
+	st.failures = 0
 	return VerifyResult{OK: true}
 }
 
-func (a *Auth) recordFailureLocked(now time.Time) VerifyResult {
-	a.failures++
-	if a.failures >= maxFailures {
-		a.lockedUntil = now.Add(lockDuration)
-		a.failures = 0
+func (a *Auth) recordFailureLocked(st *clientAuthState, now time.Time) VerifyResult {
+	st.failures++
+	if st.failures >= maxFailures {
+		st.lockedUntil = now.Add(lockDuration)
+		st.failures = 0
 		return VerifyResult{OK: false, Locked: true, RetryAfterSecond: int(lockDuration.Seconds())}
 	}
 	return VerifyResult{OK: false}

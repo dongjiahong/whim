@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"strings"
@@ -21,10 +22,25 @@ import (
 )
 
 const (
-	clockMarginMs  = int64(5 * 60 * 1000) // 5 minutes clock skew margin
-	maxBlobBytes   = 32 * 1024 * 1024     // 32 MB per pasted image
-	syncBatchLimit = 500                  // max notes per /sync/exchange HTTP batch
+	clockMarginMs    = int64(5 * 60 * 1000) // 5 minutes clock skew margin
+	maxBlobBytes     = 32 * 1024 * 1024     // 32 MB per pasted image
+	syncBatchLimit   = 500                  // max notes per /sync/exchange HTTP batch
+	metaRevokedPeers = "whim.revoked_peers"
 )
+
+// ErrPeerUnpaired is returned when the remote peer explicitly unpaired this device (HTTP 410 Gone).
+var ErrPeerUnpaired = errors.New("unpaired")
+
+type pairedOutboundTarget struct {
+	peerID      string
+	displayName string
+	addr        string
+	code        string
+}
+
+type unpairRequest struct {
+	PeerID string `json:"peer_id"`
+}
 
 // Peer manages both incoming peer sync requests (authenticated against THIS device's own localCode)
 // and outgoing bidirectional sync exchanges (authenticated against EACH remote peer's own code).
@@ -42,18 +58,22 @@ type Peer struct {
 	client       *http.Client
 	streamClient *http.Client // no timeout for long-lived SSE push streams
 
-	sseMu           sync.Mutex
-	sseSubs         map[*sseSubscriber]struct{}
-	activeSSEPeers  map[string]int64           // peerID -> connected unix ms
-	peerLiveness    map[string]*peerLiveRecord // peerID -> last verified ping/pong
-	pendingPings    map[string]*pendingPing    // pingID -> in-flight SSE ping waiter
-	localChanged    chan struct{}
-	remoteChanged   chan struct{}
-	sseReconnect    chan struct{}
-	sseStarted      bool
-	sseCancel       context.CancelFunc
-	sseStreamCancel context.CancelFunc
-	dataVersion     atomic.Int64
+	revokedMu     sync.Mutex
+	revokedLoaded bool
+	revokedPeers  map[string]bool
+
+	sseMu          sync.Mutex
+	sseSubs        map[*sseSubscriber]struct{}
+	activeSSEPeers map[string]int64              // peerID -> connected unix ms
+	peerLiveness   map[string]*peerLiveRecord    // peerID -> last verified ping/pong
+	pendingPings   map[string]*pendingPing       // pingID -> in-flight SSE ping waiter
+	sseStreams     map[string]context.CancelFunc // peerID -> active outbound SSE cancel
+	localChanged   chan struct{}
+	remoteChanged  chan struct{}
+	sseReconnect   chan struct{}
+	sseStarted     bool
+	sseCancel      context.CancelFunc
+	dataVersion    atomic.Int64
 }
 
 // NewPeer constructs a Peer attached to a local Store.
@@ -63,7 +83,7 @@ func NewPeer(st *store.Store, peerID, displayName, localCode string) *Peer {
 			Timeout:   2 * time.Second,
 			KeepAlive: 15 * time.Second,
 		}).DialContext,
-		MaxIdleConns:        8,
+		MaxIdleConns:        16,
 		IdleConnTimeout:     30 * time.Second,
 		TLSHandshakeTimeout: 3 * time.Second,
 	}
@@ -88,13 +108,78 @@ func NewPeer(st *store.Store, peerID, displayName, localCode string) *Peer {
 		streamClient: &http.Client{
 			Transport: streamTransport,
 		},
+		revokedPeers:   make(map[string]bool),
 		sseSubs:        make(map[*sseSubscriber]struct{}),
 		activeSSEPeers: make(map[string]int64),
 		peerLiveness:   make(map[string]*peerLiveRecord),
 		pendingPings:   make(map[string]*pendingPing),
+		sseStreams:     make(map[string]context.CancelFunc),
 		localChanged:   make(chan struct{}, 1),
 		remoteChanged:  make(chan struct{}, 1),
 		sseReconnect:   make(chan struct{}, 1),
+	}
+}
+
+func (p *Peer) loadRevokedLocked() {
+	if p.revokedLoaded {
+		return
+	}
+	p.revokedLoaded = true
+	if raw, err := p.store.GetMeta(metaRevokedPeers); err == nil && raw != "" {
+		var ids []string
+		if json.Unmarshal([]byte(raw), &ids) == nil {
+			for _, id := range ids {
+				if id != "" {
+					p.revokedPeers[id] = true
+				}
+			}
+		}
+	}
+}
+
+func (p *Peer) saveRevokedLocked() {
+	ids := make([]string, 0, len(p.revokedPeers))
+	for id := range p.revokedPeers {
+		ids = append(ids, id)
+	}
+	if b, err := json.Marshal(ids); err == nil {
+		_ = p.store.SetMeta(metaRevokedPeers, string(b))
+	}
+}
+
+func (p *Peer) isPeerRevoked(peerID string) bool {
+	if peerID == "" {
+		return false
+	}
+	p.revokedMu.Lock()
+	defer p.revokedMu.Unlock()
+	p.loadRevokedLocked()
+	return p.revokedPeers[peerID]
+}
+
+func (p *Peer) addRevokedPeer(peerID string) {
+	if peerID == "" {
+		return
+	}
+	p.revokedMu.Lock()
+	defer p.revokedMu.Unlock()
+	p.loadRevokedLocked()
+	if !p.revokedPeers[peerID] {
+		p.revokedPeers[peerID] = true
+		p.saveRevokedLocked()
+	}
+}
+
+func (p *Peer) clearRevokedPeer(peerID string) {
+	if peerID == "" {
+		return
+	}
+	p.revokedMu.Lock()
+	defer p.revokedMu.Unlock()
+	p.loadRevokedLocked()
+	if p.revokedPeers[peerID] {
+		delete(p.revokedPeers, peerID)
+		p.saveRevokedLocked()
 	}
 }
 
@@ -103,11 +188,33 @@ func (p *Peer) DataVersion() int64 {
 	return p.dataVersion.Load()
 }
 
-// ReconnectEvents tears down any existing (potentially half-open/zombie) SSE stream
-// and immediately wakes the subscriber loop to establish a fresh connection.
+// ReconnectEvents tears down existing outbound SSE streams and wakes the supervisor
+// so newly paired hosts connect immediately and unpaired hosts stay disconnected.
 func (p *Peer) ReconnectEvents() {
 	p.sseMu.Lock()
-	cancel := p.sseStreamCancel
+	cancels := make([]context.CancelFunc, 0, len(p.sseStreams))
+	for _, cancel := range p.sseStreams {
+		if cancel != nil {
+			cancels = append(cancels, cancel)
+		}
+	}
+	p.sseMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	select {
+	case p.sseReconnect <- struct{}{}:
+	default:
+	}
+}
+
+func (p *Peer) stopOutboundSSE(peerID string) {
+	if peerID == "" {
+		return
+	}
+	p.sseMu.Lock()
+	cancel := p.sseStreams[peerID]
+	delete(p.sseStreams, peerID)
 	p.sseMu.Unlock()
 	if cancel != nil {
 		cancel()
@@ -202,6 +309,7 @@ func (p *Peer) StartServer(httpPort int, enableDiscovery bool) (int, error) {
 	mux.HandleFunc("/sync/events", p.handleEvents)
 	mux.HandleFunc("/sync/ping", p.handlePing)
 	mux.HandleFunc("/sync/pong", p.handlePong)
+	mux.HandleFunc("/sync/unpair", p.handleUnpair)
 	mux.HandleFunc("/sync/blobs/", p.handleBlob)
 
 	srv := &http.Server{
@@ -267,7 +375,7 @@ func (p *Peer) DiscoverLAN(ctx context.Context) ([]model.DiscoveredPeerInfo, err
 	pairedList, _ := p.store.ListSyncPeers()
 	pairedSet := make(map[string]bool, len(pairedList))
 	for _, sp := range pairedList {
-		if sp.PairCode != "" {
+		if sp.PeerID != "" {
 			pairedSet[sp.PeerID] = true
 		}
 	}
@@ -300,10 +408,20 @@ func (p *Peer) PairAndSync(ctx context.Context, addr, remoteCode string) (model.
 		addr = fmt.Sprintf("%s:%d", addr, DefaultHTTPPort)
 	}
 
-	merged, dl, ul, err := p.SyncWithAddr(ctx, addr, "", norm)
+	merged, dl, ul, remotePeerID, err := p.syncWithAddrInternal(ctx, addr, "", norm, true)
 	if err != nil {
 		return model.SyncSummary{}, err
 	}
+	if remotePeerID != "" {
+		p.clearRevokedPeer(remotePeerID)
+	}
+	// Ensure background SSE supervisor immediately subscribes to this newly paired host.
+	p.ensureEventSubscriber()
+	select {
+	case p.sseReconnect <- struct{}{}:
+	default:
+	}
+
 	return model.SyncSummary{
 		PeersFound:      1,
 		PeersSynced:     1,
@@ -313,94 +431,210 @@ func (p *Peer) PairAndSync(ctx context.Context, addr, remoteCode string) (model.
 	}, nil
 }
 
-// SyncOnce discovers all online LAN peers via UDP (plus optional manual fallback addrs)
-// and performs bidirectional sync with every discovered peer using the library's 6-digit code.
-func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
-	var summary model.SyncSummary
+// UnpairPeer removes a paired peer locally, tears down its SSE stream, records it as revoked
+// so offline reconnects get 410 Gone, and notifies the remote peer immediately if reachable.
+func (p *Peer) UnpairPeer(ctx context.Context, peerID string) error {
+	peerID = strings.TrimSpace(peerID)
+	if peerID == "" {
+		return nil
+	}
+	sp, _ := p.store.GetSyncPeer(peerID)
+
+	// 1. Mark revoked locally so any future reconnect from this peer returns 410 Gone
+	// until the user explicitly re-pairs.
+	p.addRevokedPeer(peerID)
+
+	// 2. Delete from local sync_peers table.
+	_ = p.store.DeleteSyncPeer(peerID)
+
+	// 3. Clear liveness / active SSE maps & notify any online inbound SSE streams for this peer.
+	p.sseMu.Lock()
+	delete(p.peerLiveness, peerID)
+	if sp != nil && sp.LastAddr != "" {
+		delete(p.peerLiveness, "addr:"+sp.LastAddr)
+	}
+	delete(p.activeSSEPeers, peerID)
+	var inboundSubs []*sseSubscriber
+	for sub := range p.sseSubs {
+		if sub.peerID == peerID {
+			inboundSubs = append(inboundSubs, sub)
+		}
+	}
+	p.sseMu.Unlock()
+
+	for _, sub := range inboundSubs {
+		select {
+		case sub.unpairCh <- p.peerID:
+		default:
+			sub.close()
+		}
+	}
+
+	// 4. Stop any outbound SSE goroutine targeting this peer.
+	p.stopOutboundSSE(peerID)
+
+	// 5. If this was an outbound paired host, send best-effort authenticated POST /sync/unpair.
+	if sp != nil && len(NormalizeCode(sp.PairCode)) == 6 && strings.Contains(sp.LastAddr, ":") {
+		unpairCtx, cancel := context.WithTimeout(ctx, 2500*time.Millisecond)
+		defer cancel()
+		addr := sp.LastAddr
+		// Check if UDP discovery sees this peer on a fresher IP
+		p.mu.Lock()
+		discPort := p.discoveryPort
+		p.mu.Unlock()
+		if disc, err := DiscoverPeers(unpairCtx, discPort, p.peerID, 300*time.Millisecond); err == nil {
+			for _, d := range disc {
+				if d.PeerID == peerID && d.Addr != "" {
+					addr = d.Addr
+					break
+				}
+			}
+		}
+		_, _ = p.authedRequest(
+			unpairCtx,
+			http.MethodPost,
+			"http://"+addr+"/sync/unpair",
+			unpairRequest{PeerID: p.peerID},
+			"application/json",
+			sp.PairCode,
+		)
+	}
+
+	// 6. Wake local UI so the removed device disappears immediately.
+	p.NotifyChanged()
+	return nil
+}
+
+// handleRemoteUnpaired cleans up local pairing state when the remote peer tells us
+// (via POST /sync/unpair, SSE event: unpair, or HTTP 410 Gone) that it disconnected us.
+func (p *Peer) handleRemoteUnpaired(peerID, addr string) {
+	peerID = strings.TrimSpace(peerID)
+	addr = strings.TrimSpace(addr)
+
+	if peerID == "" && addr != "" {
+		if saved, err := p.store.ListSyncPeers(); err == nil {
+			for _, sp := range saved {
+				if sp.LastAddr == addr {
+					peerID = sp.PeerID
+					break
+				}
+			}
+		}
+	}
+
+	if peerID != "" {
+		_ = p.store.DeleteSyncPeer(peerID)
+	}
+
+	p.sseMu.Lock()
+	if peerID != "" {
+		delete(p.peerLiveness, peerID)
+		delete(p.activeSSEPeers, peerID)
+	}
+	if addr != "" {
+		delete(p.peerLiveness, "addr:"+addr)
+	}
+	var inboundSubs []*sseSubscriber
+	for sub := range p.sseSubs {
+		if peerID != "" && sub.peerID == peerID {
+			inboundSubs = append(inboundSubs, sub)
+		}
+	}
+	p.sseMu.Unlock()
+
+	for _, sub := range inboundSubs {
+		sub.close()
+	}
+	if peerID != "" {
+		p.stopOutboundSSE(peerID)
+	}
+	log.Printf("[whim-sync] remote peer unpaired us: peer=%s addr=%s (stopped reconnecting)", peerID, addr)
+	p.NotifyChanged()
+}
+
+// findPairedOutboundTargets returns all paired remote server hosts (sync_peers entries with a
+// 6-digit remote pair_code and host:port address), resolving fresh IPs via UDP discovery if available.
+func (p *Peer) findPairedOutboundTargets(ctx context.Context) []pairedOutboundTarget {
+	savedPeers, err := p.store.ListSyncPeers()
+	if err != nil || len(savedPeers) == 0 {
+		return nil
+	}
+
+	var outbound []model.SyncPeer
+	for _, sp := range savedPeers {
+		if sp.PeerID == "" || sp.PeerID == p.peerID {
+			continue
+		}
+		if len(NormalizeCode(sp.PairCode)) == 6 && strings.Contains(sp.LastAddr, ":") {
+			outbound = append(outbound, sp)
+		}
+	}
+	if len(outbound) == 0 {
+		return nil
+	}
 
 	p.mu.Lock()
 	discPort := p.discoveryPort
 	p.mu.Unlock()
 
-	code := p.auth.Code()
-	discovered, _ := DiscoverPeers(ctx, discPort, p.peerID, 700*time.Millisecond)
-
-	// Merge optional manual fallback addresses and previously known server hosts (host:port)
-	// so Android never misses a sync even if a Wi-Fi UDP broadcast packet is dropped.
-	type targetPeer struct {
-		peerID      string
-		displayName string
-		addr        string
-	}
-	byAddr := make(map[string]targetPeer)
-	discoveredPeerIDs := make(map[string]bool, len(discovered))
-	for _, dp := range discovered {
-		byAddr[dp.Addr] = targetPeer{peerID: dp.PeerID, displayName: dp.DisplayName, addr: dp.Addr}
-		if dp.PeerID != "" {
-			discoveredPeerIDs[dp.PeerID] = true
-		}
-	}
-	if savedPeers, err := p.store.ListSyncPeers(); err == nil {
-		for _, sp := range savedPeers {
-			if sp.PeerID == p.peerID || !strings.Contains(sp.LastAddr, ":") {
-				continue
-			}
-			// Prefer freshly UDP-discovered address if this peerID is already online on a new DHCP IP.
-			if sp.PeerID != "" && discoveredPeerIDs[sp.PeerID] {
-				continue
-			}
-			if _, exists := byAddr[sp.LastAddr]; !exists {
-				byAddr[sp.LastAddr] = targetPeer{
-					peerID:      sp.PeerID,
-					displayName: sp.DisplayName,
-					addr:        sp.LastAddr,
-				}
-			}
-		}
-	}
-	if rawManual, _ := p.store.GetMeta("whim.manual_addrs"); rawManual != "" {
-		var addrs []string
-		if json.Unmarshal([]byte(rawManual), &addrs) == nil {
-			for _, a := range addrs {
-				a = strings.TrimSpace(a)
-				if a == "" {
-					continue
-				}
-				if !strings.Contains(a, ":") {
-					a = fmt.Sprintf("%s:%d", a, DefaultHTTPPort)
-				}
-				if _, exists := byAddr[a]; !exists {
-					byAddr[a] = targetPeer{displayName: "手动设备", addr: a}
-				}
+	discoveredByID := make(map[string]DiscoveredPeer)
+	if discovered, derr := DiscoverPeers(ctx, discPort, p.peerID, 500*time.Millisecond); derr == nil {
+		for _, d := range discovered {
+			if d.PeerID != "" {
+				discoveredByID[d.PeerID] = d
 			}
 		}
 	}
 
-	summary.PeersFound = len(byAddr)
-	seenPeerIDs := make(map[string]bool)
-	seenAddrs := make(map[string]bool)
-	var targets []targetPeer
-	for _, t := range byAddr {
+	targets := make([]pairedOutboundTarget, 0, len(outbound))
+	for _, sp := range outbound {
+		addr := sp.LastAddr
+		name := sp.DisplayName
+		if d, ok := discoveredByID[sp.PeerID]; ok {
+			if d.Addr != "" && d.Addr != addr {
+				addr = d.Addr
+				_ = p.store.UpsertSyncPeer(model.SyncPeer{
+					PeerID:      sp.PeerID,
+					DisplayName: d.DisplayName,
+					LastAddr:    addr,
+					PairCode:    sp.PairCode,
+				})
+			}
+			if d.DisplayName != "" {
+				name = d.DisplayName
+			}
+		}
+		targets = append(targets, pairedOutboundTarget{
+			peerID:      sp.PeerID,
+			displayName: name,
+			addr:        addr,
+			code:        NormalizeCode(sp.PairCode),
+		})
+	}
+	return targets
+}
+
+// SyncOnce performs bidirectional sync ONLY with paired outbound peers (using each peer's
+// own saved 6-digit code) and reports status of inbound connected clients.
+// It NEVER sends auth requests to unpaired LAN devices.
+func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
+	var summary model.SyncSummary
+
+	targets := p.findPairedOutboundTargets(ctx)
+	summary.PeersFound = len(targets)
+
+	seenPeerIDs := make(map[string]bool, len(targets))
+	seenAddrs := make(map[string]bool, len(targets))
+	for _, t := range targets {
 		if t.peerID != "" {
 			seenPeerIDs[t.peerID] = true
 		}
 		if t.addr != "" {
 			seenAddrs[t.addr] = true
 		}
-		if len(NormalizeCode(code)) != 6 {
-			summary.Peers = append(summary.Peers, model.PeerSyncStatus{
-				PeerID:      t.peerID,
-				DisplayName: t.displayName,
-				Addr:        t.addr,
-				Status:      "need",
-				Message:     "需要配对码",
-			})
-			continue
-		}
-		targets = append(targets, t)
 	}
 
-	// Sync all candidate peers concurrently so a stale/offline IP never burns the timeout of a live host.
+	// Sync all paired outbound peers concurrently so an offline peer never delays live peers.
 	var (
 		wg    sync.WaitGroup
 		resMu sync.Mutex
@@ -410,7 +644,11 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			merged, dl, ul, serr := p.SyncWithAddr(ctx, t.addr, t.peerID, code)
+			merged, dl, ul, _, serr := p.syncWithAddrInternal(ctx, t.addr, t.peerID, t.code, false)
+			if errors.Is(serr, ErrPeerUnpaired) {
+				p.handleRemoteUnpaired(t.peerID, t.addr)
+				return
+			}
 			resMu.Lock()
 			defer resMu.Unlock()
 			if serr != nil {
@@ -420,7 +658,7 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 				switch {
 				case strings.Contains(errStr, "配对码不正确") || strings.Contains(errStr, "unauthorized"):
 					status = "wrong_code"
-					msg = "配对码不对"
+					msg = "对方配对码已更换，请重新配对"
 				case strings.Contains(errStr, "locked"):
 					status = "locked"
 					msg = "尝试太多次，稍后再试"
@@ -450,8 +688,8 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 	}
 	wg.Wait()
 
-	// Also include incoming client devices (e.g. Android phones) recorded in SQLite sync_peers
-	// so the Mac remembers paired/synced devices across restarts even though phones do not serve UDP.
+	// Also include inbound client devices (e.g. Android phones) recorded in SQLite sync_peers
+	// so the Mac displays all paired devices across restarts even though phones do not serve UDP.
 	if savedPeers, err := p.store.ListSyncPeers(); err == nil {
 		nowMs := time.Now().UnixMilli()
 		p.sseMu.Lock()
@@ -496,12 +734,14 @@ func (p *Peer) SyncOnce(ctx context.Context) model.SyncSummary {
 }
 
 // SyncWithAddr runs a full authenticated bidirectional sync with one specific peer using remoteCode.
-// Large note libraries are exchanged in bounded batches (syncBatchLimit notes per HTTP request) so initial
-// pairing of 10,000+ notes never hits payload size limits.
 func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode string) (notesMerged, blobsDown, blobsUp int, err error) {
+	m, dl, ul, _, serr := p.syncWithAddrInternal(ctx, addr, knownPeerID, remoteCode, false)
+	return m, dl, ul, serr
+}
+
+func (p *Peer) syncWithAddrInternal(ctx context.Context, addr, knownPeerID, remoteCode string, isExplicitPair bool) (notesMerged, blobsDown, blobsUp int, remotePeerID string, err error) {
 	baseURL := "http://" + addr
 
-	// 1. Determine watermark for this peer
 	var since int64
 	if knownPeerID != "" {
 		if sp, gerr := p.store.GetSyncPeer(knownPeerID); gerr == nil && sp != nil && sp.LastHeardAt > clockMarginMs {
@@ -509,18 +749,22 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		}
 	}
 
+	var extraHeaders map[string]string
+	if isExplicitPair {
+		extraHeaders = map[string]string{HeaderPairIntent: "1"}
+	}
+
 	haveBlobs, _ := p.store.ListLocalBlobs()
 	wantSet := make(map[string]struct{})
 	var lastResp model.SyncExchangeResponse
 	totalMerged := 0
 
-	// 2. Push local changes in bounded batches; on the final local batch, begin pulling remote changes.
 	localSince := since
 	localAfterID := ""
 	for {
 		localNotes, localAtts, nextLocalSince, nextLocalAfterID, localHasMore, lerr := p.store.ListChangesSincePaged(localSince, localAfterID, syncBatchLimit)
 		if lerr != nil {
-			return 0, 0, 0, lerr
+			return 0, 0, 0, "", lerr
 		}
 		reqBody := model.SyncExchangeRequest{
 			PeerID:      p.peerID,
@@ -534,13 +778,13 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		if !localHasMore {
 			reqBody.HaveBlobs = haveBlobs
 		}
-		respBytes, rerr := p.authedRequest(ctx, http.MethodPost, baseURL+"/sync/exchange", reqBody, "application/json", remoteCode)
+		respBytes, rerr := p.authedRequestWithHeaders(ctx, http.MethodPost, baseURL+"/sync/exchange", reqBody, "application/json", remoteCode, extraHeaders)
 		if rerr != nil {
-			return 0, 0, 0, rerr
+			return 0, 0, 0, "", rerr
 		}
 		var resp model.SyncExchangeResponse
 		if uerr := json.Unmarshal(respBytes, &resp); uerr != nil {
-			return 0, 0, 0, fmt.Errorf("decode exchange response: %w", uerr)
+			return 0, 0, 0, "", fmt.Errorf("decode exchange response: %w", uerr)
 		}
 		lastResp = resp
 		for _, w := range resp.WantBlobs {
@@ -549,7 +793,7 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		if len(resp.Notes) > 0 || len(resp.Attachments) > 0 {
 			m, merr := p.store.MergeRemote(resp.Notes, resp.Attachments)
 			if merr != nil {
-				return 0, 0, 0, merr
+				return 0, 0, 0, "", merr
 			}
 			totalMerged += m
 		}
@@ -560,7 +804,6 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		localAfterID = nextLocalAfterID
 	}
 
-	// 3. Pull any remaining remote batches until HasMore is false
 	for lastResp.HasMore && lastResp.NextAfterID != "" {
 		reqBody := model.SyncExchangeRequest{
 			PeerID:      p.peerID,
@@ -569,25 +812,24 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 			AfterID:     lastResp.NextAfterID,
 			BatchLimit:  syncBatchLimit,
 		}
-		respBytes, rerr := p.authedRequest(ctx, http.MethodPost, baseURL+"/sync/exchange", reqBody, "application/json", remoteCode)
+		respBytes, rerr := p.authedRequestWithHeaders(ctx, http.MethodPost, baseURL+"/sync/exchange", reqBody, "application/json", remoteCode, extraHeaders)
 		if rerr != nil {
-			return 0, 0, 0, rerr
+			return 0, 0, 0, "", rerr
 		}
 		var resp model.SyncExchangeResponse
 		if uerr := json.Unmarshal(respBytes, &resp); uerr != nil {
-			return 0, 0, 0, fmt.Errorf("decode exchange response: %w", uerr)
+			return 0, 0, 0, "", fmt.Errorf("decode exchange response: %w", uerr)
 		}
 		lastResp = resp
 		if len(resp.Notes) > 0 || len(resp.Attachments) > 0 {
 			m, merr := p.store.MergeRemote(resp.Notes, resp.Attachments)
 			if merr != nil {
-				return 0, 0, 0, merr
+				return 0, 0, 0, "", merr
 			}
 			totalMerged += m
 		}
 	}
 
-	// 4. Download any blobs we are missing
 	missing, _ := p.store.MissingBlobs()
 	for _, hash := range missing {
 		data, mime, derr := p.downloadBlob(ctx, baseURL, hash, remoteCode)
@@ -598,7 +840,6 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		}
 	}
 
-	// 5. Upload any blobs the peer asked for
 	for hash := range wantSet {
 		data, mime, rerr := p.store.ReadBlob(hash)
 		if rerr != nil {
@@ -609,7 +850,6 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		}
 	}
 
-	// 6. Record updated watermark + save this peer's code in sync_peers
 	now := time.Now().UnixMilli()
 	heard := lastResp.ServerTime
 	if heard <= 0 {
@@ -627,13 +867,11 @@ func (p *Peer) SyncWithAddr(ctx context.Context, addr, knownPeerID, remoteCode s
 		p.recordPeerAlive(lastResp.PeerID, lastResp.DisplayName, addr, -1)
 	}
 
-	// Notify local UI listeners (and bump dataVersion) whenever an outgoing sync
-	// (including Android background SyncWorker) merges new notes or downloads blobs.
 	if totalMerged > 0 || blobsDown > 0 {
 		p.NotifyChanged()
 	}
 
-	return totalMerged, blobsDown, blobsUp, nil
+	return totalMerged, blobsDown, blobsUp, lastResp.PeerID, nil
 }
 
 func (p *Peer) fetchNonce(ctx context.Context, baseURL string) (string, error) {
@@ -662,6 +900,10 @@ func (p *Peer) fetchNonce(ctx context.Context, baseURL string) (string, error) {
 }
 
 func (p *Peer) authedRequest(ctx context.Context, method, fullURL string, body any, contentType, remoteCode string) ([]byte, error) {
+	return p.authedRequestWithHeaders(ctx, method, fullURL, body, contentType, remoteCode, nil)
+}
+
+func (p *Peer) authedRequestWithHeaders(ctx context.Context, method, fullURL string, body any, contentType, remoteCode string, extraHeaders map[string]string) ([]byte, error) {
 	idx := strings.Index(fullURL, "/sync/")
 	if idx < 0 {
 		return nil, errors.New("invalid sync url")
@@ -696,6 +938,9 @@ func (p *Peer) authedRequest(ctx context.Context, method, fullURL string, body a
 	req.Header.Set(HeaderNonce, nonce)
 	req.Header.Set(HeaderProof, ComputeProof(remoteCode, nonce))
 	req.Header.Set(HeaderPeerID, p.peerID)
+	for k, v := range extraHeaders {
+		req.Header.Set(k, v)
+	}
 
 	resp, err := p.client.Do(req)
 	if err != nil {
@@ -705,6 +950,9 @@ func (p *Peer) authedRequest(ctx context.Context, method, fullURL string, body a
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxBlobBytes+1024))
 	if err != nil {
 		return nil, err
+	}
+	if resp.StatusCode == http.StatusGone {
+		return nil, ErrPeerUnpaired
 	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		return nil, errors.New("配对码不正确")
@@ -736,6 +984,9 @@ func (p *Peer) downloadBlob(ctx context.Context, baseURL, hash, remoteCode strin
 		return nil, "", err
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusGone {
+		return nil, "", ErrPeerUnpaired
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, "", fmt.Errorf("blob get status %d", resp.StatusCode)
 	}
@@ -771,17 +1022,49 @@ func (p *Peer) handleChallenge(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Peer) verifyRequest(w http.ResponseWriter, r *http.Request) bool {
-	res := p.auth.Verify(r.Header.Get(HeaderNonce), r.Header.Get(HeaderProof))
-	if res.OK {
-		return true
-	}
-	if res.Locked {
-		w.Header().Set("Retry-After", fmt.Sprintf("%d", res.RetryAfterSecond))
-		http.Error(w, fmt.Sprintf("locked for %ds", res.RetryAfterSecond), http.StatusTooManyRequests)
+	clientKey := clientIPFromAddr(r.RemoteAddr)
+	res := p.auth.VerifyFrom(clientKey, r.Header.Get(HeaderNonce), r.Header.Get(HeaderProof))
+	if !res.OK {
+		if res.Locked {
+			w.Header().Set("Retry-After", fmt.Sprintf("%d", res.RetryAfterSecond))
+			http.Error(w, fmt.Sprintf("locked for %ds", res.RetryAfterSecond), http.StatusTooManyRequests)
+			return false
+		}
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return false
 	}
-	http.Error(w, "unauthorized", http.StatusUnauthorized)
-	return false
+
+	callerPeerID := strings.TrimSpace(r.Header.Get(HeaderPeerID))
+	if callerPeerID != "" && p.isPeerRevoked(callerPeerID) {
+		if r.URL.Path == "/sync/exchange" && r.Header.Get(HeaderPairIntent) == "1" {
+			p.clearRevokedPeer(callerPeerID)
+			return true
+		}
+		if r.URL.Path != "/sync/unpair" {
+			http.Error(w, "unpaired", http.StatusGone)
+			return false
+		}
+	}
+	return true
+}
+
+func (p *Peer) handleUnpair(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !p.verifyRequest(w, r) {
+		return
+	}
+	var req unpairRequest
+	_ = json.NewDecoder(io.LimitReader(r.Body, 16*1024)).Decode(&req)
+	targetPeerID := strings.TrimSpace(req.PeerID)
+	if targetPeerID == "" {
+		targetPeerID = strings.TrimSpace(r.Header.Get(HeaderPeerID))
+	}
+	p.handleRemoteUnpaired(targetPeerID, clientIPFromAddr(r.RemoteAddr))
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"ok":true}`))
 }
 
 func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
@@ -807,7 +1090,13 @@ func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
 		p.NotifyChanged()
 	}
 
-	var (outNotes []model.Note; outAtts []model.Attachment; nextSince int64; nextAfterID string; hasMore bool)
+	var (
+		outNotes    []model.Note
+		outAtts     []model.Attachment
+		nextSince   int64
+		nextAfterID string
+		hasMore     bool
+	)
 	if !req.SkipPull {
 		since := req.Since
 		if since < 0 {
@@ -840,10 +1129,7 @@ func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now().UnixMilli()
 	if req.PeerID != "" {
-		clientIP := r.RemoteAddr
-		if host, _, herr := net.SplitHostPort(r.RemoteAddr); herr == nil && host != "" {
-			clientIP = host
-		}
+		clientIP := clientIPFromAddr(r.RemoteAddr)
 		_ = p.store.UpsertSyncPeer(model.SyncPeer{
 			PeerID:      req.PeerID,
 			DisplayName: req.DisplayName,
@@ -852,7 +1138,6 @@ func (p *Peer) handleExchange(w http.ResponseWriter, r *http.Request) {
 			LastSyncAt:  now,
 		})
 		p.recordPeerAlive(req.PeerID, req.DisplayName, clientIP, -1)
-		// Wake Mac UI so newly connected phone shows up immediately in Settings
 		select {
 		case p.localChanged <- struct{}{}:
 		default:

@@ -35,6 +35,7 @@ type sseSubscriber struct {
 	remoteIP    string
 	changedCh   chan struct{}
 	pingCh      chan ssePingMsg
+	unpairCh    chan string
 	closeCh     chan struct{}
 	closeOnce   sync.Once
 }
@@ -254,6 +255,10 @@ func (p *Peer) handlePong(w http.ResponseWriter, r *http.Request) {
 
 // PingAddr sends an authenticated ping with a random ping_id to addr and verifies the echoed reply.
 func (p *Peer) PingAddr(ctx context.Context, addr, remoteCode string) (model.LivePeerStatus, error) {
+	return p.pingPeer(ctx, "", addr, remoteCode)
+}
+
+func (p *Peer) pingPeer(ctx context.Context, knownPeerID, addr, remoteCode string) (model.LivePeerStatus, error) {
 	baseURL := "http://" + addr
 	pingID := newPingID()
 	start := time.Now()
@@ -265,15 +270,20 @@ func (p *Peer) PingAddr(ctx context.Context, addr, remoteCode string) (model.Liv
 	}
 	raw, err := p.authedRequest(ctx, http.MethodPost, baseURL+"/sync/ping", reqBody, "application/json", remoteCode)
 	if err != nil {
+		if errors.Is(err, ErrPeerUnpaired) {
+			p.handleRemoteUnpaired(knownPeerID, addr)
+			return model.LivePeerStatus{PeerID: knownPeerID, Addr: addr, Online: false, Status: "offline", Message: "已断开"}, err
+		}
 		errStr := err.Error()
 		status := "offline"
 		msg := errStr
 		if strings.Contains(errStr, "配对码不正确") || strings.Contains(errStr, "unauthorized") {
 			status = "wrong_code"
-			msg = "配对码不匹配"
+			msg = "对方配对码已更换"
 		}
-		p.recordPeerFailure("", "", addr, status, msg)
+		p.recordPeerFailure(knownPeerID, "", addr, status, msg)
 		return model.LivePeerStatus{
+			PeerID:  knownPeerID,
 			Addr:    addr,
 			Online:  false,
 			Status:  status,
@@ -282,10 +292,10 @@ func (p *Peer) PingAddr(ctx context.Context, addr, remoteCode string) (model.Liv
 	}
 	var resp syncPingResponse
 	if err := json.Unmarshal(raw, &resp); err != nil {
-		return model.LivePeerStatus{Addr: addr, Online: false, Status: "offline", Message: "响应解析失败"}, err
+		return model.LivePeerStatus{PeerID: knownPeerID, Addr: addr, Online: false, Status: "offline", Message: "响应解析失败"}, err
 	}
 	if !resp.OK || resp.EchoID != pingID {
-		return model.LivePeerStatus{Addr: addr, Online: false, Status: "offline", Message: "心跳校验失败"}, errors.New("ping echo mismatch")
+		return model.LivePeerStatus{PeerID: knownPeerID, Addr: addr, Online: false, Status: "offline", Message: "心跳校验失败"}, errors.New("ping echo mismatch")
 	}
 	rttMs := time.Since(start).Milliseconds()
 	if rttMs < 0 {
@@ -344,7 +354,6 @@ func (p *Peer) probeSSESubscriber(ctx context.Context, sub *sseSubscriber) (int6
 	case <-ctx.Done():
 		return 0, false
 	default:
-		// Channel busy with an in-flight ping; still wait briefly
 	}
 
 	timer := time.NewTimer(pingReplyTimeout)
@@ -355,7 +364,6 @@ func (p *Peer) probeSSESubscriber(ctx context.Context, sub *sseSubscriber) (int6
 	case <-sub.closeCh:
 		return 0, false
 	case <-timer.C:
-		// Peer failed to reply to ping within timeout -> mark offline and tear down stale SSE stream
 		if sub.peerID != "" {
 			p.recordPeerFailure(sub.peerID, sub.displayName, sub.remoteIP, "offline", "心跳超时")
 		}
@@ -366,26 +374,16 @@ func (p *Peer) probeSSESubscriber(ctx context.Context, sub *sseSubscriber) (int6
 	}
 }
 
-// CheckSyncHealth returns the real-time verified sync status.
-// When activeProbe is true, it actively sends ping challenges to all SSE clients and known/discovered
-// server peers and waits for verified pong echoes before reporting connectivity.
+// CheckSyncHealth returns the real-time verified sync status across all paired peers
+// (both outbound paired hosts and inbound connected clients).
 func (p *Peer) CheckSyncHealth(ctx context.Context, activeProbe bool) model.SyncHealthStatus {
-	code := NormalizeCode(p.auth.Code())
-	if len(code) != 6 {
-		return model.SyncHealthStatus{
-			State:        "unpaired",
-			Connected:    false,
-			ErrorMessage: "未配置 6 位配对码",
-		}
-	}
-
 	if activeProbe {
 		probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 		defer cancel()
 
 		var wg sync.WaitGroup
 
-		// 1. Actively ping all connected SSE clients (e.g. Android phones connected to macOS)
+		// 1. Actively ping all connected inbound SSE clients (e.g. Android phones connected to macOS)
 		p.sseMu.Lock()
 		subs := make([]*sseSubscriber, 0, len(p.sseSubs))
 		for s := range p.sseSubs {
@@ -402,14 +400,14 @@ func (p *Peer) CheckSyncHealth(ctx context.Context, activeProbe bool) model.Sync
 			}()
 		}
 
-		// 2. Actively ping known/discovered server peers (host:port)
-		addrs := p.findEventTargetAddrs(probeCtx)
-		for _, addr := range addrs {
-			addr := addr
+		// 2. Actively ping all paired outbound hosts using EACH host's own saved 6-digit code
+		targets := p.findPairedOutboundTargets(probeCtx)
+		for _, t := range targets {
+			t := t
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				_, _ = p.PingAddr(probeCtx, addr, code)
+				_, _ = p.pingPeer(probeCtx, t.peerID, t.addr, t.code)
 			}()
 		}
 
@@ -432,7 +430,19 @@ func (p *Peer) CheckSyncHealth(ctx context.Context, activeProbe bool) model.Sync
 	for k, v := range p.peerLiveness {
 		liveCopy[k] = *v
 	}
+	activeSSECopy := make(map[string]int64, len(p.activeSSEPeers))
+	for k, v := range p.activeSSEPeers {
+		activeSSECopy[k] = v
+	}
 	p.sseMu.Unlock()
+
+	if len(savedByID) == 0 && len(activeSSECopy) == 0 {
+		return model.SyncHealthStatus{
+			State:        "unpaired",
+			Connected:    false,
+			ErrorMessage: "尚未配对其他设备",
+		}
+	}
 
 	seen := make(map[string]bool)
 	var peers []model.LivePeerStatus
@@ -446,14 +456,18 @@ func (p *Peer) CheckSyncHealth(ctx context.Context, activeProbe bool) model.Sync
 		lastErrMsg  string
 	)
 
-	// Merge live records with persisted peers
-	for key, rec := range liveCopy {
+	// Merge live records for currently paired or actively connected peers only
+	for _, rec := range liveCopy {
 		id := rec.PeerID
 		if id == "" {
-			id = key
+			continue
+		}
+		sp, hasSaved := savedByID[id]
+		_, isActiveSSE := activeSSECopy[id]
+		if !hasSaved && !isActiveSSE {
+			continue
 		}
 		seen[id] = true
-		sp, hasSaved := savedByID[rec.PeerID]
 		name := rec.DisplayName
 		if name == "" && hasSaved {
 			name = sp.DisplayName
@@ -488,7 +502,7 @@ func (p *Peer) CheckSyncHealth(ctx context.Context, activeProbe bool) model.Sync
 			if status == "wrong_code" {
 				wrongCode = true
 				if lastErrMsg == "" {
-					lastErrMsg = "配对码不匹配"
+					lastErrMsg = "对方配对码已更换"
 				}
 			} else {
 				status = "offline"
@@ -498,7 +512,7 @@ func (p *Peer) CheckSyncHealth(ctx context.Context, activeProbe bool) model.Sync
 			}
 		}
 		peers = append(peers, model.LivePeerStatus{
-			PeerID:      rec.PeerID,
+			PeerID:      id,
 			DisplayName: name,
 			Addr:        addr,
 			Online:      isOnline,
@@ -510,7 +524,7 @@ func (p *Peer) CheckSyncHealth(ctx context.Context, activeProbe bool) model.Sync
 		})
 	}
 
-	// Include known persisted peers that have not ponged in this session
+	// Include paired peers that have not ponged in this session yet
 	for _, sp := range savedPeers {
 		if sp.PeerID == "" || sp.PeerID == p.peerID || seen[sp.PeerID] {
 			continue

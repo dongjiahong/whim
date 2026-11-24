@@ -1,6 +1,7 @@
 package com.whim.app.ui
 
 import android.app.TimePickerDialog
+import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
@@ -41,6 +42,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.Computer
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.DeleteOutline
@@ -85,7 +87,9 @@ import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.whim.app.capture.WhimWidgetProvider
 import com.whim.app.core.WhimCoreBridge
-import com.whim.app.core.WhimPeerSyncStatus
+import com.whim.app.core.WhimDiscoveredPeer
+import com.whim.app.core.WhimSyncHealthStatus
+import com.whim.app.core.WhimSyncPeer
 import com.whim.app.review.DailyReviewReceiver
 import com.whim.app.review.DailyReviewScheduler
 import com.whim.app.review.ReviewReminder
@@ -124,10 +128,10 @@ fun MobileSettingsScreen(
     notifPermissionGranted: Boolean,
     exactAlarmGranted: Boolean,
     onRequestNotificationPermission: () -> Unit,
-    pairCode: String,
-    onPairCodeUpdated: (String) -> Unit,
-    peerStatuses: List<WhimPeerSyncStatus>,
-    onPeerStatusesUpdated: (List<WhimPeerSyncStatus>) -> Unit,
+    pairedPeers: List<WhimSyncPeer>,
+    onPairedPeersUpdated: (List<WhimSyncPeer>) -> Unit,
+    syncHealth: WhimSyncHealthStatus,
+    onSyncHealthUpdated: (WhimSyncHealthStatus) -> Unit,
     initialRelease: ReleaseInfo? = null,
     onUpdateBadgeDismissed: () -> Unit = {},
     onSyncCompleted: () -> Unit,
@@ -207,8 +211,8 @@ fun MobileSettingsScreen(
                     themeMode = themeMode,
                     onThemeModeChange = onThemeModeChange,
                     reviewReminders = reviewReminders,
-                    pairCode = pairCode,
-                    peerStatuses = peerStatuses,
+                    pairedPeers = pairedPeers,
+                    syncHealth = syncHealth,
                     storageLoaded = storageLoaded,
                     storageTotalBytes = storageTotalBytes,
                     storageOrphanCount = storageOrphanCount,
@@ -227,10 +231,10 @@ fun MobileSettingsScreen(
                 )
 
                 SettingsPage.SYNC -> SyncSubPage(
-                    pairCode = pairCode,
-                    onPairCodeUpdated = onPairCodeUpdated,
-                    peerStatuses = peerStatuses,
-                    onPeerStatusesUpdated = onPeerStatusesUpdated,
+                    pairedPeers = pairedPeers,
+                    onPairedPeersUpdated = onPairedPeersUpdated,
+                    syncHealth = syncHealth,
+                    onSyncHealthUpdated = onSyncHealthUpdated,
                     onSyncCompleted = onSyncCompleted,
                     onBack = { navigateBack() }
                 )
@@ -302,8 +306,8 @@ private fun SettingsHomePage(
     themeMode: String,
     onThemeModeChange: (String) -> Unit,
     reviewReminders: List<ReviewReminder>,
-    pairCode: String,
-    peerStatuses: List<WhimPeerSyncStatus>,
+    pairedPeers: List<WhimSyncPeer>,
+    syncHealth: WhimSyncHealthStatus,
     storageLoaded: Boolean,
     storageTotalBytes: Long,
     storageOrphanCount: Int,
@@ -314,7 +318,7 @@ private fun SettingsHomePage(
     val c = WhimTheme.colors
     val t = WhimTheme.typography
     val enabledReminders = reviewReminders.filter { it.enabled && it.weekdays.isNotEmpty() }
-    val syncedPeers = peerStatuses.count { it.status == "synced" }
+    val onlinePeers = syncHealth.onlinePeers
 
     Column(modifier = Modifier.fillMaxSize()) {
         SettingsTopBar(title = "设置", onBack = onBack)
@@ -398,14 +402,14 @@ private fun SettingsHomePage(
                     StatusQuickPill(
                         modifier = Modifier.weight(1f),
                         dotColor = when {
-                            syncedPeers > 0 -> Color(0xFF34D399)
-                            pairCode.length == 6 -> c.accent
+                            onlinePeers > 0 -> Color(0xFF34D399)
+                            pairedPeers.isNotEmpty() -> c.accent
                             else -> c.textMuted
                         },
                         label = "局域网同步",
                         value = when {
-                            syncedPeers > 0 -> "$syncedPeers 台在线"
-                            pairCode.length == 6 -> "已配对"
+                            onlinePeers > 0 -> "$onlinePeers 台在线"
+                            pairedPeers.isNotEmpty() -> "已配对 ${pairedPeers.size} 台"
                             else -> "未配对"
                         },
                         onClick = { onNavigate(SettingsPage.SYNC) }
@@ -474,9 +478,9 @@ private fun SettingsHomePage(
                         iconBg = c.accent.copy(alpha = 0.16f),
                         iconTint = c.accent,
                         title = "局域网同步",
-                        subtitle = "同 Wi-Fi 下与 Mac 端零配置互传",
-                        value = if (pairCode.length == 6) "已配对" else "去配对",
-                        showDot = syncedPeers > 0,
+                        subtitle = "支持同时配对多台 Mac 独立同步",
+                        value = if (pairedPeers.isNotEmpty()) "已配对 ${pairedPeers.size} 台" else "去配对",
+                        showDot = onlinePeers > 0,
                         dotColor = Color(0xFF34D399),
                         onClick = { onNavigate(SettingsPage.SYNC) }
                     )
@@ -1521,14 +1525,14 @@ private fun ReminderEditorDialog(
     }
 }
 
-// MARK: - 3. LAN Sync Sub-Page
+// MARK: - 3. LAN Sync Sub-Page (Route B: Multi-Mac Independent Pairing + Bidirectional Unpair)
 
 @Composable
 private fun SyncSubPage(
-    pairCode: String,
-    onPairCodeUpdated: (String) -> Unit,
-    peerStatuses: List<WhimPeerSyncStatus>,
-    onPeerStatusesUpdated: (List<WhimPeerSyncStatus>) -> Unit,
+    pairedPeers: List<WhimSyncPeer>,
+    onPairedPeersUpdated: (List<WhimSyncPeer>) -> Unit,
+    syncHealth: WhimSyncHealthStatus,
+    onSyncHealthUpdated: (WhimSyncHealthStatus) -> Unit,
     onSyncCompleted: () -> Unit,
     onBack: () -> Unit
 ) {
@@ -1536,12 +1540,43 @@ private fun SyncSubPage(
     val t = WhimTheme.typography
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val syncPrefs = remember { context.getSharedPreferences("whim_sync_prefs", Context.MODE_PRIVATE) }
 
-    var remoteCodeInput by remember(pairCode) { mutableStateOf(pairCode) }
+    var discoveredPeers by remember { mutableStateOf<List<WhimDiscoveredPeer>>(emptyList()) }
+    var ignoredPeerIds by remember {
+        mutableStateOf(syncPrefs.getStringSet("ignored_peer_ids", emptySet())?.toSet() ?: emptySet())
+    }
+    var pairingTarget by remember { mutableStateOf<WhimDiscoveredPeer?>(null) }
     var manualAddrInput by remember { mutableStateOf("") }
+    var manualCodeInput by remember { mutableStateOf("") }
     var showManualAddr by remember { mutableStateOf(false) }
     var syncStatus by remember { mutableStateOf("") }
+    var isScanning by remember { mutableStateOf(false) }
     var isSyncing by remember { mutableStateOf(false) }
+    var isPairing by remember { mutableStateOf(false) }
+
+    fun persistIgnored(next: Set<String>) {
+        ignoredPeerIds = next
+        syncPrefs.edit().putStringSet("ignored_peer_ids", next).apply()
+    }
+
+    suspend fun refreshAll(activeProbe: Boolean = false) {
+        isScanning = true
+        runCatching { onPairedPeersUpdated(WhimCoreBridge.listPairedPeers()) }
+        runCatching { discoveredPeers = WhimCoreBridge.discoverLAN() }
+        runCatching { onSyncHealthUpdated(WhimCoreBridge.checkSyncHealth(activeProbe = activeProbe)) }
+        isScanning = false
+    }
+
+    LaunchedEffect(Unit) {
+        refreshAll(activeProbe = true)
+    }
+
+    val liveById = remember(syncHealth.peers) { syncHealth.peers.associateBy { it.peerId } }
+    val pairedIdSet = remember(pairedPeers) { pairedPeers.map { it.peerId }.toSet() }
+    val visibleDiscovered = remember(discoveredPeers, pairedIdSet, ignoredPeerIds) {
+        discoveredPeers.filter { it.peerId !in pairedIdSet && it.peerId !in ignoredPeerIds }
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         SettingsTopBar(
@@ -1551,17 +1586,17 @@ private fun SyncSubPage(
                 Row(
                     modifier = Modifier
                         .clip(RoundedCornerShape(10.dp))
-                        .clickable(enabled = !isSyncing) {
+                        .clickable(enabled = !isSyncing && !isScanning) {
                             scope.launch {
                                 isSyncing = true
-                                syncStatus = "正在扫描同 Wi-Fi 下的 Mac..."
-                                val res = WhimCoreBridge.syncOnce()
+                                syncStatus = "正在扫描并同步已配对设备..."
+                                val res = runCatching { WhimCoreBridge.syncOnce() }.getOrNull()
+                                refreshAll(activeProbe = true)
                                 isSyncing = false
-                                onPeerStatusesUpdated(res.peers)
                                 syncStatus = when {
-                                    res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台 Mac" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
-                                    res.peers.isNotEmpty() -> res.peers.first().message
-                                    else -> "暂未发现同 Wi-Fi 下的 Mac"
+                                    res != null && res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台设备" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
+                                    pairedPeers.isEmpty() -> "扫描完成"
+                                    else -> "已完成刷新"
                                 }
                                 onSyncCompleted()
                                 WhimWidgetProvider.refreshAll(context)
@@ -1574,14 +1609,14 @@ private fun SyncSubPage(
                     Icon(
                         Icons.Rounded.Refresh,
                         contentDescription = "刷新",
-                        tint = if (isSyncing) c.textMuted else c.tagText,
+                        tint = if (isSyncing || isScanning) c.textMuted else c.tagText,
                         modifier = Modifier.size(16.dp)
                     )
                     Text(
-                        if (isSyncing) "同步中" else "刷新",
+                        if (isSyncing || isScanning) "扫描中" else "刷新",
                         style = t.meta,
                         fontWeight = FontWeight.Medium,
-                        color = if (isSyncing) c.textMuted else c.tagText
+                        color = if (isSyncing || isScanning) c.textMuted else c.tagText
                     )
                 }
             }
@@ -1594,179 +1629,261 @@ private fun SyncSubPage(
                 .padding(horizontal = 16.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            // 6-Digit Segmented Pairing Card
+            if (syncStatus.isNotEmpty()) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(c.accent.copy(alpha = 0.12f))
+                        .padding(horizontal = 14.dp, vertical = 9.dp)
+                ) {
+                    Text(syncStatus, style = t.meta, color = c.accent)
+                }
+            }
+
+            // Card 1: Paired Devices (Concurrent Multi-Mac Sync + Bidirectional Forget)
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(16.dp))
                     .background(c.card)
                     .border(0.8.dp, c.border, RoundedCornerShape(16.dp))
-                    .padding(18.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    Text("输入 Mac 上的 6 位配对码", style = t.section, color = c.textPrimary)
-                    Text(
-                        "打开 Mac 端「设置 → 局域网同步」查看 6 位数字。同 Wi-Fi 下会自动发现并双向加密同步，只需配对一次。",
-                        style = t.meta,
-                        color = c.textSecondary
-                    )
-                }
-
-                // Segmented 6-box input backed by BasicTextField
-                BasicTextField(
-                    value = remoteCodeInput,
-                    onValueChange = { remoteCodeInput = it.filter { ch -> ch.isDigit() }.take(6) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                    cursorBrush = SolidColor(Color.Transparent),
-                    textStyle = t.body.copy(color = Color.Transparent),
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    decorationBox = {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(6.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            for (i in 0 until 6) {
-                                val ch = remoteCodeInput.getOrNull(i)?.toString() ?: ""
-                                val isCurrent = i == remoteCodeInput.length
-                                Box(
-                                    modifier = Modifier
-                                        .weight(1f)
-                                        .height(52.dp)
-                                        .clip(RoundedCornerShape(10.dp))
-                                        .background(c.canvas)
-                                        .border(
-                                            width = if (isCurrent || ch.isNotEmpty()) 1.4.dp else 0.8.dp,
-                                            color = when {
-                                                isCurrent -> c.accent
-                                                ch.isNotEmpty() -> c.accent.copy(alpha = 0.45f)
-                                                else -> c.border
-                                            },
-                                            shape = RoundedCornerShape(10.dp)
-                                        ),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    Text(
-                                        text = ch.ifEmpty { "·" },
-                                        fontSize = 22.sp,
-                                        fontWeight = FontWeight.Bold,
-                                        fontFamily = FontFamily.Monospace,
-                                        color = if (ch.isNotEmpty()) c.textPrimary else c.textMuted
-                                    )
-                                }
-                                if (i == 2) {
-                                    Spacer(Modifier.width(6.dp))
-                                }
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Text("已配对设备", style = t.section, color = c.textPrimary)
+                        if (pairedPeers.isNotEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(CircleShape)
+                                    .background(c.accent.copy(alpha = 0.16f))
+                                    .padding(horizontal = 7.dp, vertical = 1.dp)
+                            ) {
+                                Text(
+                                    "${pairedPeers.size}",
+                                    fontSize = 11.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = c.accent
+                                )
                             }
                         }
                     }
-                )
+                    Text("每台独立配对码", style = t.meta, color = c.textMuted)
+                }
 
-                val codeReady = remoteCodeInput.filter { it.isDigit() }.length == 6
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .clip(RoundedCornerShape(11.dp))
-                        .background(if (codeReady && !isSyncing) c.accent else c.canvas)
-                        .clickable(enabled = codeReady && !isSyncing) {
-                            val digits = remoteCodeInput.filter { it.isDigit() }
-                            val addr = manualAddrInput.trim()
-                            scope.launch {
-                                isSyncing = true
-                                if (addr.isNotEmpty()) {
-                                    runCatching { WhimCoreBridge.setManualPeers(listOf(addr)) }
-                                }
-                                runCatching { WhimCoreBridge.setPairCode(digits) }
-                                    .onSuccess { updated ->
-                                        onPairCodeUpdated(updated)
-                                        syncStatus = "正在自动发现 Mac 并同步..."
-                                        val res = WhimCoreBridge.syncOnce()
-                                        onPeerStatusesUpdated(res.peers)
-                                        syncStatus = when {
-                                            res.peersSynced > 0 -> "已同步 ${res.peersSynced} 台 Mac" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
-                                            res.peers.isNotEmpty() -> res.peers.first().message
-                                            else -> "已保存配对码，未发现同一 Wi-Fi 下的 Mac"
-                                        }
-                                        onSyncCompleted()
-                                        WhimWidgetProvider.refreshAll(context)
-                                    }
-                                    .onFailure { syncStatus = it.message ?: "配对码无效" }
-                                isSyncing = false
-                            }
-                        }
-                        .padding(vertical = 12.dp),
-                    contentAlignment = Alignment.Center
-                ) {
+                if (pairedPeers.isEmpty()) {
                     Text(
-                        if (isSyncing) "正在同步..." else "配对并立即同步",
-                        style = t.body,
-                        fontWeight = FontWeight.SemiBold,
-                        color = if (codeReady && !isSyncing) Color.White else c.textMuted
+                        "尚未配对任何电脑。在下方「局域网发现」中点击要连接的 Mac 并输入它的 6 位配对码即可，支持同时配对多台 Mac。",
+                        style = t.meta,
+                        color = c.textSecondary
                     )
-                }
-
-                if (syncStatus.isNotEmpty()) {
-                    Text(syncStatus, style = t.meta, color = c.accent)
-                }
-            }
-
-            // Discovered Devices Card
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(14.dp))
-                    .background(c.card)
-                    .border(0.8.dp, c.border, RoundedCornerShape(14.dp))
-                    .padding(16.dp),
-                verticalArrangement = Arrangement.spacedBy(10.dp)
-            ) {
-                Text("局域网设备", style = t.section, color = c.textPrimary)
-                if (peerStatuses.isEmpty()) {
-                    Text("暂未发现同一 Wi-Fi 下的 Mac 设备，点击右上角「刷新」重新扫描。", style = t.meta, color = c.textMuted)
                 } else {
-                    peerStatuses.forEach { peer ->
+                    pairedPeers.forEach { peer ->
+                        val live = liveById[peer.peerId]
+                        val isOnline = live?.online == true
+                        val isWrongCode = live?.status == "wrong_code"
+                        val dotColor = when {
+                            isOnline -> Color(0xFF34D399)
+                            isWrongCode -> Color(0xFFE5A03D)
+                            else -> c.textMuted
+                        }
+                        val statusLabel = live?.message?.takeIf { it.isNotEmpty() } ?: if (isOnline) "在线" else "离线"
+
                         Row(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .clip(RoundedCornerShape(9.dp))
+                                .clip(RoundedCornerShape(11.dp))
                                 .background(c.canvas)
-                                .padding(horizontal = 12.dp, vertical = 10.dp),
+                                .padding(horizontal = 12.dp, vertical = 11.dp),
                             horizontalArrangement = Arrangement.SpaceBetween,
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
                                 modifier = Modifier.weight(1f)
                             ) {
                                 Box(
                                     modifier = Modifier
-                                        .size(7.dp)
+                                        .size(8.dp)
                                         .clip(CircleShape)
-                                        .background(if (peer.status == "synced") Color(0xFF34D399) else Color(0xFFD05A5A))
+                                        .background(dotColor)
                                 )
-                                Text(
-                                    if (peer.displayName.isEmpty()) peer.addr else "${peer.displayName} · ${peer.addr}",
-                                    style = t.body,
-                                    color = c.textPrimary,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        peer.displayName.ifEmpty { "已配对电脑" },
+                                        style = t.body,
+                                        fontWeight = FontWeight.Medium,
+                                        color = c.textPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        listOfNotNull(
+                                            peer.lastAddr.takeIf { it.isNotEmpty() },
+                                            statusLabel
+                                        ).joinToString(" · "),
+                                        style = t.meta,
+                                        color = if (isOnline) c.accent else if (isWrongCode) Color(0xFFE5A03D) else c.textSecondary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
                             }
-                            Text(
-                                peer.message,
-                                style = t.meta,
-                                fontWeight = FontWeight.Medium,
-                                color = if (peer.status == "synced") c.accent else Color(0xFFD05A5A)
-                            )
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(8.dp))
+                                    .background(Color(0xFFE06C6C).copy(alpha = 0.14f))
+                                    .clickable {
+                                        scope.launch {
+                                            runCatching { WhimCoreBridge.removePairedPeer(peer.peerId) }
+                                            refreshAll(activeProbe = false)
+                                            syncStatus = "已断开与「${peer.displayName.ifEmpty { peer.peerId }}」的连接，双方已停止自动重连"
+                                        }
+                                    }
+                                    .padding(horizontal = 11.dp, vertical = 6.dp)
+                            ) {
+                                Text("忘记", style = t.meta, fontWeight = FontWeight.Medium, color = Color(0xFFE06C6C))
+                            }
                         }
                     }
                 }
             }
 
-            // Collapsible Manual Address Fallback
+            // Card 2: Nearby Discovered LAN Macs (Pair or Ignore)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(c.card)
+                    .border(0.8.dp, c.border, RoundedCornerShape(16.dp))
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("局域网发现", style = t.section, color = c.textPrimary)
+                    Text(
+                        if (isScanning) "扫描中..." else "重新扫描",
+                        style = t.meta,
+                        fontWeight = FontWeight.Medium,
+                        color = if (isScanning) c.textMuted else c.tagText,
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .clickable(enabled = !isScanning) {
+                                scope.launch { refreshAll(activeProbe = false) }
+                            }
+                            .padding(horizontal = 6.dp, vertical = 3.dp)
+                    )
+                }
+
+                if (visibleDiscovered.isEmpty()) {
+                    Text(
+                        if (isScanning) "正在同一 Wi-Fi 下搜索 Whim 电脑..." else "暂未发现新的未配对电脑。请确认 Mac 端已打开 Whim 且与手机在同一 Wi-Fi。",
+                        style = t.meta,
+                        color = c.textMuted
+                    )
+                } else {
+                    visibleDiscovered.forEach { peer ->
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(11.dp))
+                                .background(c.canvas)
+                                .padding(horizontal = 12.dp, vertical = 11.dp),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Row(
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Icon(
+                                    Icons.Rounded.Computer,
+                                    contentDescription = null,
+                                    tint = c.textSecondary,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                                    Text(
+                                        peer.displayName.ifEmpty { peer.addr },
+                                        style = t.body,
+                                        fontWeight = FontWeight.Medium,
+                                        color = c.textPrimary,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Text(
+                                        peer.addr,
+                                        style = t.meta,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = c.textMuted
+                                    )
+                                }
+                            }
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(c.card)
+                                        .border(0.8.dp, c.border, RoundedCornerShape(8.dp))
+                                        .clickable { persistIgnored(ignoredPeerIds + peer.peerId) }
+                                        .padding(horizontal = 10.dp, vertical = 6.dp)
+                                ) {
+                                    Text("忽略", style = t.meta, color = c.textSecondary)
+                                }
+                                Box(
+                                    modifier = Modifier
+                                        .clip(RoundedCornerShape(8.dp))
+                                        .background(c.accent)
+                                        .clickable { pairingTarget = peer }
+                                        .padding(horizontal = 12.dp, vertical = 6.dp)
+                                ) {
+                                    Text("配对", style = t.meta, fontWeight = FontWeight.SemiBold, color = Color.White)
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (ignoredPeerIds.isNotEmpty()) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("已忽略 ${ignoredPeerIds.size} 台局域网设备", style = t.meta, color = c.textMuted)
+                        Text(
+                            "恢复显示",
+                            style = t.meta,
+                            fontWeight = FontWeight.Medium,
+                            color = c.tagText,
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .clickable {
+                                    persistIgnored(emptySet())
+                                    scope.launch { refreshAll(activeProbe = false) }
+                                }
+                                .padding(horizontal = 6.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+            }
+
+            // Card 3: Collapsible Manual IP:Port + Remote Code Pairing
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -1782,7 +1899,7 @@ private fun SyncSubPage(
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("找不到 Mac？手动指定地址（可选）", style = t.meta, fontWeight = FontWeight.Medium, color = c.textSecondary)
+                    Text("找不到电脑？手动输入地址与配对码", style = t.meta, fontWeight = FontWeight.Medium, color = c.textSecondary)
                     Icon(
                         if (showManualAddr) Icons.Rounded.ExpandLess else Icons.Rounded.ExpandMore,
                         contentDescription = null,
@@ -1793,7 +1910,7 @@ private fun SyncSubPage(
                 AnimatedVisibility(visible = showManualAddr) {
                     Column(
                         modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         Text("仅在公司 Wi-Fi 或路由器禁用 UDP 广播时使用，正常家用网络无需填写。", style = t.meta, color = c.textMuted)
                         Box(
@@ -1811,9 +1928,65 @@ private fun SyncSubPage(
                                 cursorBrush = SolidColor(c.accent),
                                 modifier = Modifier.fillMaxWidth(),
                                 decorationBox = { inner ->
-                                    if (manualAddrInput.isEmpty()) Text("例如 192.168.5.111:8788", style = t.meta, color = c.textMuted)
+                                    if (manualAddrInput.isEmpty()) Text("IP:端口（如 192.168.5.111:8788）", style = t.meta, color = c.textMuted)
                                     inner()
                                 }
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(9.dp))
+                                .background(c.canvas)
+                                .padding(horizontal = 12.dp, vertical = 10.dp)
+                        ) {
+                            BasicTextField(
+                                value = manualCodeInput,
+                                onValueChange = { manualCodeInput = it.filter { ch -> ch.isDigit() }.take(6) },
+                                singleLine = true,
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                                textStyle = t.body.copy(color = c.textPrimary, fontFamily = FontFamily.Monospace),
+                                cursorBrush = SolidColor(c.accent),
+                                modifier = Modifier.fillMaxWidth(),
+                                decorationBox = { inner ->
+                                    if (manualCodeInput.isEmpty()) Text("该电脑的 6 位配对码", style = t.meta, color = c.textMuted)
+                                    inner()
+                                }
+                            )
+                        }
+                        val manualReady = manualAddrInput.trim().isNotEmpty() && manualCodeInput.length == 6 && !isPairing
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(if (manualReady) c.accent else c.canvas)
+                                .clickable(enabled = manualReady) {
+                                    val addr = manualAddrInput.trim()
+                                    val code = manualCodeInput
+                                    scope.launch {
+                                        isPairing = true
+                                        syncStatus = "正在连接 $addr 并验证配对码..."
+                                        runCatching { WhimCoreBridge.pairAndSync(addr, code) }
+                                            .onSuccess { res ->
+                                                manualAddrInput = ""
+                                                manualCodeInput = ""
+                                                refreshAll(activeProbe = true)
+                                                syncStatus = "配对成功" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条笔记" else " · 已保持同步"
+                                                onSyncCompleted()
+                                                WhimWidgetProvider.refreshAll(context)
+                                            }
+                                            .onFailure { syncStatus = it.message ?: "配对失败，请核对地址与配对码" }
+                                        isPairing = false
+                                    }
+                                }
+                                .padding(vertical = 11.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                if (isPairing) "正在配对..." else "配对并同步",
+                                style = t.body,
+                                fontWeight = FontWeight.SemiBold,
+                                color = if (manualReady) Color.White else c.textMuted
                             )
                         }
                     }
@@ -1821,6 +1994,152 @@ private fun SyncSubPage(
             }
 
             Spacer(Modifier.height(24.dp))
+        }
+    }
+
+    // 6-Digit Segmented Code Dialog for pairing a specific discovered Mac
+    pairingTarget?.let { target ->
+        PairDeviceCodeDialog(
+            peer = target,
+            isPairing = isPairing,
+            onDismiss = { if (!isPairing) pairingTarget = null },
+            onConfirm = { code ->
+                scope.launch {
+                    isPairing = true
+                    syncStatus = "正在配对「${target.displayName.ifEmpty { target.addr }}」..."
+                    runCatching { WhimCoreBridge.pairAndSync(target.addr, code) }
+                        .onSuccess { res ->
+                            pairingTarget = null
+                            refreshAll(activeProbe = true)
+                            syncStatus = "已配对「${target.displayName.ifEmpty { target.addr }}」" + if (res.notesMerged > 0) " · 合并 ${res.notesMerged} 条" else ""
+                            onSyncCompleted()
+                            WhimWidgetProvider.refreshAll(context)
+                        }
+                        .onFailure { err ->
+                            syncStatus = err.message ?: "配对码不正确"
+                        }
+                    isPairing = false
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun PairDeviceCodeDialog(
+    peer: WhimDiscoveredPeer,
+    isPairing: Boolean,
+    onDismiss: () -> Unit,
+    onConfirm: (String) -> Unit
+) {
+    val c = WhimTheme.colors
+    val t = WhimTheme.typography
+    var codeInput by remember(peer.peerId) { mutableStateOf("") }
+    val ready = codeInput.length == 6 && !isPairing
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .clip(RoundedCornerShape(18.dp))
+                .background(c.card)
+                .border(0.8.dp, c.border, RoundedCornerShape(18.dp))
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("配对 ${peer.displayName.ifEmpty { peer.addr }}", style = t.title, color = c.textPrimary)
+                Text(
+                    "请输入该电脑「设置 → 局域网同步」中显示的 6 位专属配对码（${peer.addr}）。",
+                    style = t.meta,
+                    color = c.textSecondary
+                )
+            }
+
+            BasicTextField(
+                value = codeInput,
+                onValueChange = { codeInput = it.filter { ch -> ch.isDigit() }.take(6) },
+                singleLine = true,
+                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                cursorBrush = SolidColor(Color.Transparent),
+                textStyle = t.body.copy(color = Color.Transparent),
+                modifier = Modifier.fillMaxWidth(),
+                decorationBox = {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        for (i in 0 until 6) {
+                            val ch = codeInput.getOrNull(i)?.toString() ?: ""
+                            val isCurrent = i == codeInput.length
+                            Box(
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .height(50.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(c.canvas)
+                                    .border(
+                                        width = if (isCurrent || ch.isNotEmpty()) 1.4.dp else 0.8.dp,
+                                        color = when {
+                                            isCurrent -> c.accent
+                                            ch.isNotEmpty() -> c.accent.copy(alpha = 0.45f)
+                                            else -> c.border
+                                        },
+                                        shape = RoundedCornerShape(10.dp)
+                                    ),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = ch.ifEmpty { "·" },
+                                    fontSize = 22.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    fontFamily = FontFamily.Monospace,
+                                    color = if (ch.isNotEmpty()) c.textPrimary else c.textMuted
+                                )
+                            }
+                            if (i == 2) Spacer(Modifier.width(6.dp))
+                        }
+                    }
+                }
+            )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(c.canvas)
+                        .clickable(enabled = !isPairing, onClick = onDismiss)
+                        .padding(vertical = 11.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text("取消", style = t.body, color = c.textSecondary)
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(if (ready) c.accent else c.canvas)
+                        .clickable(enabled = ready) { onConfirm(codeInput) }
+                        .padding(vertical = 11.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        if (isPairing) "连接中..." else "确认配对",
+                        style = t.body,
+                        fontWeight = FontWeight.SemiBold,
+                        color = if (ready) Color.White else c.textMuted
+                    )
+                }
+            }
         }
     }
 }

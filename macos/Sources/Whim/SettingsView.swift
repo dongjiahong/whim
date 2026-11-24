@@ -81,6 +81,8 @@ struct SettingsModalView: View {
     @State private var editingReminderId: String? = nil
     @State private var remoteAddrInput: String = ""
     @State private var remoteCodeInput: String = ""
+    @State private var pairingPeerId: String? = nil
+    @State private var inlinePairCode: String = ""
     @State private var showManualAddr: Bool = false
     @State private var copiedLocalCode: Bool = false
     @State private var showRegenerateConfirm: Bool = false
@@ -664,29 +666,55 @@ struct SettingsModalView: View {
         }
     }
 
-    // MARK: - LAN Sync
+    // MARK: - LAN Sync (Route B: Per-Device Code + Multi-Device Sync + Bidirectional Unpair)
 
     private var syncTab: some View {
         let digits = Array(vm.pairCode.filter(\.isNumber))
+        let liveById = Dictionary(uniqueKeysWithValues: (vm.syncHealth.peers ?? []).map { ($0.peerId, $0) })
+        let pairedIdSet = Set(vm.pairedPeers.map(\.peerId))
+        let visibleDiscovered = vm.discoveredPeers.filter { !pairedIdSet.contains($0.peerId) && !vm.ignoredPeerIDs.contains($0.peerId) }
 
         return VStack(spacing: 16) {
-            // Hero 6-Digit Code Card
+            // Card 1: This Mac's Own Independent 6-Digit Code
             settingsCard {
-                VStack(spacing: 14) {
+                VStack(spacing: 12) {
+                    HStack {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("本机专属配对码")
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                            Text("每台电脑拥有独立配对码；连接其他 Mac 时不会改变此码")
+                                .font(.system(size: 11.5))
+                                .foregroundColor(FlomoPalette.textSecondary(scheme))
+                        }
+                        Spacer()
+                        WhimSecondaryButton(title: "重新生成", icon: "arrow.2.squarepath", compact: true) {
+                            showRegenerateConfirm = true
+                        }
+                        .alert("重新生成本机配对码？", isPresented: $showRegenerateConfirm) {
+                            Button("取消", role: .cancel) {}
+                            Button("重新生成", role: .destructive) {
+                                vm.regeneratePairCode()
+                            }
+                        } message: {
+                            Text("仅影响连接到本机的其他设备，它们需要重新输入新的 6 位数字；本机已配对的其他 Mac 不受影响。")
+                        }
+                    }
+
                     Button {
                         NSPasteboard.general.clearContents()
                         NSPasteboard.general.setString(vm.pairCode, forType: .string)
                         copiedLocalCode = true
                         DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { copiedLocalCode = false }
                     } label: {
-                        VStack(spacing: 10) {
+                        VStack(spacing: 8) {
                             HStack(spacing: 8) {
                                 ForEach(0..<6, id: \.self) { idx in
                                     let ch = idx < digits.count ? String(digits[idx]) : "-"
                                     Text(ch)
                                         .font(.system(size: 24, weight: .bold, design: .monospaced))
                                         .foregroundColor(FlomoPalette.textPrimary(scheme))
-                                        .frame(width: 40, height: 48)
+                                        .frame(width: 40, height: 46)
                                         .background(
                                             RoundedRectangle(cornerRadius: 9, style: .continuous)
                                                 .fill(FlomoPalette.canvas(scheme))
@@ -707,7 +735,7 @@ struct SettingsModalView: View {
                             HStack(spacing: 5) {
                                 Image(systemName: copiedLocalCode ? "checkmark.circle.fill" : "doc.on.doc")
                                     .font(.system(size: 11.5))
-                                Text(copiedLocalCode ? "已复制到剪贴板" : "点击复制 6 位配对码")
+                                Text(copiedLocalCode ? "已复制到剪贴板" : "点击复制本机 6 位配对码")
                                     .font(.system(size: 12, weight: .medium))
                             }
                             .foregroundColor(copiedLocalCode ? FlomoPalette.accent(scheme) : FlomoPalette.tagText(scheme))
@@ -717,127 +745,229 @@ struct SettingsModalView: View {
                         .whimClickable(cornerRadius: 10, hoverFill: true)
                     }
                     .buttonStyle(WhimTactileButtonStyle(cornerRadius: 10))
-
-                    Text("在手机或另一台 Mac 的同步设置里输入这 6 位数字。同一份笔记库只需要一个码。")
-                        .font(.system(size: 12))
-                        .foregroundColor(FlomoPalette.textSecondary(scheme))
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: .infinity)
-
-                    rowDivider
-
-                    // Discovered Devices
-                    VStack(alignment: .leading, spacing: 10) {
-                        HStack {
-                            Text("已发现设备")
-                                .font(.system(size: 12.5, weight: .semibold))
-                                .foregroundColor(FlomoPalette.textSecondary(scheme))
-                            Spacer()
-                            WhimSecondaryButton(
-                                title: vm.isSyncing ? "扫描中..." : "立即刷新",
-                                icon: "arrow.triangle.2.circlepath",
-                                compact: true
-                            ) {
-                                vm.syncNow()
-                            }
-                            .disabled(vm.isSyncing)
-                        }
-
-                        if vm.peerStatuses.isEmpty {
-                            Text(vm.isSyncing ? "正在通过 UDP 自动发现同局域网设备..." : "暂未发现同一 Wi-Fi 下的其他 Whim 设备")
-                                .font(.system(size: 12.5))
-                                .foregroundColor(FlomoPalette.textMuted(scheme))
-                                .padding(.vertical, 4)
-                        } else {
-                            VStack(spacing: 6) {
-                                ForEach(vm.peerStatuses) { peer in
-                                    HStack(spacing: 10) {
-                                        Circle()
-                                            .fill(peer.status == "synced" ? Color(hex: 0x34D399) : FlomoPalette.danger(scheme))
-                                            .frame(width: 7, height: 7)
-                                        Text(peer.displayName.isEmpty ? peer.addr : "\(peer.displayName) · \(peer.addr)")
-                                            .font(.system(size: 12.5, design: .monospaced))
-                                            .foregroundColor(FlomoPalette.textPrimary(scheme))
-                                        Spacer()
-                                        Text(peer.message)
-                                            .font(.system(size: 12, weight: .medium))
-                                            .foregroundColor(peer.status == "synced" ? FlomoPalette.accent(scheme) : FlomoPalette.danger(scheme))
-                                    }
-                                    .padding(.horizontal, 10)
-                                    .padding(.vertical, 8)
-                                    .background(
-                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                            .fill(FlomoPalette.canvas(scheme))
-                                    )
-                                }
-                            }
-                        }
-                    }
-
-                    rowDivider
-
-                    // Join another Mac
-                    VStack(alignment: .leading, spacing: 10) {
-                        Text("加入另一台 Mac 的笔记库（手机端只需在手机上输入上方 6 位码，无需在此填写）")
-                            .font(.system(size: 12))
-                            .foregroundColor(FlomoPalette.textSecondary(scheme))
-
-                        HStack(spacing: 10) {
-                            TextField("输入另一台 Mac 的 6 位配对码", text: $remoteCodeInput)
-                                .textFieldStyle(.plain)
-                                .font(.system(size: 14, design: .monospaced))
-                                .foregroundColor(FlomoPalette.textPrimary(scheme))
-                                .padding(.horizontal, 12)
-                                .padding(.vertical, 8)
-                                .background(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .fill(FlomoPalette.canvas(scheme))
-                                )
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                        .stroke(FlomoPalette.border(scheme), lineWidth: 1)
-                                )
-                                .onSubmit {
-                                    if remoteCodeInput.filter(\.isNumber).count == 6 {
-                                        vm.useOtherDeviceCode(remoteCodeInput)
-                                        remoteCodeInput = ""
-                                    }
-                                }
-
-                            WhimPrimaryButton(title: "使用此码", compact: true) {
-                                vm.useOtherDeviceCode(remoteCodeInput)
-                                remoteCodeInput = ""
-                            }
-                            .disabled(remoteCodeInput.filter(\.isNumber).count != 6 || vm.isSyncing)
-                        }
-
-                        if !vm.syncMessage.isEmpty {
-                            Text(vm.syncMessage)
-                                .font(.system(size: 12))
-                                .foregroundColor(FlomoPalette.accent(scheme))
-                        }
-                    }
-
-                    HStack {
-                        Spacer()
-                        WhimSecondaryButton(title: "重新生成配对码", icon: "arrow.2.squarepath", compact: true) {
-                            showRegenerateConfirm = true
-                        }
-                        .alert("重新生成配对码？", isPresented: $showRegenerateConfirm) {
-                            Button("取消", role: .cancel) {}
-                            Button("重新生成", role: .destructive) {
-                                vm.regeneratePairCode()
-                            }
-                        } message: {
-                            Text("重新生成后，已配对的手机和另一台 Mac 都需要重新输入新的 6 位数字。")
-                        }
-                        Spacer()
-                    }
-                    .padding(.top, 2)
                 }
             }
 
-            // Collapsible Manual Fallback Card (full-area clickable header)
+            // Card 2: Paired Devices (Concurrent Multi-Device Sync + Bidirectional Forget)
+            settingsCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        HStack(spacing: 6) {
+                            Text("已配对设备")
+                                .font(.system(size: 13.5, weight: .semibold))
+                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                            if !vm.pairedPeers.isEmpty {
+                                Text("\(vm.pairedPeers.count)")
+                                    .font(.system(size: 11, weight: .semibold).monospacedDigit())
+                                    .foregroundColor(FlomoPalette.accent(scheme))
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1.5)
+                                    .background(Capsule().fill(FlomoPalette.accentSoft(scheme)))
+                            }
+                        }
+                        Spacer()
+                        WhimSecondaryButton(
+                            title: vm.isSyncing ? "同步中..." : "立即同步",
+                            icon: "arrow.triangle.2.circlepath",
+                            compact: true
+                        ) {
+                            vm.syncNow()
+                        }
+                        .disabled(vm.isSyncing)
+                    }
+
+                    if vm.pairedPeers.isEmpty {
+                        Text("尚未配对其他设备。在下方「局域网发现」中点击配对并输入对方的 6 位码，或在手机端输入上方本机码。")
+                            .font(.system(size: 12))
+                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                            .padding(.vertical, 4)
+                    } else {
+                        VStack(spacing: 8) {
+                            ForEach(vm.pairedPeers) { peer in
+                                let live = liveById[peer.peerId]
+                                let isOnline = live?.online ?? false
+                                let isWrongCode = live?.status == "wrong_code"
+                                let dotColor: Color = isOnline ? Color(hex: 0x34D399) : (isWrongCode ? FlomoPalette.warning(scheme) : FlomoPalette.textMuted(scheme))
+                                let statusText: String = {
+                                    if let live, let msg = live.message, !msg.isEmpty { return msg }
+                                    return isOnline ? "在线" : "离线"
+                                }()
+
+                                HStack(spacing: 10) {
+                                    Circle()
+                                        .fill(dotColor)
+                                        .frame(width: 8, height: 8)
+
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(peer.displayName.isEmpty ? "已配对设备" : peer.displayName)
+                                            .font(.system(size: 13, weight: .medium))
+                                            .foregroundColor(FlomoPalette.textPrimary(scheme))
+                                        HStack(spacing: 6) {
+                                            if !peer.lastAddr.isEmpty {
+                                                Text(peer.lastAddr)
+                                                    .font(.system(size: 11, design: .monospaced))
+                                                    .foregroundColor(FlomoPalette.textMuted(scheme))
+                                            }
+                                            Text(statusText)
+                                                .font(.system(size: 11, weight: isOnline ? .medium : .regular))
+                                                .foregroundColor(isOnline ? FlomoPalette.accent(scheme) : (isWrongCode ? FlomoPalette.warning(scheme) : FlomoPalette.textSecondary(scheme)))
+                                        }
+                                    }
+
+                                    Spacer()
+
+                                    WhimSecondaryButton(title: "忘记", destructive: true, compact: true) {
+                                        vm.forgetPeer(peerId: peer.peerId, displayName: peer.displayName)
+                                    }
+                                    .help("断开连接并通知对方停止自动重连")
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 9)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                        .fill(FlomoPalette.canvas(scheme))
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Card 3: Nearby Discovered LAN Devices (Pair with Remote Code or Ignore)
+            settingsCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack {
+                        Text("局域网发现")
+                            .font(.system(size: 13.5, weight: .semibold))
+                            .foregroundColor(FlomoPalette.textPrimary(scheme))
+                        Spacer()
+                        WhimSecondaryButton(
+                            title: vm.isScanningLAN ? "扫描中..." : "重新扫描",
+                            icon: "dot.radiowaves.left.and.right",
+                            compact: true
+                        ) {
+                            vm.scanLANPeers()
+                        }
+                        .disabled(vm.isScanningLAN)
+                    }
+
+                    if visibleDiscovered.isEmpty {
+                        Text(vm.isScanningLAN ? "正在扫描同一 Wi-Fi 下的 Whim 设备..." : "暂未发现新的未配对设备")
+                            .font(.system(size: 12))
+                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                            .padding(.vertical, 4)
+                    } else {
+                        VStack(spacing: 8) {
+                            ForEach(visibleDiscovered) { peer in
+                                let isExpandingPair = pairingPeerId == peer.peerId
+                                VStack(alignment: .leading, spacing: 8) {
+                                    HStack(spacing: 10) {
+                                        Image(systemName: "laptopcomputer")
+                                            .font(.system(size: 13))
+                                            .foregroundColor(FlomoPalette.textSecondary(scheme))
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(peer.displayName.isEmpty ? peer.addr : peer.displayName)
+                                                .font(.system(size: 13, weight: .medium))
+                                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                                            Text(peer.addr)
+                                                .font(.system(size: 11, design: .monospaced))
+                                                .foregroundColor(FlomoPalette.textMuted(scheme))
+                                        }
+                                        Spacer()
+                                        WhimSecondaryButton(title: "忽略", compact: true) {
+                                            if pairingPeerId == peer.peerId { pairingPeerId = nil }
+                                            vm.ignoreDiscoveredPeer(peerId: peer.peerId)
+                                        }
+                                        WhimPrimaryButton(title: isExpandingPair ? "收起" : "配对", compact: true) {
+                                            withAnimation(.easeOut(duration: 0.16)) {
+                                                if isExpandingPair {
+                                                    pairingPeerId = nil
+                                                } else {
+                                                    pairingPeerId = peer.peerId
+                                                    inlinePairCode = ""
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    if isExpandingPair {
+                                        HStack(spacing: 8) {
+                                            TextField("输入对方的 6 位配对码", text: $inlinePairCode)
+                                                .textFieldStyle(.plain)
+                                                .font(.system(size: 13.5, design: .monospaced))
+                                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                                                .padding(.horizontal, 10)
+                                                .padding(.vertical, 7)
+                                                .background(
+                                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                                        .fill(FlomoPalette.card(scheme))
+                                                )
+                                                .overlay(
+                                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                                        .stroke(FlomoPalette.accent(scheme).opacity(0.6), lineWidth: 1)
+                                                )
+                                                .onSubmit {
+                                                    if inlinePairCode.filter(\.isNumber).count == 6 {
+                                                        vm.pairWithDevice(addr: peer.addr, remoteCode: inlinePairCode) { ok in
+                                                            if ok {
+                                                                pairingPeerId = nil
+                                                                inlinePairCode = ""
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                            WhimPrimaryButton(title: vm.isPairingDevice ? "连接中..." : "确认配对", compact: true) {
+                                                vm.pairWithDevice(addr: peer.addr, remoteCode: inlinePairCode) { ok in
+                                                    if ok {
+                                                        pairingPeerId = nil
+                                                        inlinePairCode = ""
+                                                    }
+                                                }
+                                            }
+                                            .disabled(inlinePairCode.filter(\.isNumber).count != 6 || vm.isPairingDevice)
+                                        }
+                                    }
+                                }
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 9)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                        .fill(FlomoPalette.canvas(scheme))
+                                )
+                            }
+                        }
+                    }
+
+                    if !vm.ignoredPeerIDs.isEmpty {
+                        HStack {
+                            Text("已忽略 \(vm.ignoredPeerIDs.count) 台局域网设备")
+                                .font(.system(size: 11.5))
+                                .foregroundColor(FlomoPalette.textMuted(scheme))
+                            Spacer()
+                            Button {
+                                vm.restoreIgnoredPeers()
+                            } label: {
+                                Text("恢复显示")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundColor(FlomoPalette.tagText(scheme))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .whimClickable(cornerRadius: 6, hoverFill: true)
+                            }
+                            .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
+                        }
+                    }
+
+                    if !vm.syncMessage.isEmpty {
+                        Text(vm.syncMessage)
+                            .font(.system(size: 12))
+                            .foregroundColor(FlomoPalette.accent(scheme))
+                    }
+                }
+            }
+
+            // Card 4: Collapsible Manual IP:Port + Remote Code Pairing Fallback
             settingsCard {
                 VStack(alignment: .leading, spacing: 10) {
                     Button {
@@ -850,7 +980,7 @@ struct SettingsModalView: View {
                                 .font(.system(size: 11, weight: .semibold))
                                 .foregroundColor(FlomoPalette.textMuted(scheme))
                                 .frame(width: 14)
-                            Text("无法自动发现？手动添加设备地址（可选）")
+                            Text("无法自动发现？手动输入地址与对方配对码")
                                 .font(.system(size: 12.5, weight: .medium))
                                 .foregroundColor(FlomoPalette.textSecondary(scheme))
                             Spacer()
@@ -865,9 +995,9 @@ struct SettingsModalView: View {
                             .font(.system(size: 11.5))
                             .foregroundColor(FlomoPalette.textMuted(scheme))
                         HStack(spacing: 8) {
-                            TextField("例如 192.168.5.111:8788", text: $remoteAddrInput)
+                            TextField("IP:端口（如 192.168.5.111:8788）", text: $remoteAddrInput)
                                 .textFieldStyle(.plain)
-                                .font(.system(size: 13, design: .monospaced))
+                                .font(.system(size: 12.5, design: .monospaced))
                                 .foregroundColor(FlomoPalette.textPrimary(scheme))
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 7)
@@ -879,17 +1009,39 @@ struct SettingsModalView: View {
                                     RoundedRectangle(cornerRadius: 7, style: .continuous)
                                         .stroke(FlomoPalette.border(scheme), lineWidth: 1)
                                 )
-                            WhimPrimaryButton(title: "保存并同步", compact: true) {
-                                vm.saveManualFallbackAddr(remoteAddrInput)
+                            TextField("对方 6 位码", text: $remoteCodeInput)
+                                .textFieldStyle(.plain)
+                                .font(.system(size: 12.5, design: .monospaced))
+                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                                .frame(width: 108)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 7)
+                                .background(
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .fill(FlomoPalette.canvas(scheme))
+                                )
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                                        .stroke(FlomoPalette.border(scheme), lineWidth: 1)
+                                )
+                            WhimPrimaryButton(title: vm.isPairingDevice ? "连接中..." : "配对", compact: true) {
+                                vm.pairWithDevice(addr: remoteAddrInput, remoteCode: remoteCodeInput) { ok in
+                                    if ok {
+                                        remoteAddrInput = ""
+                                        remoteCodeInput = ""
+                                    }
+                                }
                             }
-                            .disabled(remoteAddrInput.trimmingCharacters(in: .whitespaces).isEmpty)
+                            .disabled(remoteAddrInput.trimmingCharacters(in: .whitespaces).isEmpty || remoteCodeInput.filter(\.isNumber).count != 6 || vm.isPairingDevice)
                         }
                     }
                 }
             }
         }
         .onAppear {
-            vm.syncNow()
+            vm.refreshSyncState()
+            vm.scanLANPeers()
+            vm.refreshSyncHealth(activeProbe: true)
         }
     }
 

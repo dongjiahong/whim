@@ -138,6 +138,7 @@ import com.whim.app.core.WhimNote
 import com.whim.app.core.WhimNoteCursor
 import com.whim.app.core.WhimStats
 import com.whim.app.core.WhimSyncHealthStatus
+import com.whim.app.core.WhimSyncPeer
 import com.whim.app.core.WhimTagNode
 import com.whim.app.review.DailyReviewReceiver
 import com.whim.app.review.DailyReviewScheduler
@@ -329,7 +330,7 @@ private fun FlomoMobileApp(
     val pageSize = 50
 
     var tagTree by remember { mutableStateOf<List<WhimTagNode>>(emptyList()) }
-    var pairCode by remember { mutableStateOf("") }
+    var pairedPeers by remember { mutableStateOf<List<WhimSyncPeer>>(emptyList()) }
     var syncToast by remember { mutableStateOf("") }
     var syncToastJob by remember { mutableStateOf<Job?>(null) }
     var peerStatuses by remember { mutableStateOf<List<com.whim.app.core.WhimPeerSyncStatus>>(emptyList()) }
@@ -375,7 +376,7 @@ private fun FlomoMobileApp(
         runCatching {
             stats = WhimCoreBridge.getStats(90)
             tagTree = WhimCoreBridge.listTagTree()
-            pairCode = WhimCoreBridge.getPairCode()
+            pairedPeers = WhimCoreBridge.listPairedPeers()
         }
     }
 
@@ -565,12 +566,14 @@ private fun FlomoMobileApp(
     // Immediate foreground catch-up sync on every ON_RESUME / Wi-Fi reconnect
     LaunchedEffect(foregroundSyncTrigger) {
         if (foregroundSyncTrigger == 0) return@LaunchedEffect
-        val code = pairCode.ifEmpty { runCatching { WhimCoreBridge.getPairCode() }.getOrDefault("") }
-        if (code.length != 6) {
+        val peers = runCatching { WhimCoreBridge.listPairedPeers() }.getOrDefault(emptyList())
+        pairedPeers = peers
+        if (peers.isEmpty()) {
             syncHealth = WhimSyncHealthStatus(state = "unpaired", connected = false)
             return@LaunchedEffect
         }
         val res = runCatching { WhimCoreBridge.syncOnce(timeoutSec = 6) }.getOrNull()
+        runCatching { pairedPeers = WhimCoreBridge.listPairedPeers() }
         runCatching { syncHealth = WhimCoreBridge.checkSyncHealth(activeProbe = true) }
         if (res != null) {
             peerStatuses = res.peers
@@ -584,29 +587,29 @@ private fun FlomoMobileApp(
     }
 
     // Real-time ping/pong liveness monitor for the top-bar sync status indicator
-    LaunchedEffect(pairCode) {
+    LaunchedEffect(pairedPeers.size) {
         var tick = 0
         while (isActive) {
-            val code = pairCode.ifEmpty { runCatching { WhimCoreBridge.getPairCode() }.getOrDefault("") }
-            if (code.length != 6) {
-                syncHealth = WhimSyncHealthStatus(state = "unpaired", connected = false)
-                delay(3000L)
-                continue
-            }
             val activeProbe = (tick % 3 == 0)
             tick++
+            runCatching { pairedPeers = WhimCoreBridge.listPairedPeers() }
+            if (pairedPeers.isEmpty()) {
+                syncHealth = WhimSyncHealthStatus(state = "unpaired", connected = false)
+                delay(4000L)
+                continue
+            }
             runCatching { syncHealth = WhimCoreBridge.checkSyncHealth(activeProbe = activeProbe) }
             delay(5000L)
         }
     }
 
-    // Real-time SSE push loop: wakes up in < 50ms when Mac creates/edits/deletes a note,
-    // with a 15s fallback sync in case of Wi-Fi hiccups. Re-runs immediately when pairCode changes.
-    LaunchedEffect(pairCode) {
+    // Real-time multi-host SSE push loop: wakes up in < 50ms when any paired Mac changes a note
+    // or sends an unpair event, with a 15s fallback sync in case of Wi-Fi hiccups.
+    LaunchedEffect(pairedPeers.size) {
         while (isActive) {
-            val code = pairCode.ifEmpty { runCatching { WhimCoreBridge.getPairCode() }.getOrDefault("") }
-            if (code.length == 6) {
+            if (pairedPeers.isNotEmpty()) {
                 val res = runCatching { WhimCoreBridge.syncOnce(timeoutSec = 6) }.getOrNull()
+                runCatching { pairedPeers = WhimCoreBridge.listPairedPeers() }
                 runCatching { syncHealth = WhimCoreBridge.checkSyncHealth(activeProbe = false) }
                 if (res != null) {
                     peerStatuses = res.peers
@@ -618,11 +621,12 @@ private fun FlomoMobileApp(
                     reload()
                 }
                 WhimCoreBridge.waitForChange(timeoutSec = 15)
+                runCatching { pairedPeers = WhimCoreBridge.listPairedPeers() }
                 if (WhimCoreBridge.dataVersion() != lastLoadedVersion) {
                     reload()
                 }
             } else {
-                delay(2000L)
+                delay(2500L)
             }
         }
     }
@@ -693,7 +697,7 @@ private fun FlomoMobileApp(
                         activeTab = MobileTab.Archived
                         scope.launch { drawerState.close() }
                     }
-                    DrawerNavRow(Icons.Rounded.Settings, "设置 · ${if (pairCode.length == 6) "已配对" else "未配对"} · v${GitHubUpdater.CURRENT_VERSION}", false) {
+                    DrawerNavRow(Icons.Rounded.Settings, "设置 · ${if (pairedPeers.isNotEmpty()) "已配对 ${pairedPeers.size} 台" else "未配对"} · v${GitHubUpdater.CURRENT_VERSION}", false) {
                         settingsFocusSection = SettingsFocusSection.ALL
                         showSettingsScreen = true
                         scope.launch { drawerState.close() }
@@ -787,8 +791,8 @@ private fun FlomoMobileApp(
                         val syncStatusText = when {
                             isSyncingNow -> "同步中"
                             syncHealth.connected -> "已同步"
-                            syncHealth.state == "wrong_code" -> "配对码错"
-                            syncHealth.state == "unpaired" || pairCode.length != 6 -> "未配对"
+                            syncHealth.state == "wrong_code" -> "需重配"
+                            syncHealth.state == "unpaired" || pairedPeers.isEmpty() -> "未配对"
                             else -> "未连接"
                         }
                         Row(
@@ -801,7 +805,7 @@ private fun FlomoMobileApp(
                                     shape = RoundedCornerShape(14.dp)
                                 )
                                 .clickable(enabled = !isSyncingNow) {
-                                    if (pairCode.length != 6 || syncHealth.state == "wrong_code") {
+                                    if (pairedPeers.isEmpty() || syncHealth.state == "wrong_code") {
                                         settingsFocusSection = SettingsFocusSection.SYNC
                                         showSettingsScreen = true
                                     } else {
@@ -809,6 +813,7 @@ private fun FlomoMobileApp(
                                             isSyncingNow = true
                                             syncToast = "正在检测连接并同步..."
                                             val res = runCatching { WhimCoreBridge.syncOnce() }.getOrNull()
+                                            runCatching { pairedPeers = WhimCoreBridge.listPairedPeers() }
                                             val health = runCatching { WhimCoreBridge.checkSyncHealth(activeProbe = true) }.getOrNull()
                                             if (health != null) syncHealth = health
                                             if (res != null) peerStatuses = res.peers
@@ -1308,10 +1313,10 @@ private fun FlomoMobileApp(
             notifPermissionGranted = notifPermissionGranted,
             exactAlarmGranted = exactAlarmGranted,
             onRequestNotificationPermission = onRequestNotificationPermission,
-            pairCode = pairCode,
-            onPairCodeUpdated = { pairCode = it },
-            peerStatuses = peerStatuses,
-            onPeerStatusesUpdated = { peerStatuses = it },
+            pairedPeers = pairedPeers,
+            onPairedPeersUpdated = { pairedPeers = it },
+            syncHealth = syncHealth,
+            onSyncHealthUpdated = { syncHealth = it },
             initialRelease = latestUpdateRelease,
             onUpdateBadgeDismissed = {
                 hasAppUpdate = false

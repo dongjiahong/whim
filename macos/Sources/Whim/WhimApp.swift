@@ -82,9 +82,14 @@ final class WhimStoreVM: ObservableObject {
     @Published var pairCode: String = ""
     @Published var syncMessage: String = ""
     @Published var isSyncing: Bool = false
+    @Published var isScanningLAN: Bool = false
+    @Published var isPairingDevice: Bool = false
     @Published var isCheckingSyncHealth: Bool = false
     @Published var syncHealth: WhimSyncHealthStatus = .initial
     @Published var peerStatuses: [WhimPeerSyncStatus] = []
+    @Published var pairedPeers: [WhimSyncPeer] = []
+    @Published var discoveredPeers: [WhimDiscoveredPeer] = []
+    @Published var ignoredPeerIDs: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "whim.sync.ignoredPeers") ?? [])
     @Published var reviewReminders: [ReviewReminder] = WhimStoreVM.loadStoredReminders()
     @Published var reviewNotificationStatus: String = ""
 
@@ -476,8 +481,10 @@ final class WhimStoreVM: ObservableObject {
         DispatchQueue.global(qos: .userInitiated).async {
             let res = try? CoreBridge.shared.syncOnce(timeoutSec: 6)
             let health = try? CoreBridge.shared.checkSyncHealth(activeProbe: true)
+            let paired = (try? CoreBridge.shared.listPairedPeers()) ?? []
             DispatchQueue.main.async {
                 self.isSyncing = false
+                self.pairedPeers = paired
                 if let health {
                     self.syncHealth = health
                 }
@@ -503,30 +510,107 @@ final class WhimStoreVM: ObservableObject {
 
     func refreshSyncState() {
         pairCode = (try? CoreBridge.shared.getPairCode()) ?? pairCode
-    }
-
-    func useOtherDeviceCode(_ code: String) {
-        do {
-            let updated = try CoreBridge.shared.setPairCode(code)
-            pairCode = updated
-            syncMessage = "已切换到新配对码，正在自动发现并同步..."
-            syncNow()
-        } catch {
-            syncMessage = error.localizedDescription
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let paired = (try? CoreBridge.shared.listPairedPeers()) ?? []
+            DispatchQueue.main.async { [weak self] in
+                self?.pairedPeers = paired
+            }
         }
     }
 
-    func saveManualFallbackAddr(_ addr: String) {
-        let trimmed = addr.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        try? CoreBridge.shared.setManualPeers([trimmed])
-        syncNow()
+    func scanLANPeers() {
+        guard !isScanningLAN else { return }
+        isScanningLAN = true
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let found = (try? CoreBridge.shared.discoverLAN()) ?? []
+            let paired = (try? CoreBridge.shared.listPairedPeers()) ?? []
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isScanningLAN = false
+                self.discoveredPeers = found
+                self.pairedPeers = paired
+            }
+        }
+    }
+
+    func pairWithDevice(addr: String, remoteCode: String, completion: ((Bool) -> Void)? = nil) {
+        guard !isPairingDevice else { return }
+        let trimmedAddr = addr.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanCode = String(remoteCode.filter(\.isNumber))
+        guard !trimmedAddr.isEmpty, cleanCode.count == 6 else {
+            syncMessage = "请输入有效的设备地址和 6 位配对码"
+            completion?(false)
+            return
+        }
+        isPairingDevice = true
+        syncMessage = "正在连接 \(trimmedAddr) 并验证对方配对码..."
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                let res = try CoreBridge.shared.pairAndSync(addr: trimmedAddr, remoteCode: cleanCode)
+                let paired = (try? CoreBridge.shared.listPairedPeers()) ?? []
+                let found = (try? CoreBridge.shared.discoverLAN()) ?? []
+                let health = try? CoreBridge.shared.checkSyncHealth(activeProbe: true)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.isPairingDevice = false
+                    self.pairedPeers = paired
+                    self.discoveredPeers = found
+                    if let health { self.syncHealth = health }
+                    self.syncMessage = "配对成功" + (res.notesMerged > 0 ? " · 已合并 \(res.notesMerged) 条笔记" : " · 已保持同步")
+                    if res.notesMerged > 0 || res.blobsDownloaded > 0 {
+                        self.reload()
+                    }
+                    completion?(true)
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.isPairingDevice = false
+                    self.syncMessage = error.localizedDescription
+                    completion?(false)
+                }
+            }
+        }
+    }
+
+    func forgetPeer(peerId: String, displayName: String) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try CoreBridge.shared.removePairedPeer(peerId: peerId)
+                let paired = (try? CoreBridge.shared.listPairedPeers()) ?? []
+                let found = (try? CoreBridge.shared.discoverLAN()) ?? []
+                let health = try? CoreBridge.shared.checkSyncHealth(activeProbe: false)
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    self.pairedPeers = paired
+                    self.discoveredPeers = found
+                    if let health { self.syncHealth = health }
+                    self.syncMessage = "已断开与「\(displayName.isEmpty ? peerId : displayName)」的连接，双方已停止自动同步"
+                }
+            } catch {
+                DispatchQueue.main.async { [weak self] in
+                    self?.syncMessage = "断开失败: \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    func ignoreDiscoveredPeer(peerId: String) {
+        guard !peerId.isEmpty else { return }
+        ignoredPeerIDs.insert(peerId)
+        UserDefaults.standard.set(Array(ignoredPeerIDs), forKey: "whim.sync.ignoredPeers")
+    }
+
+    func restoreIgnoredPeers() {
+        ignoredPeerIDs.removeAll()
+        UserDefaults.standard.removeObject(forKey: "whim.sync.ignoredPeers")
+        scanLANPeers()
     }
 
     func regeneratePairCode() {
         if let updated = try? CoreBridge.shared.regeneratePairCode() {
             pairCode = updated
-            syncMessage = "已重新生成配对码"
+            syncMessage = "已重新生成本机配对码（不影响已配对的其他电脑）"
             syncNow()
         }
     }

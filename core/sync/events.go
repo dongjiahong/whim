@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -16,7 +17,8 @@ const sseIdleTimeout = 35 * time.Second
 // handleEvents serves an authenticated Server-Sent Events (SSE) stream on /sync/events.
 // Whenever a note is created, updated, deleted, or merged on this host, all connected
 // clients receive an instant `event: changed` frame (< 50ms latency) over the existing HTTP port.
-// It also drives real bidirectional ping/pong heartbeats (`event: ping` -> client `POST /sync/pong`).
+// It also drives real bidirectional ping/pong heartbeats (`event: ping` -> client `POST /sync/pong`)
+// and instant unpair notification (`event: unpair`) when this host forgets the client.
 func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -45,6 +47,7 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		remoteIP:  clientIP,
 		changedCh: make(chan struct{}, 1),
 		pingCh:    make(chan ssePingMsg, 4),
+		unpairCh:  make(chan string, 1),
 		closeCh:   make(chan struct{}),
 	}
 
@@ -68,7 +71,6 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		p.sseMu.Lock()
 		delete(p.sseSubs, sub)
 		if clientPeerID != "" {
-			// Only clear activeSSEPeers if no other subscriber for the same peerID remains
 			stillActive := false
 			for s := range p.sseSubs {
 				if s.peerID == clientPeerID {
@@ -118,6 +120,11 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-sub.closeCh:
 			return
+		case remotePeerID := <-sub.unpairCh:
+			payload, _ := json.Marshal(unpairRequest{PeerID: remotePeerID})
+			_, _ = fmt.Fprintf(w, "event: unpair\ndata: %s\n\n", payload)
+			flusher.Flush()
+			return
 		case <-sub.changedCh:
 			if _, err := fmt.Fprintf(w, "event: changed\ndata: %d\n\n", time.Now().UnixMilli()); err != nil {
 				return
@@ -128,7 +135,6 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-pingTicker.C:
-			// Check whether the client replied to our previous ping
 			if clientPeerID != "" {
 				p.sseMu.Lock()
 				rec := p.peerLiveness[clientPeerID]
@@ -155,8 +161,8 @@ func (p *Peer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// ensureEventSubscriber starts a single lightweight background goroutine that discovers
-// LAN hosts via cached sync_peers + UDP (or manual fallback addrs) and subscribes to /sync/events.
+// ensureEventSubscriber starts the multi-peer SSE supervisor goroutine that maintains
+// concurrent live SSE streams to all paired outbound hosts using each host's own 6-digit code.
 func (p *Peer) ensureEventSubscriber() {
 	p.mu.Lock()
 	if p.sseStarted {
@@ -171,119 +177,114 @@ func (p *Peer) ensureEventSubscriber() {
 	go p.runEventSubscriberLoop(ctx)
 }
 
+type activeSSEWorker struct {
+	addr   string
+	code   string
+	cancel context.CancelFunc
+}
+
 func (p *Peer) runEventSubscriberLoop(ctx context.Context) {
-	waitOrReconnect := func(d time.Duration) bool {
-		timer := time.NewTimer(d)
-		defer timer.Stop()
-		select {
-		case <-ctx.Done():
-			return false
-		case <-p.sseReconnect:
-			return true
-		case <-timer.C:
-			return true
+	active := make(map[string]activeSSEWorker)
+	defer func() {
+		for k, w := range active {
+			w.cancel()
+			delete(active, k)
+		}
+		p.sseMu.Lock()
+		for k := range p.sseStreams {
+			delete(p.sseStreams, k)
+		}
+		p.sseMu.Unlock()
+	}()
+
+	reconcile := func() {
+		targets := p.findPairedOutboundTargets(ctx)
+		desired := make(map[string]pairedOutboundTarget, len(targets))
+		for _, t := range targets {
+			key := t.peerID
+			if key == "" {
+				key = t.addr
+			}
+			desired[key] = t
+		}
+
+		// Tear down streams for peers that were unpaired or changed address/code.
+		for key, w := range active {
+			t, ok := desired[key]
+			if !ok || t.addr != w.addr || t.code != w.code {
+				w.cancel()
+				delete(active, key)
+				p.sseMu.Lock()
+				delete(p.sseStreams, key)
+				p.sseMu.Unlock()
+			}
+		}
+
+		// Spawn concurrent SSE workers for newly paired hosts.
+		for key, t := range desired {
+			if _, exists := active[key]; exists {
+				continue
+			}
+			streamCtx, streamCancel := context.WithCancel(ctx)
+			active[key] = activeSSEWorker{
+				addr:   t.addr,
+				code:   t.code,
+				cancel: streamCancel,
+			}
+			p.sseMu.Lock()
+			p.sseStreams[key] = streamCancel
+			p.sseMu.Unlock()
+
+			go p.runSinglePeerSSE(streamCtx, key, t)
 		}
 	}
 
+	reconcile()
+	ticker := time.NewTicker(4 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-p.sseReconnect:
+			reconcile()
+		case <-ticker.C:
+			reconcile()
+		}
+	}
+}
+
+func (p *Peer) runSinglePeerSSE(ctx context.Context, key string, target pairedOutboundTarget) {
+	backoff := 1 * time.Second
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		code := NormalizeCode(p.auth.Code())
-		if len(code) != 6 {
-			if !waitOrReconnect(1 * time.Second) {
-				return
-			}
-			continue
-		}
-
-		addrs := p.findEventTargetAddrs(ctx)
-		if len(addrs) == 0 {
-			if !waitOrReconnect(2 * time.Second) {
-				return
-			}
-			continue
-		}
-
-		// Try each known host until one accepts the SSE stream
-		for _, addr := range addrs {
-			if ctx.Err() != nil {
-				return
-			}
-			streamCtx, streamCancel := context.WithCancel(ctx)
-			p.sseMu.Lock()
-			p.sseStreamCancel = streamCancel
-			p.sseMu.Unlock()
-
-			err := p.subscribeOneSSE(streamCtx, addr, code)
-
-			p.sseMu.Lock()
-			p.sseStreamCancel = nil
-			p.sseMu.Unlock()
-			streamCancel()
-
-			if err != nil && ctx.Err() == nil {
-				log.Printf("[whim-sync] sse disconnected from %s: %v", addr, err)
-			}
-		}
-
-		if !waitOrReconnect(1 * time.Second) {
+		err := p.subscribeOneSSE(ctx, target.peerID, target.addr, target.code)
+		if errors.Is(err, ErrPeerUnpaired) || ctx.Err() != nil {
 			return
+		}
+		if err != nil {
+			log.Printf("[whim-sync] sse disconnected from %s (%s): %v", target.displayName, target.addr, err)
+		}
+		timer := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		if backoff < 8*time.Second {
+			backoff *= 2
+			if backoff > 8*time.Second {
+				backoff = 8 * time.Second
+			}
 		}
 	}
 }
 
-func (p *Peer) findEventTargetAddrs(ctx context.Context) []string {
-	p.mu.Lock()
-	discPort := p.discoveryPort
-	p.mu.Unlock()
-
-	seen := make(map[string]bool)
-	var out []string
-	add := func(a string) {
-		a = strings.TrimSpace(a)
-		if a == "" || seen[a] {
-			return
-		}
-		seen[a] = true
-		out = append(out, a)
-	}
-
-	// 1. Fresh UDP discovery (picks up DHCP IP changes automatically)
-	if discovered, err := DiscoverPeers(ctx, discPort, p.peerID, 700*time.Millisecond); err == nil {
-		for _, d := range discovered {
-			add(d.Addr)
-		}
-	}
-	// 2. Persisted server peers from SQLite sync_peers (entries with host:port, e.g. Mac host).
-	// Immune to Android Wi-Fi UDP broadcast packet drops!
-	if saved, err := p.store.ListSyncPeers(); err == nil {
-		for _, sp := range saved {
-			if strings.Contains(sp.LastAddr, ":") {
-				add(sp.LastAddr)
-			}
-		}
-	}
-	// 3. Optional manual fallback addresses
-	if rawManual, _ := p.store.GetMeta("whim.manual_addrs"); rawManual != "" {
-		var addrs []string
-		if json.Unmarshal([]byte(rawManual), &addrs) == nil {
-			for _, a := range addrs {
-				a = strings.TrimSpace(a)
-				if a == "" {
-					continue
-				}
-				if !strings.Contains(a, ":") {
-					a = fmt.Sprintf("%s:%d", a, DefaultHTTPPort)
-				}
-				add(a)
-			}
-		}
-	}
-	return out
-}
-
-func (p *Peer) subscribeOneSSE(ctx context.Context, addr, code string) error {
+func (p *Peer) subscribeOneSSE(ctx context.Context, peerID, addr, code string) error {
 	baseURL := "http://" + addr
 	nonce, err := p.fetchNonce(ctx, baseURL)
 	if err != nil {
@@ -305,23 +306,24 @@ func (p *Peer) subscribeOneSSE(ctx context.Context, addr, code string) error {
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusGone {
+		p.handleRemoteUnpaired(peerID, addr)
+		return ErrPeerUnpaired
+	}
 	if resp.StatusCode != http.StatusOK {
 		if resp.StatusCode == http.StatusUnauthorized {
-			p.recordPeerFailure("", "", addr, "wrong_code", "配对码不匹配")
+			p.recordPeerFailure(peerID, "", addr, "wrong_code", "对方配对码已更换")
 		}
 		return fmt.Errorf("sse status %d", resp.StatusCode)
 	}
-	log.Printf("[whim-sync] sse subscribed to %s", addr)
+	log.Printf("[whim-sync] sse subscribed to %s (peer=%s)", addr, peerID)
 
-	// Immediately trigger a catch-up sync whenever an SSE stream (re)connects so any
-	// events missed while Android was asleep/frozen are pulled right away.
+	// Trigger a catch-up sync whenever an SSE stream (re)connects.
 	select {
 	case p.remoteChanged <- struct{}{}:
 	default:
 	}
 
-	// Watchdog: server sends `event: ping` every 10s. If no bytes arrive for 35s
-	// (e.g. half-open TCP socket after Android Doze/Wi-Fi sleep), close body to force reconnect.
 	done := make(chan struct{})
 	defer close(done)
 	go func() {
@@ -356,20 +358,30 @@ func (p *Peer) subscribeOneSSE(ctx context.Context, addr, code string) error {
 				default:
 				}
 			}
-		} else if strings.HasPrefix(line, "data:") && currentEvent == "ping" {
+		} else if strings.HasPrefix(line, "data:") {
 			rawData := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-			var pingMsg ssePingMsg
-			if json.Unmarshal([]byte(rawData), &pingMsg) == nil && pingMsg.ID != "" {
-				go func(msg ssePingMsg) {
-					pongCtx, cancel := context.WithTimeout(ctx, pingReplyTimeout)
-					defer cancel()
-					_ = p.sendPong(pongCtx, addr, code, msg.ID, msg.TS)
-				}(pingMsg)
+			switch currentEvent {
+			case "unpair":
+				var msg unpairRequest
+				_ = json.Unmarshal([]byte(rawData), &msg)
+				targetID := msg.PeerID
+				if targetID == "" {
+					targetID = peerID
+				}
+				p.handleRemoteUnpaired(targetID, addr)
+				return ErrPeerUnpaired
+			case "ping":
+				var pingMsg ssePingMsg
+				if json.Unmarshal([]byte(rawData), &pingMsg) == nil && pingMsg.ID != "" {
+					go func(msg ssePingMsg) {
+						pongCtx, cancel := context.WithTimeout(ctx, pingReplyTimeout)
+						defer cancel()
+						if perr := p.sendPong(pongCtx, addr, code, msg.ID, msg.TS); errors.Is(perr, ErrPeerUnpaired) {
+							p.handleRemoteUnpaired(peerID, addr)
+						}
+					}(pingMsg)
+				}
 			}
-		}
-		// If local pairing code changed while stream is open, drop & reconnect with new code
-		if NormalizeCode(p.auth.Code()) != code {
-			return nil
 		}
 	}
 	return scanner.Err()

@@ -1286,11 +1286,11 @@ func (s *Store) GetSyncPeer(peerID string) (*model.SyncPeer, error) {
 	return &p, err
 }
 
-// ListSyncPeers lists all paired sync peers.
+// ListSyncPeers lists all paired sync peers (both outbound hosts and inbound clients).
 func (s *Store) ListSyncPeers() ([]model.SyncPeer, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	rows, err := s.db.Query(`SELECT peer_id, display_name, last_addr, pair_code, last_heard_at, last_sync_at FROM sync_peers WHERE pair_code <> '' ORDER BY last_sync_at DESC`)
+	rows, err := s.db.Query(`SELECT peer_id, display_name, last_addr, pair_code, last_heard_at, last_sync_at FROM sync_peers ORDER BY last_sync_at DESC`)
 	if err != nil {
 		return nil, err
 	}

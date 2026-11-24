@@ -46,11 +46,18 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      - uses: android-actions/setup-android@v3
       - name: Install Android NDK & gomobile
         run: |
-          sdkmanager "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          SDKMANAGER="$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager 2>/dev/null | sort -V | tail -n 1)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "sdkmanager not found under $ANDROID_HOME/cmdline-tools" >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "ndk;27.2.12479018" "platforms;android-35" "build-tools;35.0.0"
           export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+          export PATH="$(go env GOPATH)/bin:$PATH"
           go install golang.org/x/mobile/cmd/gomobile@latest
           gomobile init
           mkdir -p android/app/libs
@@ -66,9 +73,12 @@ jobs:
           else
             echo "Warning: ANDROID_KEYSTORE_BASE64 secret not set; falling back to ephemeral debug keystore."
           fi
-      - name: Build Android Release APK
+      - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
-      - env:
+        with:
+          gradle-version: '8.10.2'
+      - name: Build Android Release APK
+        env:
           WHIM_KEYSTORE_PASSWORD: ${{ secrets.WHIM_KEYSTORE_PASSWORD }}
           WHIM_KEY_ALIAS: ${{ secrets.WHIM_KEY_ALIAS }}
           WHIM_KEY_PASSWORD: ${{ secrets.WHIM_KEY_PASSWORD }}

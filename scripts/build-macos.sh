@@ -40,4 +40,7 @@ if [ -d "$MAC_DIR/Resources/Fonts" ]; then
   cp -R "$MAC_DIR/Resources/Fonts" "$APP/Contents/Resources/Fonts"
 fi
 
-echo "Built $APP"
+echo "==> Ad-hoc signing Whim.app (required for macOS Notification Center)..."
+codesign --force --deep --sign - "$APP"
+
+echo "Built and signed $APP"

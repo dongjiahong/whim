@@ -11,6 +11,65 @@ enum SidebarTab: Equatable {
     case tag(String)
 }
 
+struct ReviewReminder: Codable, Identifiable, Equatable {
+    var id: String = UUID().uuidString
+    var label: String = ""
+    var hour: Int
+    var minute: Int
+    var weekdays: Set<Int>
+    var enabled: Bool = true
+
+    static let allWeekdays: Set<Int> = Set(1...7)
+    static let workdays: Set<Int> = Set([2, 3, 4, 5, 6])
+    static let weekends: Set<Int> = Set([1, 7])
+
+    var formattedTime: String {
+        String(format: "%02d:%02d", hour, minute)
+    }
+
+    var totalMinutes: Int {
+        hour * 60 + minute
+    }
+
+    var displayTitle: String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty { return trimmed }
+        switch hour {
+        case 5..<12: return "晨间复盘"
+        case 12..<18: return "午后回顾"
+        default: return "晚间总结"
+        }
+    }
+
+    var timeIcon: String {
+        switch hour {
+        case 5..<11: return "sunrise.fill"
+        case 11..<18: return "sun.max.fill"
+        default: return "moon.stars.fill"
+        }
+    }
+
+    var repeatSummary: String {
+        if weekdays.count == 7 { return "每天" }
+        if weekdays == Self.workdays { return "工作日" }
+        if weekdays == Self.weekends { return "周末" }
+        let labels: [(Int, String)] = [(2, "一"), (3, "二"), (4, "三"), (5, "四"), (6, "五"), (7, "六"), (1, "日")]
+        let picked = labels.filter { weekdays.contains($0.0) }.map(\.1).joined(separator: "、")
+        return picked.isEmpty ? "不重复" : "周\(picked)"
+    }
+
+    var notificationBody: String {
+        switch hour {
+        case 5..<12:
+            return "早安，花 2 分钟回顾一下昨天的闪念与思考，带着清晰开始今天。"
+        case 12..<18:
+            return "小憩片刻，翻看今天记录的灵感，理顺接下来的思路。"
+        default:
+            return "花 2 分钟回顾今天记录的闪念，整理关键想法。"
+        }
+    }
+}
+
 @MainActor
 final class WhimStoreVM: ObservableObject {
     @Published var displayedNotes: [WhimNote] = []
@@ -26,16 +85,35 @@ final class WhimStoreVM: ObservableObject {
     @Published var isCheckingSyncHealth: Bool = false
     @Published var syncHealth: WhimSyncHealthStatus = .initial
     @Published var peerStatuses: [WhimPeerSyncStatus] = []
-    @Published var dailyReviewEnabled: Bool = UserDefaults.standard.object(forKey: "whim.review.enabled") as? Bool ?? true
-    @Published var reviewHour: Int = UserDefaults.standard.object(forKey: "whim.review.hour") as? Int ?? 21
-    @Published var reviewMinute: Int = UserDefaults.standard.object(forKey: "whim.review.minute") as? Int ?? 30
-    @Published var reviewWeekdays: Set<Int> = {
-        if let arr = UserDefaults.standard.array(forKey: "whim.review.weekdays") as? [Int], !arr.isEmpty {
-            return Set(arr.filter { (1...7).contains($0) })
-        }
-        return Set(1...7)
-    }()
+    @Published var reviewReminders: [ReviewReminder] = WhimStoreVM.loadStoredReminders()
     @Published var reviewNotificationStatus: String = ""
+
+    private static let remindersStorageKey = "whim.review.reminders.v2"
+
+    private static func loadStoredReminders() -> [ReviewReminder] {
+        let ud = UserDefaults.standard
+        if let data = ud.data(forKey: remindersStorageKey),
+           let decoded = try? JSONDecoder().decode([ReviewReminder].self, from: data) {
+            return decoded
+        }
+        let legacyEnabled = ud.object(forKey: "whim.review.enabled") as? Bool ?? true
+        let legacyHour = ud.object(forKey: "whim.review.hour") as? Int ?? 21
+        let legacyMinute = ud.object(forKey: "whim.review.minute") as? Int ?? 30
+        let legacyDays: Set<Int> = {
+            if let arr = ud.array(forKey: "whim.review.weekdays") as? [Int], !arr.isEmpty {
+                return Set(arr.filter { (1...7).contains($0) })
+            }
+            return ReviewReminder.allWeekdays
+        }()
+        let migrated = ReviewReminder(
+            label: legacyHour < 12 ? "晨间复盘" : "晚间总结",
+            hour: max(0, min(23, legacyHour)),
+            minute: max(0, min(59, legacyMinute)),
+            weekdays: legacyDays.isEmpty ? ReviewReminder.allWeekdays : legacyDays,
+            enabled: legacyEnabled
+        )
+        return [migrated]
+    }
 
     // Undo delete toast
     @Published var lastDeletedNoteId: String? = nil
@@ -592,43 +670,72 @@ final class WhimStoreVM: ObservableObject {
     static let reviewActionOpen = "WHIM_REVIEW_OPEN"
     static let reviewActionSnooze = "WHIM_REVIEW_SNOOZE"
 
+    var enabledReminders: [ReviewReminder] {
+        reviewReminders
+            .filter { $0.enabled && !$0.weekdays.isEmpty }
+            .sorted { $0.totalMinutes < $1.totalMinutes }
+    }
+
+    var hasEnabledReminders: Bool {
+        !enabledReminders.isEmpty
+    }
+
     var reviewScheduleSummary: String {
-        guard dailyReviewEnabled, !reviewWeekdays.isEmpty else { return "提醒已关" }
-        let timeStr = String(format: "%02d:%02d", reviewHour, reviewMinute)
-        let weekdays = reviewWeekdays
-        if weekdays.count == 7 {
-            return "每天 \(timeStr)"
-        } else if weekdays == Set([2, 3, 4, 5, 6]) {
-            return "工作日 \(timeStr)"
-        } else if weekdays == Set([1, 7]) {
-            return "周末 \(timeStr)"
+        let active = enabledReminders
+        guard !active.isEmpty else { return "提醒已关" }
+        if active.count == 1, let r = active.first {
+            return "\(r.repeatSummary) \(r.formattedTime)"
         }
-        let labels: [(Int, String)] = [(2, "一"), (3, "二"), (4, "三"), (5, "四"), (6, "五"), (7, "六"), (1, "日")]
-        let picked = labels.filter { weekdays.contains($0.0) }.map(\.1).joined(separator: "、")
-        return "周\(picked) \(timeStr)"
-    }
-
-    func toggleReviewWeekday(_ weekday: Int) {
-        if reviewWeekdays.contains(weekday) {
-            if reviewWeekdays.count > 1 {
-                reviewWeekdays.remove(weekday)
-            }
-        } else {
-            reviewWeekdays.insert(weekday)
+        if active.count == 2 {
+            return "\(active[0].formattedTime) · \(active[1].formattedTime)"
         }
-        saveReviewSchedule()
+        return "\(active[0].formattedTime) 等 \(active.count) 个提醒"
     }
 
-    func setReviewWeekdayPreset(_ days: Set<Int>) {
-        reviewWeekdays = days
-        saveReviewSchedule()
+    @discardableResult
+    func addReminder(
+        label: String = "",
+        hour: Int = 8,
+        minute: Int = 30,
+        weekdays: Set<Int> = ReviewReminder.allWeekdays
+    ) -> ReviewReminder {
+        let item = ReviewReminder(
+            label: label,
+            hour: max(0, min(23, hour)),
+            minute: max(0, min(59, minute)),
+            weekdays: weekdays.isEmpty ? ReviewReminder.allWeekdays : weekdays,
+            enabled: true
+        )
+        reviewReminders.append(item)
+        reviewReminders.sort { $0.totalMinutes < $1.totalMinutes }
+        persistAndScheduleReminders()
+        return item
     }
 
-    func saveReviewSchedule() {
-        UserDefaults.standard.set(dailyReviewEnabled, forKey: "whim.review.enabled")
-        UserDefaults.standard.set(reviewHour, forKey: "whim.review.hour")
-        UserDefaults.standard.set(reviewMinute, forKey: "whim.review.minute")
-        UserDefaults.standard.set(Array(reviewWeekdays).sorted(), forKey: "whim.review.weekdays")
+    func updateReminder(_ updated: ReviewReminder) {
+        guard let idx = reviewReminders.firstIndex(where: { $0.id == updated.id }) else { return }
+        var safe = updated
+        if safe.weekdays.isEmpty { safe.weekdays = ReviewReminder.allWeekdays }
+        reviewReminders[idx] = safe
+        reviewReminders.sort { $0.totalMinutes < $1.totalMinutes }
+        persistAndScheduleReminders()
+    }
+
+    func toggleReminder(id: String) {
+        guard let idx = reviewReminders.firstIndex(where: { $0.id == id }) else { return }
+        reviewReminders[idx].enabled.toggle()
+        persistAndScheduleReminders()
+    }
+
+    func deleteReminder(id: String) {
+        reviewReminders.removeAll { $0.id == id }
+        persistAndScheduleReminders()
+    }
+
+    private func persistAndScheduleReminders() {
+        if let data = try? JSONEncoder().encode(reviewReminders) {
+            UserDefaults.standard.set(data, forKey: Self.remindersStorageKey)
+        }
         scheduleDailyReviewNotification()
     }
 
@@ -648,55 +755,77 @@ final class WhimStoreVM: ObservableObject {
         guard Bundle.main.bundleIdentifier != nil else { return }
         let center = UNUserNotificationCenter.current()
         registerNotificationCategories(on: center)
-        var ids = ["whim.daily.review"] + (1...7).map { "whim.daily.review.\($0)" }
-        if !dailyReviewEnabled {
-            ids.append("whim.daily.review.snooze")
-        }
-        center.removePendingNotificationRequests(withIdentifiers: ids)
-        guard dailyReviewEnabled, !reviewWeekdays.isEmpty else {
-            reviewNotificationStatus = "每日复盘提醒已关闭"
-            return
-        }
-        let hour = reviewHour
-        let minute = reviewMinute
-        let days = reviewWeekdays.sorted()
+        let active = enabledReminders
         let summary = reviewScheduleSummary
-        center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, err in
+
+        center.getPendingNotificationRequests { [weak self] existing in
+            let toRemove = existing
+                .map(\.identifier)
+                .filter { id in
+                    guard id.hasPrefix("whim.daily.review") else { return false }
+                    if active.isEmpty { return true }
+                    return id != "whim.daily.review.snooze"
+                }
+            if !toRemove.isEmpty {
+                center.removePendingNotificationRequests(withIdentifiers: toRemove)
+            }
+
             DispatchQueue.main.async {
                 guard let self else { return }
-                if !granted {
-                    self.reviewNotificationStatus = "系统通知权限未开启，请在「系统设置 → 通知 → Whim」中允许通知"
+                guard !active.isEmpty else {
+                    self.reviewNotificationStatus = "所有提醒已关闭"
                     return
                 }
-                if let err {
-                    self.reviewNotificationStatus = "通知注册失败: \(err.localizedDescription)"
-                    return
-                }
-                let content = UNMutableNotificationContent()
-                content.title = "晚间复盘 · Whim"
-                content.body = "花 2 分钟回顾今天记录的闪念，整理关键想法。"
-                content.sound = .default
-                content.categoryIdentifier = Self.reviewCategoryId
+                center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, err in
+                    DispatchQueue.main.async {
+                        guard let self else { return }
+                        if let err {
+                            self.reviewNotificationStatus = "通知注册失败: \(err.localizedDescription)"
+                            return
+                        }
+                        if !granted {
+                            self.reviewNotificationStatus = "系统通知权限未开启，请在「系统设置 → 通知 → Whim」中允许通知"
+                            return
+                        }
 
-                if days.count == 7 {
-                    var comps = DateComponents()
-                    comps.hour = hour
-                    comps.minute = minute
-                    let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
-                    let req = UNNotificationRequest(identifier: "whim.daily.review", content: content, trigger: trigger)
-                    center.add(req)
-                } else {
-                    for wd in days {
-                        var comps = DateComponents()
-                        comps.hour = hour
-                        comps.minute = minute
-                        comps.weekday = wd
-                        let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
-                        let req = UNNotificationRequest(identifier: "whim.daily.review.\(wd)", content: content, trigger: trigger)
-                        center.add(req)
+                        for reminder in active {
+                            let content = UNMutableNotificationContent()
+                            content.title = "\(reminder.displayTitle) · Whim"
+                            content.body = reminder.notificationBody
+                            content.sound = .default
+                            content.categoryIdentifier = Self.reviewCategoryId
+
+                            let days = reminder.weekdays.sorted()
+                            if days.count == 7 {
+                                var comps = DateComponents()
+                                comps.hour = reminder.hour
+                                comps.minute = reminder.minute
+                                let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
+                                let req = UNNotificationRequest(
+                                    identifier: "whim.daily.review.\(reminder.id)",
+                                    content: content,
+                                    trigger: trigger
+                                )
+                                center.add(req)
+                            } else {
+                                for wd in days {
+                                    var comps = DateComponents()
+                                    comps.hour = reminder.hour
+                                    comps.minute = reminder.minute
+                                    comps.weekday = wd
+                                    let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
+                                    let req = UNNotificationRequest(
+                                        identifier: "whim.daily.review.\(reminder.id).\(wd)",
+                                        content: content,
+                                        trigger: trigger
+                                    )
+                                    center.add(req)
+                                }
+                            }
+                        }
+                        self.reviewNotificationStatus = "已生效 \(active.count) 个提醒：\(summary)"
                     }
                 }
-                self.reviewNotificationStatus = "已开启系统提醒：\(summary)"
             }
         }
     }
@@ -709,19 +838,20 @@ final class WhimStoreVM: ObservableObject {
         let center = UNUserNotificationCenter.current()
         registerNotificationCategories(on: center)
         let todayCount = dailyCounts[dayFmt.string(from: Date())] ?? 0
+        let sampleTitle = enabledReminders.first?.displayTitle ?? "每日复盘"
         center.requestAuthorization(options: [.alert, .sound, .badge]) { [weak self] granted, err in
             DispatchQueue.main.async {
                 guard let self else { return }
-                if !granted {
-                    self.reviewNotificationStatus = "未获得通知权限，请在「系统设置 → 通知 → Whim」开启"
-                    return
-                }
                 if let err {
                     self.reviewNotificationStatus = "通知发送失败: \(err.localizedDescription)"
                     return
                 }
+                if !granted {
+                    self.reviewNotificationStatus = "未获得通知权限，请在「系统设置 → 通知 → Whim」开启"
+                    return
+                }
                 let content = UNMutableNotificationContent()
-                content.title = "晚间复盘 · Whim（测试）"
+                content.title = "\(sampleTitle) · Whim（测试）"
                 content.body = todayCount > 0
                     ? "今天已记录 \(todayCount) 条闪念，点击这条通知可直达每日回顾。"
                     : "点击这条通知可直达每日回顾页面，长按/展开还可选择 30 分钟后再提醒。"
@@ -744,7 +874,7 @@ final class WhimStoreVM: ObservableObject {
         registerNotificationCategories(on: center)
         center.removePendingNotificationRequests(withIdentifiers: ["whim.daily.review.snooze"])
         let content = UNMutableNotificationContent()
-        content.title = "晚间复盘 · Whim"
+        content.title = "每日复盘 · Whim"
         content.body = "稍后提醒时间到了，花 2 分钟回顾今天的闪念吧。"
         content.sound = .default
         content.categoryIdentifier = Self.reviewCategoryId
@@ -940,19 +1070,20 @@ struct FlomoComposerView: View {
                                     .font(.system(size: 12, weight: active ? .medium : .regular))
                                     .foregroundColor(active ? .white : FlomoPalette.tagText(scheme))
                                     .padding(.horizontal, 8)
-                                    .padding(.vertical, 3)
+                                    .padding(.vertical, 3.5)
                                     .background(
                                         RoundedRectangle(cornerRadius: 5, style: .continuous)
                                             .fill(active ? FlomoPalette.accent(scheme) : FlomoPalette.tagBg(scheme))
                                     )
+                                    .whimClickable(cornerRadius: 5, hoverFill: false)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(WhimTactileButtonStyle(cornerRadius: 5))
                         }
                     }
                 }
             }
 
-            HStack(spacing: 14) {
+            HStack(spacing: 8) {
                 toolbarIcon("number", help: "插入标签 (#)") {
                     editor.insertSnippet(markdown.isEmpty || markdown.hasSuffix(" ") || markdown.hasSuffix("\n") ? "#" : " #")
                     editor.focus()
@@ -964,23 +1095,29 @@ struct FlomoComposerView: View {
                 Spacer()
 
                 if let onFinishEdit {
-                    Button("取消") { onFinishEdit() }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 12))
-                        .foregroundColor(FlomoPalette.textSecondary(scheme))
+                    Button(action: onFinishEdit) {
+                        Text("取消")
+                            .font(.system(size: 12))
+                            .foregroundColor(FlomoPalette.textSecondary(scheme))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .whimClickable(cornerRadius: 6, hoverFill: true)
+                    }
+                    .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
                 }
 
                 Button(action: submit) {
                     Image(systemName: "paperplane.fill")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundColor(.white.opacity(canSubmit ? 1.0 : 0.45))
-                        .frame(width: 38, height: 26)
+                        .frame(width: 40, height: 27)
                         .background(
                             RoundedRectangle(cornerRadius: 6, style: .continuous)
                                 .fill(FlomoPalette.accent(scheme).opacity(canSubmit ? 1.0 : 0.45))
                         )
+                        .whimClickable(cornerRadius: 6, hoverFill: false)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
                 .disabled(!canSubmit)
             }
         }
@@ -1011,9 +1148,10 @@ struct FlomoComposerView: View {
             Image(systemName: systemName)
                 .font(.system(size: 14))
                 .foregroundColor(FlomoPalette.textSecondary(scheme))
-                .frame(width: 22, height: 22)
+                .frame(width: 28, height: 26)
+                .whimClickable(cornerRadius: 6, hoverFill: true)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
         .help(help)
     }
 
@@ -1143,18 +1281,19 @@ struct MainContentView: View {
                                 Image(systemName: "gearshape")
                                     .font(.system(size: 12))
                                 Text("设置")
-                                    .font(.system(size: 12))
+                                    .font(.system(size: 12, weight: .medium))
                                 if updater.hasUpdate {
                                     Circle()
                                         .fill(Color(hex: 0xEF4444))
                                         .frame(width: 6.5, height: 6.5)
                                 }
                             }
-                            .foregroundColor(FlomoPalette.textMuted(scheme))
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 4)
+                            .foregroundColor(FlomoPalette.textSecondary(scheme))
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 6)
+                            .whimClickable(cornerRadius: 7, hoverFill: true)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
                         .help(updater.hasUpdate ? "发现新版本 \(updater.latestRelease?.tagName ?? "")，点击查看更新" : "打开偏好设置 (⌘,)")
 
                         Spacer()
@@ -1176,14 +1315,16 @@ struct MainContentView: View {
                                     .foregroundColor(syncStatusTextColor)
                                     .lineLimit(1)
                             }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 3.5)
+                            .padding(.horizontal, 9)
+                            .padding(.vertical, 5)
                             .background(
                                 Capsule()
                                     .fill(vm.syncHealth.connected ? FlomoPalette.accent(scheme).opacity(0.16) : FlomoPalette.border(scheme).opacity(0.7))
                             )
+                            .contentShape(Capsule())
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 12))
+                        .whimClickable(cornerRadius: 12, hoverFill: false)
                         .disabled(vm.isSyncing)
                         .help(syncStatusTooltip)
                     }
@@ -1196,19 +1337,24 @@ struct MainContentView: View {
                 // Right Main Column
                 VStack(alignment: .leading, spacing: 14) {
                     // Top Bar: Title + Search (⌘K) + Pin + Utility Menu
-                    HStack(spacing: 12) {
+                    HStack(spacing: 10) {
                         Text(currentTitle)
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundColor(FlomoPalette.textPrimary(scheme))
 
                         if case .day = vm.activeTab {
-                            Button("清除日期") {
+                            Button {
                                 vm.activeTab = .all
                                 vm.applyFilter()
+                            } label: {
+                                Text("清除日期")
+                                    .font(.system(size: 11.5, weight: .medium))
+                                    .foregroundColor(FlomoPalette.tagText(scheme))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 4)
+                                    .whimClickable(cornerRadius: 6, hoverFill: true)
                             }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 11.5))
-                            .foregroundColor(FlomoPalette.tagText(scheme))
+                            .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
                         }
 
                         Spacer()
@@ -1229,10 +1375,12 @@ struct MainContentView: View {
                                     vm.applyFilter()
                                 } label: {
                                     Image(systemName: "xmark.circle.fill")
-                                        .font(.system(size: 11))
+                                        .font(.system(size: 12))
                                         .foregroundColor(FlomoPalette.textMuted(scheme))
+                                        .frame(width: 20, height: 20)
+                                        .whimClickable(cornerRadius: 10, hoverFill: false)
                                 }
-                                .buttonStyle(.plain)
+                                .buttonStyle(WhimTactileButtonStyle(cornerRadius: 10))
                             }
                         }
                         .padding(.horizontal, 10)
@@ -1250,8 +1398,10 @@ struct MainContentView: View {
                             Image(systemName: mainWindowPinned ? "pin.fill" : "pin")
                                 .font(.system(size: 12.5))
                                 .foregroundColor(mainWindowPinned ? FlomoPalette.accent(scheme) : FlomoPalette.textSecondary(scheme))
+                                .frame(width: 28, height: 28)
+                                .whimClickable(cornerRadius: 7, hoverFill: true)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
                         .help(mainWindowPinned ? "取消主窗口置顶" : "主窗口置顶")
 
                         Button {
@@ -1260,8 +1410,10 @@ struct MainContentView: View {
                             Image(systemName: "arrow.triangle.2.circlepath")
                                 .font(.system(size: 12.5))
                                 .foregroundColor(vm.isSyncing ? FlomoPalette.accent(scheme) : FlomoPalette.textSecondary(scheme))
+                                .frame(width: 28, height: 28)
+                                .whimClickable(cornerRadius: 7, hoverFill: true)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
                         .disabled(vm.isSyncing)
                         .help("立即局域网同步")
 
@@ -1269,8 +1421,10 @@ struct MainContentView: View {
                             Image(systemName: "square.and.pencil")
                                 .font(.system(size: 12.5))
                                 .foregroundColor(FlomoPalette.textSecondary(scheme))
+                                .frame(width: 28, height: 28)
+                                .whimClickable(cornerRadius: 7, hoverFill: true)
                         }
-                        .buttonStyle(.plain)
+                        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
                         .help("新建浮窗 (⌘⇧J)")
                     }
                     .padding(.top, 14)
@@ -1507,10 +1661,11 @@ struct MainContentView: View {
                 Image(systemName: "chevron.left")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(FlomoPalette.textPrimary(scheme))
-                    .frame(width: 26, height: 26)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(FlomoPalette.card(scheme)))
+                    .frame(width: 28, height: 28)
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(FlomoPalette.canvas(scheme)))
+                    .whimClickable(cornerRadius: 7, hoverFill: true)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
 
             Text(isToday ? "\(dateText) · 今天" : dateText)
                 .font(.system(size: 13.5, weight: .medium).monospacedDigit())
@@ -1520,17 +1675,23 @@ struct MainContentView: View {
                 Image(systemName: "chevron.right")
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(isToday ? FlomoPalette.textMuted(scheme) : FlomoPalette.textPrimary(scheme))
-                    .frame(width: 26, height: 26)
-                    .background(RoundedRectangle(cornerRadius: 6).fill(FlomoPalette.card(scheme)))
+                    .frame(width: 28, height: 28)
+                    .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(FlomoPalette.canvas(scheme)))
+                    .whimClickable(cornerRadius: 7, hoverFill: !isToday)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
             .disabled(isToday)
 
             if !isToday {
-                Button("回到今天") { vm.jumpReviewToday() }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 12))
-                    .foregroundColor(FlomoPalette.tagText(scheme))
+                Button { vm.jumpReviewToday() } label: {
+                    Text("回到今天")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(FlomoPalette.tagText(scheme))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .whimClickable(cornerRadius: 6, hoverFill: true)
+                }
+                .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
             }
 
             Spacer()
@@ -1543,22 +1704,23 @@ struct MainContentView: View {
                 settingsInitialSection = .review
                 showSettingsSheet = true
             } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: vm.dailyReviewEnabled ? "bell.fill" : "bell.slash")
+                HStack(spacing: 5) {
+                    Image(systemName: vm.hasEnabledReminders ? "bell.fill" : "bell.slash")
                         .font(.system(size: 10.5))
                     Text(vm.reviewScheduleSummary)
                         .font(.system(size: 11.5, weight: .medium).monospacedDigit())
                 }
-                .foregroundColor(vm.dailyReviewEnabled ? FlomoPalette.tagText(scheme) : FlomoPalette.textMuted(scheme))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+                .foregroundColor(vm.hasEnabledReminders ? FlomoPalette.tagText(scheme) : FlomoPalette.textMuted(scheme))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5.5)
                 .background(
-                    RoundedRectangle(cornerRadius: 6, style: .continuous)
-                        .fill(vm.dailyReviewEnabled ? FlomoPalette.tagBg(scheme) : FlomoPalette.canvas(scheme))
+                    RoundedRectangle(cornerRadius: 7, style: .continuous)
+                        .fill(vm.hasEnabledReminders ? FlomoPalette.tagBg(scheme) : FlomoPalette.canvas(scheme))
                 )
+                .whimClickable(cornerRadius: 7, hoverFill: false)
             }
-            .buttonStyle(.plain)
-            .help("设置每日回顾系统提醒时间与星期")
+            .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
+            .help("管理每日复盘与总结提醒时钟")
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -1571,19 +1733,9 @@ struct MainContentView: View {
                 .font(.system(size: 12.5))
                 .foregroundColor(FlomoPalette.textSecondary(scheme))
             Spacer()
-            Button { vm.reshuffleRandom() } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "shuffle")
-                        .font(.system(size: 11.5))
-                    Text("换一批")
-                        .font(.system(size: 12.5, weight: .medium))
-                }
-                .foregroundColor(.white)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(FlomoPalette.accent(scheme)))
+            WhimPrimaryButton(title: "换一批", icon: "shuffle", compact: true) {
+                vm.reshuffleRandom()
             }
-            .buttonStyle(.plain)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
@@ -1651,6 +1803,21 @@ struct MainContentView: View {
     }
 
     private func navRow(icon: String, title: String, active: Bool, badge: String? = nil, action: @escaping () -> Void) -> some View {
+        SidebarNavButton(icon: icon, title: title, active: active, badge: badge, action: action)
+    }
+}
+
+private struct SidebarNavButton: View {
+    @Environment(\.colorScheme) private var scheme
+    let icon: String
+    let title: String
+    let active: Bool
+    var badge: String? = nil
+    let action: () -> Void
+
+    @State private var isHovered: Bool = false
+
+    var body: some View {
         Button(action: action) {
             HStack(spacing: 10) {
                 Image(systemName: icon)
@@ -1664,17 +1831,26 @@ struct MainContentView: View {
                 if let badge, !badge.isEmpty {
                     Text(badge)
                         .font(.system(size: 10.5, design: .monospaced))
-                        .foregroundColor(FlomoPalette.textMuted(scheme))
+                        .foregroundColor(active ? .white.opacity(0.85) : FlomoPalette.textMuted(scheme))
                 }
             }
             .padding(.horizontal, 10)
             .padding(.vertical, 8)
+            .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .fill(active ? FlomoPalette.accent(scheme) : .clear)
+                    .fill(active ? FlomoPalette.accent(scheme) : (isHovered ? FlomoPalette.hoverFill(scheme) : .clear))
             )
+            .contentShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
         }
-        .buttonStyle(.plain)
+        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 8, pressScale: 0.99))
+        .onHover { hovering in
+            isHovered = hovering
+            if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+        }
+        .onDisappear {
+            if isHovered { isHovered = false; NSCursor.pop() }
+        }
     }
 }
 
@@ -1686,6 +1862,7 @@ private struct FlomoTagRow: View {
     let onSelect: (String) -> Void
 
     @State private var expanded: Bool = true
+    @State private var isHovered: Bool = false
 
     private var hasChildren: Bool { !(node.children?.isEmpty ?? true) }
     private var isSelected: Bool {
@@ -1701,11 +1878,12 @@ private struct FlomoTagRow: View {
                         Image(systemName: expanded ? "chevron.down" : "chevron.right")
                             .font(.system(size: 9.5, weight: .semibold))
                             .foregroundColor(isSelected ? .white.opacity(0.85) : FlomoPalette.textMuted(scheme))
-                            .frame(width: 14, height: 14)
+                            .frame(width: 18, height: 18)
+                            .contentShape(Rectangle())
                     }
-                    .buttonStyle(.plain)
+                    .buttonStyle(WhimTactileButtonStyle(cornerRadius: 4, pressScale: 0.95))
                 } else {
-                    Spacer().frame(width: 14)
+                    Spacer().frame(width: 18)
                 }
 
                 Button { onSelect(node.fullPath) } label: {
@@ -1722,16 +1900,26 @@ private struct FlomoTagRow: View {
                             .font(.system(size: 11))
                             .foregroundColor(isSelected ? .white.opacity(0.8) : FlomoPalette.textMuted(scheme))
                     }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.vertical, 6)
+                    .contentShape(Rectangle())
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6, pressScale: 0.99))
             }
             .padding(.leading, CGFloat(depth * 12) + 4)
             .padding(.trailing, 8)
-            .padding(.vertical, 6)
             .background(
                 RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(isSelected ? FlomoPalette.accent(scheme) : .clear)
+                    .fill(isSelected ? FlomoPalette.accent(scheme) : (isHovered ? FlomoPalette.hoverFill(scheme) : .clear))
             )
+            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .onHover { hovering in
+                isHovered = hovering
+                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
+            .onDisappear {
+                if isHovered { isHovered = false; NSCursor.pop() }
+            }
 
             if expanded, let children = node.children {
                 ForEach(children) { child in
@@ -1839,14 +2027,21 @@ private struct CardHeaderActions: View {
                 Image(systemName: "pencil")
                     .font(.system(size: 12))
                     .foregroundColor(editHovered ? FlomoPalette.textPrimary(scheme) : FlomoPalette.textMuted(scheme))
-                    .frame(width: 24, height: 22)
+                    .frame(width: 26, height: 24)
                     .background(
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(editHovered ? FlomoPalette.border(scheme) : .clear)
+                            .fill(editHovered ? FlomoPalette.hoverFill(scheme) : .clear)
                     )
+                    .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
             }
-            .buttonStyle(.plain)
-            .onHover { editHovered = $0 }
+            .buttonStyle(WhimTactileButtonStyle(cornerRadius: 5))
+            .onHover { hovering in
+                editHovered = hovering
+                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
+            .onDisappear {
+                if editHovered { editHovered = false; NSCursor.pop() }
+            }
             .help("编辑笔记")
 
             Menu {
@@ -1863,16 +2058,23 @@ private struct CardHeaderActions: View {
                 Image(systemName: "ellipsis")
                     .font(.system(size: 13))
                     .foregroundColor(menuHovered ? FlomoPalette.textPrimary(scheme) : FlomoPalette.textMuted(scheme))
-                    .frame(width: 24, height: 22)
+                    .frame(width: 26, height: 24)
                     .background(
                         RoundedRectangle(cornerRadius: 5, style: .continuous)
-                            .fill(menuHovered ? FlomoPalette.border(scheme) : .clear)
+                            .fill(menuHovered ? FlomoPalette.hoverFill(scheme) : .clear)
                     )
+                    .contentShape(RoundedRectangle(cornerRadius: 5, style: .continuous))
             }
             .menuStyle(.borderlessButton)
             .menuIndicator(.hidden)
-            .frame(width: 24)
-            .onHover { menuHovered = $0 }
+            .frame(width: 26)
+            .onHover { hovering in
+                menuHovered = hovering
+                if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+            }
+            .onDisappear {
+                if menuHovered { menuHovered = false; NSCursor.pop() }
+            }
         }
     }
 }
@@ -2089,19 +2291,13 @@ private struct FlomoCardDeckView: View {
                         .foregroundColor(FlomoPalette.textPrimary(scheme))
                     HStack(spacing: 12) {
                         if currentIndex > 0 {
-                            Button("回看上一张") {
+                            WhimSecondaryButton(title: "回看上一张", compact: true) {
                                 withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
                                     currentIndex = max(0, notes.count - 1)
                                 }
                             }
-                            .buttonStyle(.plain)
-                            .font(.system(size: 13))
-                            .foregroundColor(FlomoPalette.textSecondary(scheme))
-                            .padding(.horizontal, 14)
-                            .padding(.vertical, 7)
-                            .background(RoundedRectangle(cornerRadius: 8).fill(FlomoPalette.card(scheme)))
                         }
-                        Button(isRandomMode ? "换一批" : "重新回顾") {
+                        WhimPrimaryButton(title: isRandomMode ? "换一批" : "重新回顾", compact: true) {
                             if isRandomMode {
                                 currentIndex = 0
                                 onReshuffle()
@@ -2111,12 +2307,6 @@ private struct FlomoCardDeckView: View {
                                 }
                             }
                         }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 13, weight: .medium))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 7)
-                        .background(RoundedRectangle(cornerRadius: 8).fill(FlomoPalette.accent(scheme)))
                     }
                 }
                 .padding(32)
@@ -2171,21 +2361,9 @@ private struct FlomoCardDeckView: View {
                 .padding(.bottom, 22)
 
                 HStack(spacing: 14) {
-                    Button {
+                    WhimSecondaryButton(title: "上一张", icon: "chevron.left", compact: true) {
                         goPrev()
-                    } label: {
-                        HStack(spacing: 5) {
-                            Image(systemName: "chevron.left")
-                                .font(.system(size: 11.5, weight: .semibold))
-                            Text("上一张")
-                                .font(.system(size: 12.5))
-                        }
-                        .foregroundColor(currentIndex > 0 ? FlomoPalette.textPrimary(scheme) : FlomoPalette.textMuted(scheme))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(FlomoPalette.card(scheme)))
                     }
-                    .buttonStyle(.plain)
                     .disabled(currentIndex == 0)
 
                     Text("\(currentIndex + 1) / \(notes.count)")
@@ -2193,21 +2371,9 @@ private struct FlomoCardDeckView: View {
                         .foregroundColor(FlomoPalette.textSecondary(scheme))
                         .frame(minWidth: 56)
 
-                    Button {
+                    WhimPrimaryButton(title: currentIndex + 1 >= notes.count ? "完成" : "下一张", icon: "chevron.right", compact: true) {
                         swipeOut(direction: -1)
-                    } label: {
-                        HStack(spacing: 5) {
-                            Text(currentIndex + 1 >= notes.count ? "完成" : "下一张")
-                                .font(.system(size: 12.5, weight: .medium))
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 11.5, weight: .semibold))
-                        }
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 14)
-                        .padding(.vertical, 6)
-                        .background(RoundedRectangle(cornerRadius: 7, style: .continuous).fill(FlomoPalette.accent(scheme)))
                     }
-                    .buttonStyle(.plain)
 
                     Text("左右拖拽或按 ← / → / 空格切卡")
                         .font(.system(size: 11))
@@ -2406,18 +2572,20 @@ struct FloatingQuickCaptureView: View {
                     Image(systemName: isPinned ? "pin.fill" : "pin")
                         .font(.system(size: 13))
                         .foregroundColor(isPinned ? FlomoPalette.accent(scheme) : FlomoPalette.textSecondary(scheme))
-                        .frame(width: 24, height: 24)
+                        .frame(width: 28, height: 28)
+                        .whimClickable(cornerRadius: 7, hoverFill: true)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
                 .help(isPinned ? "已固定在屏幕最前（发送后不关闭）" : "固定在屏幕最前")
 
                 Button(action: onClose) {
                     Image(systemName: "xmark")
                         .font(.system(size: 13, weight: .medium))
                         .foregroundColor(FlomoPalette.textSecondary(scheme))
-                        .frame(width: 24, height: 24)
+                        .frame(width: 28, height: 28)
+                        .whimClickable(cornerRadius: 7, hoverFill: true)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
                 .help("关闭 (Esc)")
             }
 
@@ -2473,19 +2641,20 @@ struct FloatingQuickCaptureView: View {
                                     .font(.system(size: 12, weight: active ? .medium : .regular))
                                     .foregroundColor(active ? .white : FlomoPalette.tagText(scheme))
                                     .padding(.horizontal, 8)
-                                    .padding(.vertical, 3)
+                                    .padding(.vertical, 3.5)
                                     .background(
                                         RoundedRectangle(cornerRadius: 5, style: .continuous)
                                             .fill(active ? FlomoPalette.accent(scheme) : FlomoPalette.tagBg(scheme))
                                     )
+                                    .whimClickable(cornerRadius: 5, hoverFill: false)
                             }
-                            .buttonStyle(.plain)
+                            .buttonStyle(WhimTactileButtonStyle(cornerRadius: 5))
                         }
                     }
                 }
             }
 
-            HStack(spacing: 14) {
+            HStack(spacing: 8) {
                 iconBtn("number", help: "插入标签") {
                     editor.insertSnippet(markdown.isEmpty || markdown.hasSuffix(" ") || markdown.hasSuffix("\n") ? "#" : " #")
                     editor.focus()
@@ -2505,8 +2674,9 @@ struct FloatingQuickCaptureView: View {
                             RoundedRectangle(cornerRadius: 7, style: .continuous)
                                 .fill(FlomoPalette.accent(scheme).opacity(canSubmit ? 1.0 : 0.45))
                         )
+                        .whimClickable(cornerRadius: 7, hoverFill: false)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(WhimTactileButtonStyle(cornerRadius: 7))
                 .disabled(!canSubmit)
             }
         }
@@ -2527,9 +2697,10 @@ struct FloatingQuickCaptureView: View {
             Image(systemName: name)
                 .font(.system(size: 14))
                 .foregroundColor(FlomoPalette.textSecondary(scheme))
-                .frame(width: 22, height: 22)
+                .frame(width: 28, height: 26)
+                .whimClickable(cornerRadius: 6, hoverFill: true)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
         .help(help)
     }
 

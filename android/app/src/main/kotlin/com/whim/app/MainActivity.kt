@@ -312,7 +312,7 @@ private fun FlomoMobileApp(
     var showSearch by remember { mutableStateOf(false) }
     var showSettingsScreen by remember { mutableStateOf(false) }
     var settingsFocusSection by remember { mutableStateOf(SettingsFocusSection.ALL) }
-    var reviewSchedule by remember { mutableStateOf(DailyReviewScheduler.getSchedule(context)) }
+    var reviewReminders by remember { mutableStateOf(DailyReviewScheduler.getReminders(context)) }
     var exactAlarmGranted by remember { mutableStateOf(DailyReviewScheduler.canScheduleExactAlarms(context)) }
     var notifPermissionGranted by remember { mutableStateOf(DailyReviewReceiver.hasNotificationPermission(context)) }
     var previewImagePath by remember { mutableStateOf<String?>(null) }
@@ -471,7 +471,7 @@ private fun FlomoMobileApp(
             if (event == Lifecycle.Event.ON_RESUME) {
                 exactAlarmGranted = DailyReviewScheduler.canScheduleExactAlarms(context)
                 notifPermissionGranted = DailyReviewReceiver.hasNotificationPermission(context)
-                reviewSchedule = DailyReviewScheduler.getSchedule(context)
+                reviewReminders = DailyReviewScheduler.getReminders(context)
                 // Tear down any half-open SSE socket from sleep/background and trigger immediate foreground sync
                 WhimCoreBridge.reconnectEvents()
                 reload()
@@ -998,10 +998,11 @@ private fun FlomoMobileApp(
                             } else {
                                 Text("共 ${displayedNotes.size} 条", style = t.meta, color = c.textSecondary)
                             }
+                            val remindersActive = DailyReviewScheduler.hasEnabledReminders(reviewReminders)
                             Row(
                                 modifier = Modifier
                                     .clip(RoundedCornerShape(6.dp))
-                                    .background(if (reviewSchedule.enabled) c.tagBg else c.canvas)
+                                    .background(if (remindersActive) c.tagBg else c.canvas)
                                     .clickable {
                                         settingsFocusSection = SettingsFocusSection.REVIEW
                                         showSettingsScreen = true
@@ -1013,13 +1014,13 @@ private fun FlomoMobileApp(
                                 Icon(
                                     Icons.Rounded.Notifications,
                                     contentDescription = "提醒设置",
-                                    tint = if (reviewSchedule.enabled) c.tagText else c.textMuted,
+                                    tint = if (remindersActive) c.tagText else c.textMuted,
                                     modifier = Modifier.size(13.dp)
                                 )
                                 Text(
-                                    DailyReviewScheduler.formatSummary(reviewSchedule),
+                                    DailyReviewScheduler.formatSummary(reviewReminders),
                                     style = t.meta,
-                                    color = if (reviewSchedule.enabled) c.tagText else c.textMuted,
+                                    color = if (remindersActive) c.tagText else c.textMuted,
                                     fontWeight = FontWeight.Medium
                                 )
                             }
@@ -1302,8 +1303,8 @@ private fun FlomoMobileApp(
             focusSection = settingsFocusSection,
             themeMode = themeMode,
             onThemeModeChange = onThemeModeChange,
-            reviewSchedule = reviewSchedule,
-            onReviewScheduleChange = { reviewSchedule = it },
+            reviewReminders = reviewReminders,
+            onReviewRemindersChange = { reviewReminders = it },
             notifPermissionGranted = notifPermissionGranted,
             exactAlarmGranted = exactAlarmGranted,
             onRequestNotificationPermission = onRequestNotificationPermission,

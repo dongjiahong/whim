@@ -18,7 +18,7 @@ import com.whim.app.core.WhimCoreBridge
 /**
  * Fires even when the app process has been killed, checks today's note count via Go SQLite,
  * posts a system notification deep-linking to Daily Review (with a 30-min snooze action),
- * and schedules the next matching alarm.
+ * and schedules the next upcoming reminder alarm.
  */
 class DailyReviewReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
@@ -29,23 +29,34 @@ class DailyReviewReceiver : BroadcastReceiver() {
                 return
             }
             DailyReviewScheduler.ACTION_SNOOZE_REVIEW -> {
+                val label = intent.getStringExtra(DailyReviewScheduler.EXTRA_REMINDER_LABEL).orEmpty().ifBlank { "每日复盘" }
                 NotificationManagerCompat.from(context).cancel(NOTIF_ID)
-                DailyReviewScheduler.scheduleSnooze(context, minutes = 30)
+                DailyReviewScheduler.scheduleSnooze(context, minutes = 30, label = label)
                 return
             }
         }
 
         val isSnooze = intent.getBooleanExtra(DailyReviewScheduler.EXTRA_IS_SNOOZE, false)
+        val label = intent.getStringExtra(DailyReviewScheduler.EXTRA_REMINDER_LABEL).orEmpty().ifBlank { "每日复盘" }
+        val hour = intent.getIntExtra(DailyReviewScheduler.EXTRA_REMINDER_HOUR, 21)
+        val skipIfEmpty = intent.getBooleanExtra(DailyReviewScheduler.EXTRA_SKIP_IF_EMPTY, false)
+
         WhimCoreBridge.ensureInit(context)
-        val schedule = DailyReviewScheduler.getSchedule(context)
         val todayCount = runCatching { WhimCoreBridge.countTodayNotesBlocking() }.getOrDefault(0)
 
-        if (!isSnooze && schedule.skipIfEmpty && todayCount == 0) {
+        if (!isSnooze && skipIfEmpty && todayCount == 0) {
             DailyReviewScheduler.scheduleNext(context)
             return
         }
 
-        postNotification(context, todayCount, isTest = false, isSnooze = isSnooze)
+        postNotification(
+            context = context,
+            count = todayCount,
+            label = label,
+            hour = hour,
+            isTest = false,
+            isSnooze = isSnooze
+        )
         if (!isSnooze) {
             DailyReviewScheduler.scheduleNext(context)
         }
@@ -65,6 +76,8 @@ class DailyReviewReceiver : BroadcastReceiver() {
         fun postNotification(
             context: Context,
             count: Int,
+            label: String = "每日复盘",
+            hour: Int = 21,
             isTest: Boolean = false,
             isSnooze: Boolean = false
         ): Boolean {
@@ -98,6 +111,7 @@ class DailyReviewReceiver : BroadcastReceiver() {
 
             val snoozeIntent = Intent(context, DailyReviewReceiver::class.java).apply {
                 action = DailyReviewScheduler.ACTION_SNOOZE_REVIEW
+                putExtra(DailyReviewScheduler.EXTRA_REMINDER_LABEL, label)
             }
             val snoozePi = PendingIntent.getBroadcast(
                 context,
@@ -106,10 +120,14 @@ class DailyReviewReceiver : BroadcastReceiver() {
                 PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
             )
 
-            val title = if (isTest) "晚间复盘 · Whim（测试）" else "晚间复盘 · Whim"
+            val safeLabel = label.ifBlank { "每日复盘" }
+            val title = if (isTest) "$safeLabel · Whim（测试）" else "$safeLabel · Whim"
             val body = when {
                 isSnooze && count > 0 -> "稍后提醒时间到了，今天共记录了 $count 条闪念，花 2 分钟回顾一下。"
-                isSnooze -> "稍后提醒时间到了，睡前记下今天的一个想法吧。"
+                isSnooze -> "稍后提醒时间到了，花 2 分钟回顾一下最近的闪念吧。"
+                hour in 5..11 -> "早安，花 2 分钟回顾一下昨日的闪念与思考，带着清晰开始今天。"
+                hour in 12..17 && count > 0 -> "今天已记录 $count 条闪念，小憩片刻理顺一下思路吧。"
+                hour in 12..17 -> "午后小憩，翻看最近的闪念，捕捉新的灵感。"
                 count > 0 -> "今天记录了 $count 条闪念，花 2 分钟整理和回顾一下。"
                 else -> "今天还没有记录闪念，睡前记下脑海里的一个想法吧。"
             }

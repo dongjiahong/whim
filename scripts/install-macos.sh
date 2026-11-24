@@ -18,6 +18,7 @@ pkill -x Whim 2>/dev/null || true
 sleep 0.5
 rm -rf "$DST_APP"
 cp -R "$SRC_APP" "$DST_APP"
+/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$DST_APP" 2>/dev/null || true
 
 echo "==> Launching Whim..."
 open "$DST_APP"

@@ -315,8 +315,10 @@ struct AboutUpdateView: View {
                     Image(systemName: "xmark")
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(FlomoPalette.textSecondary(scheme))
+                        .frame(width: 26, height: 26)
+                        .whimClickable(cornerRadius: 6, hoverFill: true)
                 }
-                .buttonStyle(.plain)
+                .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
             }
 
             Divider()
@@ -348,30 +350,33 @@ struct AboutUpdateView: View {
             }
 
             HStack(spacing: 10) {
-                Button(updater.checking ? "检查中..." : "检查更新") {
+                WhimSecondaryButton(title: updater.checking ? "检查中..." : "检查更新", compact: true) {
                     updater.checkForUpdates()
                 }
                 .disabled(updater.checking || updater.downloading)
 
                 if updater.hasUpdate {
-                    Button(updater.downloading ? "下载安装中..." : "一键更新并重启") {
+                    WhimPrimaryButton(title: updater.downloading ? "下载安装中..." : "一键更新并重启", compact: true) {
                         updater.downloadAndInstall()
                     }
                     .disabled(updater.downloading)
-                    .buttonStyle(.borderedProminent)
-                    .tint(FlomoPalette.accent(scheme))
                 }
 
                 Spacer()
 
-                Button("打开 GitHub") {
+                Button {
                     if let url = URL(string: "https://github.com/\(GitHubUpdater.repo)") {
                         NSWorkspace.shared.open(url)
                     }
+                } label: {
+                    Text("打开 GitHub")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(FlomoPalette.tagText(scheme))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .whimClickable(cornerRadius: 6, hoverFill: true)
                 }
-                .buttonStyle(.plain)
-                .font(.system(size: 12))
-                .foregroundColor(FlomoPalette.tagText(scheme))
+                .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
             }
         }
         .padding(20)

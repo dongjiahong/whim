@@ -4,6 +4,8 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>zh_CN</string>
+	<key>CFBundleDisplayName</key>
+	<string>Whim</string>
 	<key>CFBundleExecutable</key>
 	<string>Whim</string>
 	<key>CFBundleIconFile</key>
@@ -26,5 +28,7 @@
 	<true/>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Whim 使用局域网在您的 Mac 与 Android 设备之间进行对等同步。</string>
+	<key>NSUserNotificationAlertStyle</key>
+	<string>alert</string>
 </dict>
 </plist>

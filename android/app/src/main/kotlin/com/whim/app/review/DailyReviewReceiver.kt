@@ -14,16 +14,23 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.whim.app.MainActivity
 import com.whim.app.core.WhimCoreBridge
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 
 /**
- * Fires even when the app process has been killed, checks today's note count via Go SQLite,
- * posts a system notification deep-linking to Daily Review (with a 30-min snooze action),
- * and schedules the next upcoming reminder alarm.
+ * Fires even when the app process has been killed. Uses goAsync() so SQLite/Go initialization
+ * never blocks the main broadcast thread, skips DB init entirely for morning reminders when
+ * skipIfEmpty is false, posts the notification, and schedules the next upcoming alarm.
  */
 class DailyReviewReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         when (intent.action) {
             Intent.ACTION_BOOT_COMPLETED,
+            Intent.ACTION_LOCKED_BOOT_COMPLETED,
+            Intent.ACTION_MY_PACKAGE_REPLACED,
+            Intent.ACTION_TIME_CHANGED,
+            Intent.ACTION_TIMEZONE_CHANGED,
             android.app.AlarmManager.ACTION_SCHEDULE_EXACT_ALARM_PERMISSION_STATE_CHANGED -> {
                 DailyReviewScheduler.scheduleNext(context)
                 return
@@ -41,24 +48,46 @@ class DailyReviewReceiver : BroadcastReceiver() {
         val hour = intent.getIntExtra(DailyReviewScheduler.EXTRA_REMINDER_HOUR, 21)
         val skipIfEmpty = intent.getBooleanExtra(DailyReviewScheduler.EXTRA_SKIP_IF_EMPTY, false)
 
-        WhimCoreBridge.ensureInit(context)
-        val todayCount = runCatching { WhimCoreBridge.countTodayNotesBlocking() }.getOrDefault(0)
-
-        if (!isSnooze && skipIfEmpty && todayCount == 0) {
+        // Fast-path: morning reminders without skipIfEmpty don't need today's note count at all
+        if (!isSnooze && !skipIfEmpty && hour in 5..11) {
+            postNotification(
+                context = context,
+                count = 0,
+                label = label,
+                hour = hour,
+                isTest = false,
+                isSnooze = false
+            )
             DailyReviewScheduler.scheduleNext(context)
             return
         }
 
-        postNotification(
-            context = context,
-            count = todayCount,
-            label = label,
-            hour = hour,
-            isTest = false,
-            isSnooze = isSnooze
-        )
-        if (!isSnooze) {
-            DailyReviewScheduler.scheduleNext(context)
+        val pendingResult = goAsync()
+        val appCtx = context.applicationContext
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                WhimCoreBridge.ensureInit(appCtx)
+                val todayCount = runCatching { WhimCoreBridge.countTodayNotesBlocking() }.getOrDefault(0)
+
+                if (!isSnooze && skipIfEmpty && todayCount == 0) {
+                    DailyReviewScheduler.scheduleNext(appCtx)
+                    return@launch
+                }
+
+                postNotification(
+                    context = appCtx,
+                    count = todayCount,
+                    label = label,
+                    hour = hour,
+                    isTest = false,
+                    isSnooze = isSnooze
+                )
+                if (!isSnooze) {
+                    DailyReviewScheduler.scheduleNext(appCtx)
+                }
+            } finally {
+                pendingResult.finish()
+            }
         }
     }
 

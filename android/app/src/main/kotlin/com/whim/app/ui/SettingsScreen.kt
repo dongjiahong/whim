@@ -1,6 +1,6 @@
 package com.whim.app.ui
 
-import android.app.TimePickerDialog
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -86,6 +86,7 @@ import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import com.whim.app.capture.WhimWidgetProvider
+import com.whim.app.core.WhimBackupInfo
 import com.whim.app.core.WhimCoreBridge
 import com.whim.app.core.WhimDiscoveredPeer
 import com.whim.app.core.WhimSyncHealthStatus
@@ -784,6 +785,13 @@ private fun RemindersSubPage(
     var editingReminder by remember { mutableStateOf<ReviewReminder?>(null) }
     var isCreatingNew by remember { mutableStateOf(false) }
     var statusMessage by remember { mutableStateOf("") }
+    // Entering RemindersSubPage must NEVER auto-open any reminder editor
+    LaunchedEffect(Unit) {
+        editingReminder = null
+        isCreatingNew = false
+    }
+    val batteryUnrestricted = remember(reminders) { DailyReviewScheduler.isIgnoringBatteryOptimizations(context) }
+    val nextTriggerText = remember(reminders) { DailyReviewScheduler.nextTriggerSummary(context) }
 
     val hasMorning = reminders.any { it.hour in 5..11 }
     val hasEvening = reminders.any { it.hour >= 18 || it.hour < 5 }
@@ -831,8 +839,23 @@ private fun RemindersSubPage(
                 .padding(horizontal = 16.dp, vertical = 6.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            // Permission warning banner (only when needed)
-            if (!notifPermissionGranted || (!exactAlarmGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S)) {
+            if (!nextTriggerText.isNullOrBlank()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(c.accent.copy(alpha = 0.10f))
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Box(Modifier.size(6.dp).clip(CircleShape).background(c.accent))
+                    Text(nextTriggerText, style = t.meta, color = c.accent, fontWeight = FontWeight.Medium)
+                }
+            }
+
+            // Permission & battery reliability banner (only when needed)
+            if (!notifPermissionGranted || (!exactAlarmGranted && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) || !batteryUnrestricted) {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -881,6 +904,41 @@ private fun RemindersSubPage(
                                                 data = Uri.parse("package:${context.packageName}")
                                             }
                                             context.startActivity(i)
+                                        }
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 3.dp)
+                            )
+                        }
+                    }
+                    if (!batteryUnrestricted) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("未设为省电无限制，国产系统杀后台可能延迟", style = t.meta, color = c.textPrimary, modifier = Modifier.weight(1f))
+                            Text(
+                                "去设置",
+                                style = t.meta,
+                                fontWeight = FontWeight.SemiBold,
+                                color = Color(0xFFE5A03D),
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable {
+                                        val opened = runCatching {
+                                            val i = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                                                data = Uri.parse("package:${context.packageName}")
+                                            }
+                                            context.startActivity(i)
+                                            true
+                                        }.getOrDefault(false)
+                                        if (!opened) {
+                                            runCatching {
+                                                val i = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                                                    data = Uri.parse("package:${context.packageName}")
+                                                }
+                                                context.startActivity(i)
+                                            }
                                         }
                                     }
                                     .padding(horizontal = 6.dp, vertical = 3.dp)
@@ -1288,6 +1346,7 @@ private fun ReminderEditorDialog(
                 .clip(RoundedCornerShape(18.dp))
                 .background(c.card)
                 .border(0.8.dp, c.border, RoundedCornerShape(18.dp))
+                .verticalScroll(rememberScrollState())
                 .padding(20.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
@@ -1317,37 +1376,15 @@ private fun ReminderEditorDialog(
                 }
             }
 
-            // Big Time Picker Button
-            Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .clip(RoundedCornerShape(12.dp))
-                    .background(c.canvas)
-                    .clickable {
-                        TimePickerDialog(
-                            context,
-                            { _, pickedHour, pickedMinute ->
-                                hour = pickedHour
-                                minute = pickedMinute
-                            },
-                            hour,
-                            minute,
-                            true
-                        ).show()
-                    }
-                    .padding(vertical = 16.dp),
-                horizontalAlignment = Alignment.CenterHorizontally,
-                verticalArrangement = Arrangement.spacedBy(4.dp)
-            ) {
-                Text(
-                    String.format(Locale.getDefault(), "%02d:%02d", hour, minute),
-                    fontSize = 36.sp,
-                    fontWeight = FontWeight.Bold,
-                    fontFamily = FontFamily.Monospace,
-                    color = c.accent
-                )
-                Text("点击调整提醒时间", style = t.meta, color = c.textMuted)
-            }
+            // Custom Whim-styled Compose Wheel Time Picker (replaces native TimePickerDialog)
+            WhimTimePicker(
+                hour = hour,
+                minute = minute,
+                onTimeChange = { h, m ->
+                    hour = h
+                    minute = m
+                }
+            )
 
             // Label Input + Presets
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -1912,7 +1949,36 @@ private fun SyncSubPage(
                         modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 16.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Text("仅在公司 Wi-Fi 或路由器禁用 UDP 广播时使用，正常家用网络无需填写。", style = t.meta, color = c.textMuted)
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text("支持手动输入或粘贴 Mac 配对链接", style = t.meta, color = c.textMuted)
+                            Text(
+                                "粘贴配对码链接",
+                                style = t.meta,
+                                fontWeight = FontWeight.Medium,
+                                color = c.accent,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable {
+                                        val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
+                                        val clipText = cm?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.text?.toString().orEmpty().trim()
+                                        val uri = runCatching { Uri.parse(clipText) }.getOrNull()
+                                        if (uri != null && uri.scheme == "whim" && uri.host == "pair") {
+                                            val addr = uri.getQueryParameter("addr").orEmpty()
+                                            val code = uri.getQueryParameter("code").orEmpty().filter { it.isDigit() }.take(6)
+                                            if (addr.isNotEmpty()) manualAddrInput = addr
+                                            if (code.isNotEmpty()) manualCodeInput = code
+                                            syncStatus = "已从剪贴板解析配对地址与配对码"
+                                        } else {
+                                            syncStatus = "剪贴板中未找到 whim://pair?... 配对链接"
+                                        }
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 2.dp)
+                            )
+                        }
                         Box(
                             modifier = Modifier
                                 .fillMaxWidth()
@@ -2164,6 +2230,13 @@ private fun StorageSubPage(
 
     var isCleaning by remember { mutableStateOf(false) }
     var cleanupMsg by remember { mutableStateOf("") }
+    var backups by remember { mutableStateOf<List<WhimBackupInfo>>(emptyList()) }
+    var isBackingUp by remember { mutableStateOf(false) }
+    var backupMsg by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        backups = runCatching { WhimCoreBridge.listBackups() }.getOrDefault(emptyList())
+    }
 
     Column(modifier = Modifier.fillMaxSize()) {
         SettingsTopBar(
@@ -2296,6 +2369,78 @@ private fun StorageSubPage(
             if (cleanupMsg.isNotEmpty()) {
                 Text(cleanupMsg, style = t.meta, color = c.accent, modifier = Modifier.padding(horizontal = 4.dp))
             }
+
+            // Daily Local Backup Card
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(16.dp))
+                    .background(c.card)
+                    .border(0.8.dp, c.border, RoundedCornerShape(16.dp))
+                    .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("每日自动备份", style = t.section, color = c.textPrimary)
+                        Text("每天启动时自动创建 SQLite 快照，滚动保留 7 天", style = t.meta, color = c.textSecondary)
+                    }
+                    Text(
+                        "${backups.size} 份",
+                        style = t.meta,
+                        fontFamily = FontFamily.Monospace,
+                        color = c.accent,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+                backups.firstOrNull()?.let { latest ->
+                    Text(
+                        "最近备份：${latest.name}（${formatStorageBytes(latest.sizeBytes)}）",
+                        style = t.meta,
+                        fontFamily = FontFamily.Monospace,
+                        color = c.textMuted
+                    )
+                }
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(c.canvas)
+                        .border(0.8.dp, c.border, RoundedCornerShape(10.dp))
+                        .clickable(enabled = !isBackingUp) {
+                            isBackingUp = true
+                            backupMsg = ""
+                            scope.launch {
+                                val res = runCatching { WhimCoreBridge.backupDatabase(keepDays = 7, force = true) }.getOrNull()
+                                backups = runCatching { WhimCoreBridge.listBackups() }.getOrDefault(emptyList())
+                                isBackingUp = false
+                                backupMsg = if (res != null) {
+                                    "已创建备份快照（${formatStorageBytes(res.sizeBytes)}）"
+                                } else {
+                                    "备份失败，请重试"
+                                }
+                            }
+                        }
+                        .padding(vertical = 11.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        if (isBackingUp) "正在备份..." else "立即备份数据库",
+                        style = t.body,
+                        fontWeight = FontWeight.Medium,
+                        color = c.textPrimary
+                    )
+                }
+                if (backupMsg.isNotEmpty()) {
+                    Text(backupMsg, style = t.meta, color = c.accent)
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
         }
     }
 }

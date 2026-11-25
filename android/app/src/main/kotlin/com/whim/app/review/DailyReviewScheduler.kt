@@ -174,6 +174,51 @@ object DailyReviewScheduler {
         return am.canScheduleExactAlarms()
     }
 
+    fun isIgnoringBatteryOptimizations(context: Context): Boolean {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) return true
+        val pm = context.getSystemService(Context.POWER_SERVICE) as? android.os.PowerManager
+            ?: return true
+        return pm.isIgnoringBatteryOptimizations(context.packageName)
+    }
+
+    fun nextTriggerSummary(context: Context): String? {
+        val active = getReminders(context).filter { it.enabled && it.weekdays.isNotEmpty() }
+        if (active.isEmpty()) return null
+        val now = System.currentTimeMillis()
+        var earliestTime = Long.MAX_VALUE
+        var earliestReminder: ReviewReminder? = null
+        for (r in active) {
+            val nextMs = computeNextTriggerMs(r, now)
+            if (nextMs < earliestTime) {
+                earliestTime = nextMs
+                earliestReminder = r
+            }
+        }
+        val target = earliestReminder ?: return null
+        val nowCal = Calendar.getInstance().apply { timeInMillis = now }
+        val nextCal = Calendar.getInstance().apply { timeInMillis = earliestTime }
+        val dayPrefix = when {
+            nowCal.get(Calendar.YEAR) == nextCal.get(Calendar.YEAR) &&
+                nowCal.get(Calendar.DAY_OF_YEAR) == nextCal.get(Calendar.DAY_OF_YEAR) -> "今天"
+            else -> {
+                val tomorrow = Calendar.getInstance().apply {
+                    timeInMillis = now
+                    add(Calendar.DAY_OF_YEAR, 1)
+                }
+                if (tomorrow.get(Calendar.YEAR) == nextCal.get(Calendar.YEAR) &&
+                    tomorrow.get(Calendar.DAY_OF_YEAR) == nextCal.get(Calendar.DAY_OF_YEAR)
+                ) "明天"
+                else String.format(
+                    Locale.getDefault(),
+                    "%d/%d",
+                    nextCal.get(Calendar.MONTH) + 1,
+                    nextCal.get(Calendar.DAY_OF_MONTH)
+                )
+            }
+        }
+        return "下次提醒：$dayPrefix ${target.formattedTime()}（${target.displayTitle()}）"
+    }
+
     fun scheduleNext(context: Context) {
         val active = getReminders(context).filter { it.enabled && it.weekdays.isNotEmpty() }
         if (active.isEmpty()) {

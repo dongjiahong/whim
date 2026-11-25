@@ -24,9 +24,11 @@ data class WhimAttachment(
 @Serializable
 data class WhimNote(
     val id: String,
+    @SerialName("parent_id") val parentId: String = "",
     val content: String,
     val tags: List<String> = emptyList(),
     val attachments: List<WhimAttachment> = emptyList(),
+    @SerialName("reply_count") val replyCount: Int = 0,
     val pinned: Boolean = false,
     val archived: Boolean = false,
     val deleted: Boolean = false,
@@ -77,6 +79,10 @@ data class WhimListFilter(
     @SerialName("date_to_ms") val dateToMs: Long = 0,
     @SerialName("include_archived") val includeArchived: Boolean = false,
     @SerialName("only_archived") val onlyArchived: Boolean = false,
+    @SerialName("only_deleted") val onlyDeleted: Boolean = false,
+    @SerialName("only_untagged") val onlyUntagged: Boolean = false,
+    @SerialName("only_with_images") val onlyWithImages: Boolean = false,
+    @SerialName("parent_id") val parentId: String = "",
     val limit: Int = 50,
     val cursor: WhimNoteCursor? = null
 )
@@ -120,7 +126,7 @@ data class WhimLivePeerStatus(
 @Immutable
 @Serializable
 data class WhimSyncHealthStatus(
-    val state: String = "offline", // "connected" | "offline" | "unpaired" | "wrong_code"
+    val state: String = "offline",
     val connected: Boolean = false,
     @SerialName("online_peers") val onlinePeers: Int = 0,
     @SerialName("total_peers") val totalPeers: Int = 0,
@@ -166,4 +172,32 @@ data class SavedBlob(
 data class WhimStorageCleanupResult(
     @SerialName("removed_files") val removedFiles: Int = 0,
     @SerialName("freed_bytes") val freedBytes: Long = 0
+)
+
+@Immutable
+@Serializable
+data class WhimTagRenameResult(
+    @SerialName("old_tag") val oldTag: String = "",
+    @SerialName("new_tag") val newTag: String = "",
+    @SerialName("updated_notes") val updatedNotes: Int = 0
+)
+
+@Immutable
+@Serializable
+data class WhimBackupResult(
+    @SerialName("backup_path") val backupPath: String = "",
+    @SerialName("backup_dir") val backupDir: String = "",
+    @SerialName("backup_count") val backupCount: Int = 0,
+    @SerialName("size_bytes") val sizeBytes: Long = 0,
+    @SerialName("created_at") val createdAt: Long = 0,
+    val skipped: Boolean = false
+)
+
+@Immutable
+@Serializable
+data class WhimBackupInfo(
+    val name: String = "",
+    val path: String = "",
+    @SerialName("size_bytes") val sizeBytes: Long = 0,
+    @SerialName("mod_time") val modTime: Long = 0
 )

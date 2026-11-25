@@ -60,7 +60,7 @@ object WhimCoreBridge {
             pinned?.let { put("pinned", it) }
             archived?.let { put("archived", it) }
             deleted?.let { put("deleted", it) }
-            if (!attachments.isNullOrEmpty()) {
+            if (attachments != null) {
                 put("attachments", json.parseToJsonElement(json.encodeToString(attachments)))
             }
         }
@@ -168,4 +168,52 @@ object WhimCoreBridge {
             val raw = Mobile.cleanupOrphanBlobs(minAgeSec.toLong(), dryRun)
             json.decodeFromString(raw)
         }
+
+    suspend fun createReply(
+        parentId: String,
+        content: String,
+        attachments: List<WhimAttachment> = emptyList()
+    ): WhimNote = withContext(Dispatchers.IO) {
+        val attJson = if (attachments.isEmpty()) "[]" else json.encodeToString(attachments)
+        val raw = Mobile.createReply(parentId, content, attJson)
+        json.decodeFromString(raw)
+    }
+
+    suspend fun listReplies(parentId: String): List<WhimNote> = withContext(Dispatchers.IO) {
+        val raw = Mobile.listReplies(parentId)
+        json.decodeFromString(raw)
+    }
+
+    suspend fun purgeNote(id: String) = withContext(Dispatchers.IO) {
+        Mobile.purgeNote(id)
+    }
+
+    suspend fun purgeOldDeleted(days: Int = 30): Long = withContext(Dispatchers.IO) {
+        Mobile.purgeOldDeleted(days.toLong())
+    }
+
+    suspend fun renameTag(oldPrefix: String, newPrefix: String): WhimTagRenameResult =
+        withContext(Dispatchers.IO) {
+            val raw = Mobile.renameTag(oldPrefix, newPrefix)
+            json.decodeFromString(raw)
+        }
+
+    suspend fun backupDatabase(keepDays: Int = 7, force: Boolean = false): WhimBackupResult = withContext(Dispatchers.IO) {
+        val raw = Mobile.backupDatabase(keepDays.toLong(), force)
+        json.decodeFromString(raw)
+    }
+
+    suspend fun listBackups(): List<WhimBackupInfo> = withContext(Dispatchers.IO) {
+        val raw = Mobile.listBackups()
+        json.decodeFromString(raw)
+    }
+
+    fun getLocalAddr(): String = runCatching { Mobile.getLocalAddr() }.getOrDefault("")
+
+    fun encodeAttachments(attachments: List<WhimAttachment>): String =
+        if (attachments.isEmpty()) "[]" else json.encodeToString(attachments)
+
+    fun decodeAttachments(raw: String?): List<WhimAttachment> =
+        if (raw.isNullOrBlank()) emptyList()
+        else runCatching { json.decodeFromString<List<WhimAttachment>>(raw) }.getOrDefault(emptyList())
 }

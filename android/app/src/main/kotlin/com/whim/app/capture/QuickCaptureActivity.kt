@@ -36,6 +36,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.FormatListBulleted
 import androidx.compose.material.icons.automirrored.rounded.Send
+import androidx.compose.material.icons.rounded.CheckBox
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.ContentPaste
 import androidx.compose.material.icons.rounded.FormatListNumbered
@@ -82,6 +83,10 @@ class QuickCaptureActivity : ComponentActivity() {
     companion object {
         const val EXTRA_EDIT_NOTE_ID = "edit_note_id"
         const val EXTRA_EDIT_CONTENT = "edit_content"
+        const val EXTRA_EDIT_ATTACHMENTS_JSON = "edit_attachments_json"
+        private const val DRAFT_PREFS = "whim_capture_draft"
+        private const val KEY_DRAFT_TEXT = "draft_text"
+        private const val KEY_DRAFT_ATTACHMENTS = "draft_attachments"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -90,6 +95,7 @@ class QuickCaptureActivity : ComponentActivity() {
 
         val editNoteId = intent?.getStringExtra(EXTRA_EDIT_NOTE_ID)
         val editContent = intent?.getStringExtra(EXTRA_EDIT_CONTENT)
+        val editAttachmentsJson = intent?.getStringExtra(EXTRA_EDIT_ATTACHMENTS_JSON)
 
         val sharedText = editContent ?: if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
             intent.getStringExtra(Intent.EXTRA_TEXT).orEmpty()
@@ -104,6 +110,12 @@ class QuickCaptureActivity : ComponentActivity() {
             }
         } else null
 
+        val initialAttachments = if (editNoteId != null) {
+            WhimCoreBridge.decodeAttachments(editAttachmentsJson)
+        } else {
+            emptyList()
+        }
+
         setContent {
             val prefs = remember { getSharedPreferences("whim_ui_prefs", Context.MODE_PRIVATE) }
             val mode = prefs.getString("theme_mode", "system") ?: "system"
@@ -117,6 +129,7 @@ class QuickCaptureActivity : ComponentActivity() {
                 FlomoQuickCaptureSheet(
                     editNoteId = editNoteId,
                     initialText = sharedText,
+                    initialAttachments = initialAttachments,
                     initialImageUri = sharedImageUri,
                     onDismiss = { finish() },
                     onSaved = {
@@ -137,6 +150,7 @@ private val quickTagVisualRegex = Regex("(^|[\\s(\\[{（【「『，。、；：
 fun FlomoQuickCaptureSheet(
     editNoteId: String? = null,
     initialText: String = "",
+    initialAttachments: List<WhimAttachment> = emptyList(),
     initialImageUri: Uri? = null,
     onDismiss: () -> Unit,
     onSaved: () -> Unit
@@ -146,16 +160,48 @@ fun FlomoQuickCaptureSheet(
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val focusRequester = remember { FocusRequester() }
+    val draftPrefs = remember { context.getSharedPreferences("whim_capture_draft", Context.MODE_PRIVATE) }
+
+    val restoredDraft = remember(editNoteId, initialText, initialImageUri) {
+        if (editNoteId == null && initialText.isEmpty() && initialImageUri == null) {
+            val dText = draftPrefs.getString("draft_text", "").orEmpty()
+            val dAtts = WhimCoreBridge.decodeAttachments(draftPrefs.getString("draft_attachments", null))
+            if (dText.isNotEmpty() || dAtts.isNotEmpty()) dText to dAtts else null
+        } else null
+    }
+
+    val startText = restoredDraft?.first ?: initialText
+    val startAtts = restoredDraft?.second ?: initialAttachments
 
     var textValue by remember {
-        mutableStateOf(TextFieldValue(text = initialText, selection = TextRange(initialText.length)))
+        mutableStateOf(TextFieldValue(text = startText, selection = TextRange(startText.length)))
     }
-    val attachments = remember { mutableStateListOf<WhimAttachment>() }
+    val attachments = remember { mutableStateListOf<WhimAttachment>().apply { addAll(startAtts) } }
+    var draftRestoredBanner by remember { mutableStateOf(restoredDraft != null) }
     var allTags by remember { mutableStateOf<List<String>>(emptyList()) }
     var saving by remember { mutableStateOf(false) }
 
     val text = textValue.text
     val canSubmit = !saving && (text.isNotBlank() || attachments.isNotEmpty())
+
+    fun clearDraft() {
+        draftPrefs.edit().remove("draft_text").remove("draft_attachments").apply()
+        draftRestoredBanner = false
+    }
+
+    // Auto-persist draft for new note capture so accidental dismissals never lose ideas
+    LaunchedEffect(textValue.text, attachments.size, editNoteId) {
+        if (editNoteId == null && !saving) {
+            if (textValue.text.isBlank() && attachments.isEmpty()) {
+                draftPrefs.edit().remove("draft_text").remove("draft_attachments").apply()
+            } else {
+                draftPrefs.edit()
+                    .putString("draft_text", textValue.text)
+                    .putString("draft_attachments", WhimCoreBridge.encodeAttachments(attachments.toList()))
+                    .apply()
+            }
+        }
+    }
 
     fun insertAtCursor(snippet: String) {
         val sel = textValue.selection
@@ -236,9 +282,9 @@ fun FlomoQuickCaptureSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
-                .clip(RoundedCornerShape(12.dp))
+                .clip(RoundedCornerShape(14.dp))
                 .background(c.card)
-                .border(1.2.dp, c.accent, RoundedCornerShape(12.dp))
+                .border(1.2.dp, c.accent, RoundedCornerShape(14.dp))
                 .clickable(
                     interactionSource = remember { MutableInteractionSource() },
                     indication = null,
@@ -246,13 +292,35 @@ fun FlomoQuickCaptureSheet(
                 )
                 .padding(16.dp)
         ) {
-            // Header: 新建 / 编辑 + Close
+            // Header: 新建 / 编辑 + Draft indicator + Close
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(text = if (editNoteId != null) "编辑笔记" else "新建", style = t.section, color = c.textPrimary)
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(text = if (editNoteId != null) "编辑笔记" else "新建", style = t.section, color = c.textPrimary)
+                    if (draftRestoredBanner && editNoteId == null) {
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(6.dp))
+                                .background(c.accent.copy(alpha = 0.14f))
+                                .clickable {
+                                    textValue = TextFieldValue("")
+                                    attachments.clear()
+                                    clearDraft()
+                                }
+                                .padding(horizontal = 7.dp, vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Text("已恢复草稿 · 清空", style = t.meta, color = c.accent)
+                        }
+                    }
+                }
                 Icon(
                     Icons.Rounded.Close,
                     contentDescription = "关闭",
@@ -372,7 +440,7 @@ fun FlomoQuickCaptureSheet(
 
             Spacer(Modifier.height(12.dp))
 
-            // Bottom toolbar: # | image | paste | divider | bullet | number ... sage-green Send button
+            // Bottom toolbar: # | image | paste | divider | bullet | number | task ... sage-green Send button
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
@@ -417,6 +485,11 @@ fun FlomoQuickCaptureSheet(
                         val needNL = cur > 0 && textValue.text[cur - 1] != '\n'
                         insertAtCursor(if (needNL) "\n1. " else "1. ")
                     }
+                    ToolbarIcon(Icons.Rounded.CheckBox, "待办") {
+                        val cur = textValue.selection.min.coerceIn(0, textValue.text.length)
+                        val needNL = cur > 0 && textValue.text[cur - 1] != '\n'
+                        insertAtCursor(if (needNL) "\n- [ ] " else "- [ ] ")
+                    }
                 }
 
                 // Flomo sage-green rounded send button
@@ -438,6 +511,7 @@ fun FlomoQuickCaptureSheet(
                                         WhimCoreBridge.createNote(text.trim(), attachments.toList())
                                     }
                                 }.onSuccess {
+                                    if (editNoteId == null) clearDraft()
                                     onSaved()
                                 }.onFailure {
                                     saving = false

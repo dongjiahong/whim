@@ -22,10 +22,13 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.detectHorizontalDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -58,6 +61,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Archive
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.ChatBubbleOutline
+import androidx.compose.material.icons.rounded.DeleteOutline
+import androidx.compose.material.icons.rounded.RestoreFromTrash
 import androidx.compose.material.icons.rounded.ChevronLeft
 import androidx.compose.material.icons.rounded.ChevronRight
 import androidx.compose.material.icons.rounded.Close
@@ -143,8 +149,11 @@ import com.whim.app.core.WhimTagNode
 import com.whim.app.review.DailyReviewReceiver
 import com.whim.app.review.DailyReviewScheduler
 import com.whim.app.sync.SyncWorker
+import com.whim.app.ui.ImageLightboxDialog
 import com.whim.app.ui.MobileSettingsScreen
+import com.whim.app.ui.NoteThreadSheet
 import com.whim.app.ui.SettingsFocusSection
+import com.whim.app.ui.TagRenameDialog
 import com.whim.app.ui.theme.WhimTheme
 import com.whim.app.ui.theme.WhimThemeProvider
 import com.whim.app.ui.theme.heatmapColor
@@ -171,8 +180,41 @@ private sealed class MobileTab {
     data object Review : MobileTab()
     data object Random : MobileTab()
     data object Archived : MobileTab()
+    data object Trash : MobileTab()
     data class Day(val dayStr: String) : MobileTab()
     data class Tag(val path: String) : MobileTab()
+}
+
+private fun toggleMarkdownTask(content: String, targetIndex: Int): String {
+    val lines = content.lines().toMutableList()
+    var inCode = false
+    var taskIdx = 0
+    for (i in lines.indices) {
+        val trimmed = lines[i].trim()
+        if (trimmed.startsWith("```")) {
+            inCode = !inCode
+            continue
+        }
+        if (inCode) continue
+        when {
+            trimmed.startsWith("- [ ] ") -> {
+                if (taskIdx == targetIndex) {
+                    lines[i] = lines[i].replaceFirst("- [ ] ", "- [x] ")
+                    return lines.joinToString("\n")
+                }
+                taskIdx++
+            }
+            trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ") -> {
+                if (taskIdx == targetIndex) {
+                    val token = if (trimmed.startsWith("- [x] ")) "- [x] " else "- [X] "
+                    lines[i] = lines[i].replaceFirst(token, "- [ ] ")
+                    return lines.joinToString("\n")
+                }
+                taskIdx++
+            }
+        }
+    }
+    return content
 }
 
 private val mobileTagStripRegex = Regex(
@@ -264,6 +306,10 @@ class MainActivity : ComponentActivity() {
                         val intent = Intent(this, QuickCaptureActivity::class.java).apply {
                             putExtra(QuickCaptureActivity.EXTRA_EDIT_NOTE_ID, note.id)
                             putExtra(QuickCaptureActivity.EXTRA_EDIT_CONTENT, note.content)
+                            putExtra(
+                                QuickCaptureActivity.EXTRA_EDIT_ATTACHMENTS_JSON,
+                                WhimCoreBridge.encodeAttachments(note.attachments)
+                            )
                         }
                         startActivity(intent)
                     }
@@ -316,7 +362,13 @@ private fun FlomoMobileApp(
     var reviewReminders by remember { mutableStateOf(DailyReviewScheduler.getReminders(context)) }
     var exactAlarmGranted by remember { mutableStateOf(DailyReviewScheduler.canScheduleExactAlarms(context)) }
     var notifPermissionGranted by remember { mutableStateOf(DailyReviewReceiver.hasNotificationPermission(context)) }
-    var previewImagePath by remember { mutableStateOf<String?>(null) }
+    var lightboxImages by remember { mutableStateOf<Pair<List<String>, Int>?>(null) }
+    var threadNote by remember { mutableStateOf<WhimNote?>(null) }
+    var renamingTag by remember { mutableStateOf<String?>(null) }
+    var isRenamingTag by remember { mutableStateOf(false) }
+    var filterUntagged by remember { mutableStateOf(false) }
+    var filterWithImages by remember { mutableStateOf(false) }
+    var filterRangeDays by remember { mutableStateOf(0) }
     var lastDeletedNoteId by remember { mutableStateOf<String?>(null) }
     var undoDismissJob by remember { mutableStateOf<Job?>(null) }
     var randomSeed by remember { mutableStateOf(0) }
@@ -342,9 +394,18 @@ private fun FlomoMobileApp(
     var foregroundSyncTrigger by remember { mutableStateOf(0) }
 
     fun buildFilterForTab(tab: MobileTab, cursor: WhimNoteCursor?): WhimListFilter? {
+        val quickDateFrom = if (filterRangeDays > 0) System.currentTimeMillis() - filterRangeDays * 86_400_000L else 0L
         return when (tab) {
-            MobileTab.All -> WhimListFilter(query = searchQuery, limit = pageSize, cursor = cursor)
+            MobileTab.All -> WhimListFilter(
+                query = searchQuery,
+                onlyUntagged = filterUntagged,
+                onlyWithImages = filterWithImages,
+                dateFromMs = quickDateFrom,
+                limit = pageSize,
+                cursor = cursor
+            )
             MobileTab.Archived -> WhimListFilter(query = searchQuery, onlyArchived = true, limit = pageSize, cursor = cursor)
+            MobileTab.Trash -> WhimListFilter(query = searchQuery, onlyDeleted = true, limit = pageSize, cursor = cursor)
             MobileTab.Review -> {
                 val (fromMs, toMs) = dayRangeMs(reviewOffsetDays)
                 WhimListFilter(
@@ -367,7 +428,14 @@ private fun FlomoMobileApp(
                     cursor = cursor
                 )
             }
-            is MobileTab.Tag -> WhimListFilter(query = searchQuery, tagPrefix = tab.path, limit = pageSize, cursor = cursor)
+            is MobileTab.Tag -> WhimListFilter(
+                query = searchQuery,
+                tagPrefix = tab.path,
+                onlyWithImages = filterWithImages,
+                dateFromMs = quickDateFrom,
+                limit = pageSize,
+                cursor = cursor
+            )
             MobileTab.Random -> null
         }
     }
@@ -443,7 +511,24 @@ private fun FlomoMobileApp(
 
     DisposableEffect(Unit) {
         MobileTagDispatch.onTap = { path -> activeTab = MobileTab.Tag(path) }
-        onDispose { MobileTagDispatch.onTap = null }
+        MobileTaskDispatch.onToggle = { noteId, taskIdx ->
+            val target = displayedNotes.firstOrNull { it.id == noteId } ?: return@onToggle
+            val nextContent = toggleMarkdownTask(target.content, taskIdx)
+            if (nextContent != target.content) {
+                scope.launch {
+                    runCatching {
+                        WhimCoreBridge.updateNote(id = target.id, content = nextContent)
+                    }
+                    reload()
+                    runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
+                    SyncWorker.enqueueImmediate(context)
+                }
+            }
+        }
+        onDispose {
+            MobileTagDispatch.onTap = null
+            MobileTaskDispatch.onToggle = null
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -506,7 +591,7 @@ private fun FlomoMobileApp(
         }
     }
 
-    LaunchedEffect(activeTab, reviewOffsetDays, searchQuery, randomSeed) {
+    LaunchedEffect(activeTab, reviewOffsetDays, searchQuery, randomSeed, filterUntagged, filterWithImages, filterRangeDays) {
         if (searchQuery.isNotEmpty()) {
             delay(180L)
         }
@@ -697,6 +782,10 @@ private fun FlomoMobileApp(
                         activeTab = MobileTab.Archived
                         scope.launch { drawerState.close() }
                     }
+                    DrawerNavRow(Icons.Rounded.DeleteOutline, "最近删除", activeTab == MobileTab.Trash) {
+                        activeTab = MobileTab.Trash
+                        scope.launch { drawerState.close() }
+                    }
                     DrawerNavRow(Icons.Rounded.Settings, "设置 · ${if (pairedPeers.isNotEmpty()) "已配对 ${pairedPeers.size} 台" else "未配对"} · v${GitHubUpdater.CURRENT_VERSION}", false) {
                         settingsFocusSection = SettingsFocusSection.ALL
                         showSettingsScreen = true
@@ -704,7 +793,16 @@ private fun FlomoMobileApp(
                     }
 
                     Spacer(Modifier.height(16.dp))
-                    Text("全部标签", style = t.meta, color = c.textMuted, modifier = Modifier.padding(start = 6.dp, bottom = 6.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth().padding(start = 6.dp, end = 6.dp, bottom = 6.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("全部标签", style = t.meta, color = c.textMuted)
+                        if (tagTree.isNotEmpty()) {
+                            Text("长按可整理", fontSize = 11.sp, color = c.textMuted.copy(alpha = 0.7f))
+                        }
+                    }
 
                     if (tagTree.isEmpty()) {
                         Text("输入 #工作/架构 自动生成标签树", style = t.meta, color = c.textMuted, modifier = Modifier.padding(start = 6.dp))
@@ -715,6 +813,10 @@ private fun FlomoMobileApp(
                             activeTab = activeTab,
                             onSelect = { path ->
                                 activeTab = MobileTab.Tag(path)
+                                scope.launch { drawerState.close() }
+                            },
+                            onLongPress = { path ->
+                                renamingTag = path
                                 scope.launch { drawerState.close() }
                             }
                         )
@@ -757,6 +859,7 @@ private fun FlomoMobileApp(
                                 MobileTab.Review -> "每日回顾"
                                 MobileTab.Random -> "随机漫步"
                                 MobileTab.Archived -> "已归档"
+                                MobileTab.Trash -> "最近删除"
                                 is MobileTab.Day -> "日期 · ${tab.dayStr}"
                                 is MobileTab.Tag -> "#${tab.path}"
                             },
@@ -957,6 +1060,80 @@ private fun FlomoMobileApp(
                     }
                 }
 
+                // Quick Filter Bar for All & Tag views
+                if (activeTab == MobileTab.All || activeTab is MobileTab.Tag) {
+                    val hasAnyQuickFilter = filterUntagged || filterWithImages || filterRangeDays > 0
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .horizontalScroll(rememberScrollState())
+                            .padding(horizontal = 16.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        if (activeTab == MobileTab.All) {
+                            QuickFilterPill("无标签", filterUntagged) { filterUntagged = !filterUntagged }
+                        }
+                        QuickFilterPill("含图片", filterWithImages) { filterWithImages = !filterWithImages }
+                        QuickFilterPill("近 7 天", filterRangeDays == 7) {
+                            filterRangeDays = if (filterRangeDays == 7) 0 else 7
+                        }
+                        QuickFilterPill("近 30 天", filterRangeDays == 30) {
+                            filterRangeDays = if (filterRangeDays == 30) 0 else 30
+                        }
+                        if (hasAnyQuickFilter) {
+                            Text(
+                                "重置",
+                                style = t.meta,
+                                color = c.tagText,
+                                fontWeight = FontWeight.Medium,
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(6.dp))
+                                    .clickable {
+                                        filterUntagged = false
+                                        filterWithImages = false
+                                        filterRangeDays = 0
+                                    }
+                                    .padding(horizontal = 6.dp, vertical = 4.dp)
+                            )
+                        }
+                    }
+                }
+
+                // Trash banner with one-tap empty trash
+                if (activeTab == MobileTab.Trash) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 4.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(c.card)
+                            .border(0.8.dp, c.border, RoundedCornerShape(10.dp))
+                            .padding(horizontal = 14.dp, vertical = 10.dp),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("删除笔记保留 30 天后自动清理", style = t.meta, color = c.textSecondary)
+                        if (displayedNotes.isNotEmpty()) {
+                            Box(
+                                modifier = Modifier
+                                    .clip(RoundedCornerShape(7.dp))
+                                    .background(Color(0xFFE06C6C).copy(alpha = 0.14f))
+                                    .clickable {
+                                        val ids = displayedNotes.map { it.id }
+                                        scope.launch {
+                                            ids.forEach { runCatching { WhimCoreBridge.purgeNote(it) } }
+                                            reload()
+                                        }
+                                    }
+                                    .padding(horizontal = 10.dp, vertical = 5.dp)
+                            ) {
+                                Text("清空回收站", style = t.meta, fontWeight = FontWeight.Medium, color = Color(0xFFE06C6C))
+                            }
+                        }
+                    }
+                }
+
                 if (activeTab == MobileTab.Review) {
                     val reviewLabel = remember(reviewOffsetDays) {
                         val (startMs, _) = dayRangeMs(reviewOffsetDays)
@@ -1062,7 +1239,8 @@ private fun FlomoMobileApp(
                         notes = displayedNotes,
                         isRandomMode = activeTab == MobileTab.Random,
                         resetKey = "$activeTab|$reviewOffsetDays|$randomSeed|${displayedNotes.firstOrNull()?.id.orEmpty()}|${displayedNotes.size}",
-                        onTapImage = { path -> previewImagePath = path },
+                        highlightQuery = searchQuery,
+                        onTapImage = { paths, idx -> lightboxImages = paths to idx },
                         onEdit = { note -> onEditNote(note) },
                         onTogglePin = { note ->
                             scope.launch {
@@ -1160,9 +1338,12 @@ private fun FlomoMobileApp(
                             ) { note ->
                                 FlomoMobileNoteCard(
                                     note = note,
+                                    isTrash = activeTab == MobileTab.Trash,
+                                    highlightQuery = searchQuery,
                                     modifier = Modifier.animateItem(),
                                     onTapTag = { path -> activeTab = MobileTab.Tag(path) },
-                                    onTapImage = { path -> previewImagePath = path },
+                                    onTapImage = { paths, idx -> lightboxImages = paths to idx },
+                                    onOpenThread = { threadNote = note },
                                     onEdit = { onEditNote(note) },
                                     onTogglePin = {
                                         scope.launch {
@@ -1183,6 +1364,20 @@ private fun FlomoMobileApp(
                                     onCopy = {
                                         val cm = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
                                         cm.setPrimaryClip(ClipData.newPlainText("whim", note.content))
+                                    },
+                                    onRestore = {
+                                        scope.launch {
+                                            WhimCoreBridge.updateNote(note.id, deleted = false)
+                                            reload()
+                                            runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
+                                            SyncWorker.enqueueImmediate(context)
+                                        }
+                                    },
+                                    onPurge = {
+                                        scope.launch {
+                                            runCatching { WhimCoreBridge.purgeNote(note.id) }
+                                            reload()
+                                        }
                                     },
                                     onDelete = {
                                         scope.launch {
@@ -1327,42 +1522,56 @@ private fun FlomoMobileApp(
         )
     }
 
-    // Full-screen Image Lightbox Dialog
-    previewImagePath?.let { path ->
-        Dialog(
-            onDismissRequest = { previewImagePath = null },
-            properties = DialogProperties(usePlatformDefaultWidth = false)
-        ) {
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(Color(0xE6000000))
-                    .clickable { previewImagePath = null },
-                contentAlignment = Alignment.Center
-            ) {
-                AsyncImage(
-                    model = File(path),
-                    contentDescription = "图片大图预览",
-                    contentScale = ContentScale.Fit,
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp)
-                )
-                Box(
-                    modifier = Modifier
-                        .align(Alignment.TopEnd)
-                        .statusBarsPadding()
-                        .padding(16.dp)
-                        .size(36.dp)
-                        .clip(CircleShape)
-                        .background(Color(0x88000000))
-                        .clickable { previewImagePath = null },
-                    contentAlignment = Alignment.Center
-                ) {
-                    Icon(Icons.Rounded.Close, contentDescription = "关闭", tint = Color.White, modifier = Modifier.size(20.dp))
+    // Multi-image Pinch-to-Zoom Lightbox Dialog
+    lightboxImages?.let { (paths, startIndex) ->
+        ImageLightboxDialog(
+            imagePaths = paths,
+            initialIndex = startIndex,
+            onDismiss = { lightboxImages = null }
+        )
+    }
+
+    // Note Thread / Replies Sheet
+    threadNote?.let { parent ->
+        NoteThreadSheet(
+            parentNote = parent,
+            onDismiss = { threadNote = null },
+            onThreadChanged = {
+                reload()
+                SyncWorker.enqueueImmediate(context)
+            }
+        )
+    }
+
+    // Tag Rename / Merge Dialog
+    renamingTag?.let { oldTag ->
+        TagRenameDialog(
+            oldTag = oldTag,
+            isRenaming = isRenamingTag,
+            onDismiss = { if (!isRenamingTag) renamingTag = null },
+            onConfirm = { newTag ->
+                scope.launch {
+                    isRenamingTag = true
+                    val res = runCatching { WhimCoreBridge.renameTag(oldTag, newTag) }.getOrNull()
+                    isRenamingTag = false
+                    renamingTag = null
+                    if (res != null) {
+                        val curTab = activeTab
+                        if (curTab is MobileTab.Tag && (curTab.path == oldTag || curTab.path.startsWith("$oldTag/"))) {
+                            activeTab = MobileTab.Tag(curTab.path.replaceFirst(oldTag, newTag))
+                        }
+                        syncToast = "已更新 ${res.updatedNotes} 条笔记的标签为 #$newTag"
+                        syncToastJob?.cancel()
+                        syncToastJob = scope.launch {
+                            delay(2800L)
+                            syncToast = ""
+                        }
+                        reload()
+                        SyncWorker.enqueueImmediate(context)
+                    }
                 }
             }
-        }
+        )
     }
 }
 
@@ -1451,11 +1660,34 @@ private fun DrawerNavRow(icon: ImageVector, title: String, active: Boolean, onCl
 }
 
 @Composable
+private fun QuickFilterPill(label: String, selected: Boolean, onClick: () -> Unit) {
+    val c = WhimTheme.colors
+    val t = WhimTheme.typography
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(14.dp))
+            .background(if (selected) c.accent else c.card)
+            .border(0.7.dp, if (selected) c.accent else c.border, RoundedCornerShape(14.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 11.dp, vertical = 5.dp)
+    ) {
+        Text(
+            text = label,
+            style = t.meta,
+            fontWeight = if (selected) FontWeight.Medium else FontWeight.Normal,
+            color = if (selected) Color.White else c.textSecondary
+        )
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
 private fun DrawerTagTree(
     nodes: List<WhimTagNode>,
     depth: Int,
     activeTab: MobileTab,
-    onSelect: (String) -> Unit
+    onSelect: (String) -> Unit,
+    onLongPress: (String) -> Unit
 ) {
     val c = WhimTheme.colors
     Column {
@@ -1466,7 +1698,10 @@ private fun DrawerTagTree(
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(7.dp))
                     .background(if (selected) c.accent else Color.Transparent)
-                    .clickable { onSelect(node.fullPath) }
+                    .combinedClickable(
+                        onClick = { onSelect(node.fullPath) },
+                        onLongClick = { onLongPress(node.fullPath) }
+                    )
                     .padding(start = (depth * 14 + 10).dp, end = 10.dp, top = 7.dp, bottom = 7.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
@@ -1478,7 +1713,7 @@ private fun DrawerTagTree(
                 Text("${node.count}", fontSize = 12.sp, color = if (selected) Color.White.copy(alpha = 0.8f) else c.textMuted)
             }
             if (node.children.isNotEmpty()) {
-                DrawerTagTree(node.children, depth + 1, activeTab, onSelect)
+                DrawerTagTree(node.children, depth + 1, activeTab, onSelect, onLongPress)
             }
         }
     }
@@ -1520,11 +1755,17 @@ private object MobileTagDispatch {
     var onTap: ((String) -> Unit)? = null
 }
 
+private object MobileTaskDispatch {
+    @Volatile
+    var onToggle: ((noteId: String, taskIndex: Int) -> Unit)? = null
+}
+
 @Immutable
 private data class ParsedMobileCard(
     val timeStr: String,
     val blocks: List<MobileCardBlock>,
-    val trailing: List<WhimAttachment>
+    val trailing: List<WhimAttachment>,
+    val allImagePaths: List<String>
 )
 
 private object MobileCardParseCache {
@@ -1537,11 +1778,13 @@ private object MobileCardParseCache {
         muted: Color,
         accent: Color,
         codeBg: Color,
-        codeFg: Color
+        codeFg: Color,
+        highlightQuery: String = ""
     ): ParsedMobileCard {
-        val key = "${note.id}:${note.updatedAt}:inline:${primary.value}:${note.attachments.size}"
+        val q = highlightQuery.trim().lowercase()
+        val key = "${note.id}:${note.updatedAt}:inline:${primary.value}:${note.attachments.size}:$q"
         cache.get(key)?.let { return it }
-        val parsed = parse(note, primary, secondary, muted, accent, codeBg, codeFg)
+        val parsed = parse(note, primary, secondary, muted, accent, codeBg, codeFg, q)
         cache.put(key, parsed)
         return parsed
     }
@@ -1553,7 +1796,8 @@ private object MobileCardParseCache {
         muted: Color,
         accent: Color,
         codeBg: Color,
-        codeFg: Color
+        codeFg: Color,
+        highlightQuery: String
     ): ParsedMobileCard {
         val timeStr = Instant.ofEpochMilli(note.createdAt)
             .atZone(ZoneId.systemDefault())
@@ -1568,6 +1812,8 @@ private object MobileCardParseCache {
         val pathByHash = note.attachments.associate { it.sha256 to it.localPath }
         val blocks = mutableListOf<MobileCardBlock>()
         val referenced = HashSet<String>()
+        val allImages = mutableListOf<String>()
+        val taskCounter = intArrayOf(0)
         var cursor = 0
 
         for (m in mobileBlobRegex.findAll(displayBody)) {
@@ -1576,7 +1822,7 @@ private object MobileCardParseCache {
                 if (seg.isNotBlank()) {
                     blocks.add(
                         MobileCardBlock.TextBlock(
-                            parseMarkdownChunks(seg, primary, secondary, muted, accent, codeBg, codeFg)
+                            parseMarkdownChunks(note.id, seg, primary, secondary, muted, accent, codeBg, codeFg, highlightQuery, taskCounter)
                         )
                     )
                 }
@@ -1586,6 +1832,7 @@ private object MobileCardParseCache {
             val path = pathByHash[hash].orEmpty()
             if (path.isNotEmpty()) {
                 blocks.add(MobileCardBlock.ImageBlock(path))
+                allImages.add(path)
             }
             cursor = m.range.last + 1
         }
@@ -1594,24 +1841,28 @@ private object MobileCardParseCache {
             if (tail.isNotBlank()) {
                 blocks.add(
                     MobileCardBlock.TextBlock(
-                        parseMarkdownChunks(tail, primary, secondary, muted, accent, codeBg, codeFg)
+                        parseMarkdownChunks(note.id, tail, primary, secondary, muted, accent, codeBg, codeFg, highlightQuery, taskCounter)
                     )
                 )
             }
         }
 
         val trailing = note.attachments.filter { it.sha256 !in referenced && it.localPath.isNotEmpty() }
-        return ParsedMobileCard(timeStr = timeStr, blocks = blocks, trailing = trailing)
+        trailing.forEach { allImages.add(it.localPath) }
+        return ParsedMobileCard(timeStr = timeStr, blocks = blocks, trailing = trailing, allImagePaths = allImages)
     }
 
     private fun parseMarkdownChunks(
+        noteId: String,
         text: String,
         primary: Color,
         secondary: Color,
         muted: Color,
         accent: Color,
         codeBg: Color,
-        codeFg: Color
+        codeFg: Color,
+        highlightQuery: String,
+        taskCounter: IntArray
     ): List<MobileMdChunk> {
         val effective = text.lines()
         val out = ArrayList<MobileMdChunk>(2)
@@ -1678,28 +1929,35 @@ private object MobileCardParseCache {
                 }
                 trimmed.startsWith("#### ") -> {
                     textBuilder.withStyle(SpanStyle(color = primary, fontSize = 14.5.sp, fontWeight = FontWeight.SemiBold)) {
-                        appendInlineMarkdown(trimmed.drop(5), codeBg, codeFg)
+                        appendInlineMarkdown(trimmed.drop(5), codeBg, codeFg, highlightQuery)
                     }
                 }
                 trimmed.startsWith("### ") -> {
                     textBuilder.withStyle(SpanStyle(color = primary, fontSize = 15.5.sp, fontWeight = FontWeight.SemiBold)) {
-                        appendInlineMarkdown(trimmed.drop(4), codeBg, codeFg)
+                        appendInlineMarkdown(trimmed.drop(4), codeBg, codeFg, highlightQuery)
                     }
                 }
                 trimmed.startsWith("## ") -> {
                     textBuilder.withStyle(SpanStyle(color = primary, fontSize = 17.sp, fontWeight = FontWeight.Bold)) {
-                        appendInlineMarkdown(trimmed.drop(3), codeBg, codeFg)
+                        appendInlineMarkdown(trimmed.drop(3), codeBg, codeFg, highlightQuery)
                     }
                 }
                 trimmed.startsWith("# ") -> {
                     textBuilder.withStyle(SpanStyle(color = primary, fontSize = 18.5.sp, fontWeight = FontWeight.Bold)) {
-                        appendInlineMarkdown(trimmed.drop(2), codeBg, codeFg)
+                        appendInlineMarkdown(trimmed.drop(2), codeBg, codeFg, highlightQuery)
                     }
                 }
                 trimmed.startsWith("- [ ] ") || trimmed.startsWith("- [x] ") || trimmed.startsWith("- [X] ") -> {
                     val done = !trimmed.startsWith("- [ ] ")
+                    val thisTaskIndex = taskCounter[0]++
                     if (indentStr.isNotEmpty()) textBuilder.append(indentStr)
-                    textBuilder.withStyle(SpanStyle(color = if (done) accent else muted)) {
+                    textBuilder.withLink(
+                        LinkAnnotation.Clickable(
+                            tag = "whim_task_${noteId}_$thisTaskIndex",
+                            styles = TextLinkStyles(style = SpanStyle(color = if (done) accent else muted)),
+                            linkInteractionListener = { MobileTaskDispatch.onToggle?.invoke(noteId, thisTaskIndex) }
+                        )
+                    ) {
                         append(if (done) "☑ " else "☐ ")
                     }
                     textBuilder.withStyle(
@@ -1708,7 +1966,7 @@ private object MobileCardParseCache {
                             textDecoration = if (done) TextDecoration.LineThrough else TextDecoration.None
                         )
                     ) {
-                        appendInlineMarkdown(trimmed.drop(6), codeBg, codeFg)
+                        appendInlineMarkdown(trimmed.drop(6), codeBg, codeFg, highlightQuery)
                     }
                 }
                 trimmed.startsWith("- ") || trimmed.startsWith("* ") -> {
@@ -1717,7 +1975,7 @@ private object MobileCardParseCache {
                         append("$bulletGlyph ")
                     }
                     textBuilder.withStyle(SpanStyle(color = primary)) {
-                        appendInlineMarkdown(trimmed.drop(2), codeBg, codeFg)
+                        appendInlineMarkdown(trimmed.drop(2), codeBg, codeFg, highlightQuery)
                     }
                 }
                 trimmed.startsWith("> ") -> {
@@ -1726,7 +1984,7 @@ private object MobileCardParseCache {
                         append("▎ ")
                     }
                     textBuilder.withStyle(SpanStyle(color = secondary)) {
-                        appendInlineMarkdown(trimmed.drop(2), codeBg, codeFg)
+                        appendInlineMarkdown(trimmed.drop(2), codeBg, codeFg, highlightQuery)
                     }
                 }
                 else -> {
@@ -1737,12 +1995,12 @@ private object MobileCardParseCache {
                             append("${orderedMatch.groupValues[1]}. ")
                         }
                         textBuilder.withStyle(SpanStyle(color = primary)) {
-                            appendInlineMarkdown(orderedMatch.groupValues[2], codeBg, codeFg)
+                            appendInlineMarkdown(orderedMatch.groupValues[2], codeBg, codeFg, highlightQuery)
                         }
                     } else {
                         if (indentStr.isNotEmpty()) textBuilder.append(indentStr)
                         textBuilder.withStyle(SpanStyle(color = primary)) {
-                            appendInlineMarkdown(trimmed, codeBg, codeFg)
+                            appendInlineMarkdown(trimmed, codeBg, codeFg, highlightQuery)
                         }
                     }
                 }
@@ -1761,13 +2019,18 @@ private object MobileCardParseCache {
 @Composable
 private fun FlomoMobileNoteCard(
     note: WhimNote,
+    isTrash: Boolean = false,
+    highlightQuery: String = "",
     modifier: Modifier = Modifier,
     onTapTag: (String) -> Unit,
-    onTapImage: (String) -> Unit,
+    onTapImage: (List<String>, Int) -> Unit,
+    onOpenThread: () -> Unit,
     onEdit: () -> Unit,
     onTogglePin: () -> Unit,
     onToggleArchive: () -> Unit,
     onCopy: () -> Unit,
+    onRestore: () -> Unit = {},
+    onPurge: () -> Unit = {},
     onDelete: () -> Unit
 ) {
     val c = WhimTheme.colors
@@ -1778,7 +2041,7 @@ private fun FlomoMobileNoteCard(
     var contentOverflow by remember(note.id, note.updatedAt) { mutableStateOf(false) }
     val maxCollapsedPx = with(LocalDensity.current) { 340.dp.roundToPx() }
 
-    val parsed = remember(note.id, note.updatedAt, c.textPrimary) {
+    val parsed = remember(note.id, note.updatedAt, c.textPrimary, highlightQuery) {
         MobileCardParseCache.getOrParse(
             note = note,
             primary = c.textPrimary,
@@ -1786,7 +2049,8 @@ private fun FlomoMobileNoteCard(
             muted = c.textMuted,
             accent = c.accent,
             codeBg = c.tagBg,
-            codeFg = c.tagText
+            codeFg = c.tagText,
+            highlightQuery = highlightQuery
         )
     }
 
@@ -1795,6 +2059,11 @@ private fun FlomoMobileNoteCard(
             .fillMaxWidth()
             .clip(RoundedCornerShape(10.dp))
             .background(c.card)
+            .pointerInput(note.id, isTrash) {
+                if (!isTrash) {
+                    detectTapGestures(onDoubleTap = { onEdit() })
+                }
+            }
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(9.dp)
     ) {
@@ -1808,36 +2077,68 @@ private fun FlomoMobileNoteCard(
                 style = t.meta,
                 color = c.textSecondary
             )
-            Box {
-                Icon(
-                    Icons.Rounded.MoreHoriz,
-                    contentDescription = "更多",
-                    tint = c.textMuted,
-                    modifier = Modifier
-                        .size(20.dp)
-                        .clickable { menuExpanded = true }
-                )
-                DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                    DropdownMenuItem(
-                        text = { Text("编辑") },
-                        onClick = { menuExpanded = false; onEdit() }
+            if (isTrash) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(c.accent.copy(alpha = 0.14f))
+                            .clickable(onClick = onRestore)
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(3.dp)
+                    ) {
+                        Icon(Icons.Rounded.RestoreFromTrash, contentDescription = "恢复", tint = c.accent, modifier = Modifier.size(13.dp))
+                        Text("恢复", style = t.meta, fontWeight = FontWeight.Medium, color = c.accent)
+                    }
+                    Text(
+                        "彻底删除",
+                        style = t.meta,
+                        fontWeight = FontWeight.Medium,
+                        color = Color(0xFFE06C6C),
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(Color(0xFFE06C6C).copy(alpha = 0.12f))
+                            .clickable(onClick = onPurge)
+                            .padding(horizontal = 8.dp, vertical = 4.dp)
                     )
-                    DropdownMenuItem(
-                        text = { Text(if (note.pinned) "取消置顶" else "置顶") },
-                        onClick = { menuExpanded = false; onTogglePin() }
+                }
+            } else {
+                Box {
+                    Icon(
+                        Icons.Rounded.MoreHoriz,
+                        contentDescription = "更多",
+                        tint = c.textMuted,
+                        modifier = Modifier
+                            .size(20.dp)
+                            .clickable { menuExpanded = true }
                     )
-                    DropdownMenuItem(
-                        text = { Text(if (note.archived) "取消归档" else "归档") },
-                        onClick = { menuExpanded = false; onToggleArchive() }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("复制内容") },
-                        onClick = { menuExpanded = false; onCopy() }
-                    )
-                    DropdownMenuItem(
-                        text = { Text("删除") },
-                        onClick = { menuExpanded = false; onDelete() }
-                    )
+                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        DropdownMenuItem(
+                            text = { Text("编辑") },
+                            onClick = { menuExpanded = false; onEdit() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (note.replyCount > 0) "追记 (${note.replyCount})" else "添加追记") },
+                            onClick = { menuExpanded = false; onOpenThread() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (note.pinned) "取消置顶" else "置顶") },
+                            onClick = { menuExpanded = false; onTogglePin() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(if (note.archived) "取消归档" else "归档") },
+                            onClick = { menuExpanded = false; onToggleArchive() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("复制内容") },
+                            onClick = { menuExpanded = false; onCopy() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text("删除") },
+                            onClick = { menuExpanded = false; onDelete() }
+                        )
+                    }
                 }
             }
         }
@@ -1886,7 +2187,10 @@ private fun FlomoMobileNoteCard(
                                     .aspectRatio(ratio)
                                     .clip(RoundedCornerShape(8.dp))
                                     .background(c.canvas)
-                                    .clickable { onTapImage(block.path) }
+                                    .clickable {
+                                        val idx = parsed.allImagePaths.indexOf(block.path).coerceAtLeast(0)
+                                        onTapImage(parsed.allImagePaths, idx)
+                                    }
                             )
                         }
                     }
@@ -1911,7 +2215,10 @@ private fun FlomoMobileNoteCard(
                                     .size(104.dp)
                                     .clip(RoundedCornerShape(8.dp))
                                     .background(c.canvas)
-                                    .clickable { onTapImage(att.localPath) }
+                                    .clickable {
+                                        val idx = parsed.allImagePaths.indexOf(att.localPath).coerceAtLeast(0)
+                                        onTapImage(parsed.allImagePaths, idx)
+                                    }
                             )
                         }
                     }
@@ -1933,14 +2240,48 @@ private fun FlomoMobileNoteCard(
             }
         }
 
-        if (contentOverflow) {
-            Text(
-                text = if (textExpanded) "收起" else "展开全文",
-                style = t.meta,
-                fontWeight = FontWeight.Medium,
-                color = c.tagText,
-                modifier = Modifier.clickable { textExpanded = !textExpanded }
-            )
+        if (contentOverflow || (!isTrash && note.replyCount > 0)) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (contentOverflow) {
+                    Text(
+                        text = if (textExpanded) "收起" else "展开全文",
+                        style = t.meta,
+                        fontWeight = FontWeight.Medium,
+                        color = c.tagText,
+                        modifier = Modifier.clickable { textExpanded = !textExpanded }
+                    )
+                } else {
+                    Spacer(Modifier.width(1.dp))
+                }
+                if (!isTrash && note.replyCount > 0) {
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(6.dp))
+                            .background(c.canvas)
+                            .clickable(onClick = onOpenThread)
+                            .padding(horizontal = 8.dp, vertical = 4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            Icons.Rounded.ChatBubbleOutline,
+                            contentDescription = "追记",
+                            tint = c.accent,
+                            modifier = Modifier.size(12.dp)
+                        )
+                        Text(
+                            "${note.replyCount} 条追记",
+                            style = t.meta,
+                            color = c.accent,
+                            fontWeight = FontWeight.Medium
+                        )
+                    }
+                }
+            }
         }
     }
 }
@@ -1950,7 +2291,8 @@ private fun MobileCardDeck(
     notes: List<WhimNote>,
     isRandomMode: Boolean,
     resetKey: String,
-    onTapImage: (String) -> Unit,
+    highlightQuery: String = "",
+    onTapImage: (List<String>, Int) -> Unit,
     onEdit: (WhimNote) -> Unit,
     onTogglePin: (WhimNote) -> Unit,
     onToggleArchive: (WhimNote) -> Unit,
@@ -2071,7 +2413,7 @@ private fun MobileCardDeck(
                     val scale = if (isTop) 1f else (1f - depth * 0.045f + dragProgress * 0.045f)
                     val offsetYDp = if (isTop) 0.dp else ((depth * 14f - dragProgress * 14f).dp)
                     val cardAlpha = if (isTop) 1f else (1f - depth * 0.22f + dragProgress * 0.22f).coerceIn(0.45f, 1f)
-                    val parsed = remember(note.id, note.updatedAt, c.textPrimary) {
+                    val parsed = remember(note.id, note.updatedAt, c.textPrimary, highlightQuery) {
                         MobileCardParseCache.getOrParse(
                             note = note,
                             primary = c.textPrimary,
@@ -2079,7 +2421,8 @@ private fun MobileCardDeck(
                             muted = c.textMuted,
                             accent = c.accent,
                             codeBg = c.tagBg,
-                            codeFg = c.tagText
+                            codeFg = c.tagText,
+                            highlightQuery = highlightQuery
                         )
                     }
                     var menuExpanded by remember(note.id) { mutableStateOf(false) }
@@ -2187,7 +2530,10 @@ private fun MobileCardDeck(
                                                 .aspectRatio(ratio)
                                                 .clip(RoundedCornerShape(8.dp))
                                                 .background(c.canvas)
-                                                .clickable { onTapImage(block.path) }
+                                                .clickable {
+                                                    val idx = parsed.allImagePaths.indexOf(block.path).coerceAtLeast(0)
+                                                    onTapImage(parsed.allImagePaths, idx)
+                                                }
                                         )
                                     }
                                 }
@@ -2211,7 +2557,10 @@ private fun MobileCardDeck(
                                                 .size(104.dp)
                                                 .clip(RoundedCornerShape(8.dp))
                                                 .background(c.canvas)
-                                                .clickable { onTapImage(att.localPath) }
+                                                .clickable {
+                                                    val idx = parsed.allImagePaths.indexOf(att.localPath).coerceAtLeast(0)
+                                                    onTapImage(parsed.allImagePaths, idx)
+                                                }
                                         )
                                     }
                                 }
@@ -2301,14 +2650,40 @@ private fun MobileMarkdownChunksView(chunks: List<MobileMdChunk>) {
     }
 }
 
-private fun AnnotatedString.Builder.appendPlainWithInlineTags(segment: String, tagBg: Color, tagFg: Color) {
+private fun AnnotatedString.Builder.appendHighlightedPlain(text: String, query: String) {
+    if (query.isEmpty() || text.isEmpty()) {
+        append(text)
+        return
+    }
+    val lower = text.lowercase()
+    var start = 0
+    while (start < text.length) {
+        val hit = lower.indexOf(query, start)
+        if (hit < 0) {
+            append(text.substring(start))
+            break
+        }
+        if (hit > start) append(text.substring(start, hit))
+        withStyle(SpanStyle(background = Color(0x4DE5A03D), fontWeight = FontWeight.SemiBold)) {
+            append(text.substring(hit, hit + query.length))
+        }
+        start = hit + query.length
+    }
+}
+
+private fun AnnotatedString.Builder.appendPlainWithInlineTags(
+    segment: String,
+    tagBg: Color,
+    tagFg: Color,
+    highlightQuery: String = ""
+) {
     if ('#' !in segment) {
-        append(segment)
+        appendHighlightedPlain(segment, highlightQuery)
         return
     }
     var idx = 0
     for (m in mobileTagStripRegex.findAll(segment)) {
-        if (m.range.first > idx) append(segment.substring(idx, m.range.first))
+        if (m.range.first > idx) appendHighlightedPlain(segment.substring(idx, m.range.first), highlightQuery)
         val lead = m.groupValues[1]
         val rawTag = m.groupValues[2]
         if (lead.isNotEmpty()) append(lead)
@@ -2331,26 +2706,31 @@ private fun AnnotatedString.Builder.appendPlainWithInlineTags(segment: String, t
         }
         idx = m.range.last + 1
     }
-    if (idx < segment.length) append(segment.substring(idx))
+    if (idx < segment.length) appendHighlightedPlain(segment.substring(idx), highlightQuery)
 }
 
-private fun AnnotatedString.Builder.appendInlineMarkdown(raw: String, codeBg: Color, codeFg: Color) {
+private fun AnnotatedString.Builder.appendInlineMarkdown(
+    raw: String,
+    codeBg: Color,
+    codeFg: Color,
+    highlightQuery: String = ""
+) {
     if ('*' !in raw && '~' !in raw && '`' !in raw) {
-        appendPlainWithInlineTags(raw, codeBg, codeFg)
+        appendPlainWithInlineTags(raw, codeBg, codeFg, highlightQuery)
         return
     }
     var idx = 0
     for (m in inlineMdTokenRegex.findAll(raw)) {
-        if (m.range.first > idx) appendPlainWithInlineTags(raw.substring(idx, m.range.first), codeBg, codeFg)
+        if (m.range.first > idx) appendPlainWithInlineTags(raw.substring(idx, m.range.first), codeBg, codeFg, highlightQuery)
         val tok = m.value
         when {
-            tok.startsWith("**") && tok.endsWith("**") -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { appendPlainWithInlineTags(tok.drop(2).dropLast(2), codeBg, codeFg) }
-            tok.startsWith("~~") && tok.endsWith("~~") -> withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) { appendPlainWithInlineTags(tok.drop(2).dropLast(2), codeBg, codeFg) }
+            tok.startsWith("**") && tok.endsWith("**") -> withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { appendPlainWithInlineTags(tok.drop(2).dropLast(2), codeBg, codeFg, highlightQuery) }
+            tok.startsWith("~~") && tok.endsWith("~~") -> withStyle(SpanStyle(textDecoration = TextDecoration.LineThrough)) { appendPlainWithInlineTags(tok.drop(2).dropLast(2), codeBg, codeFg, highlightQuery) }
             tok.startsWith("`") && tok.endsWith("`") -> withStyle(SpanStyle(background = codeBg, color = codeFg)) { append(" ${tok.drop(1).dropLast(1)} ") }
-            tok.startsWith("*") && tok.endsWith("*") -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { appendPlainWithInlineTags(tok.drop(1).dropLast(1), codeBg, codeFg) }
-            else -> appendPlainWithInlineTags(tok, codeBg, codeFg)
+            tok.startsWith("*") && tok.endsWith("*") -> withStyle(SpanStyle(fontStyle = FontStyle.Italic)) { appendPlainWithInlineTags(tok.drop(1).dropLast(1), codeBg, codeFg, highlightQuery) }
+            else -> appendPlainWithInlineTags(tok, codeBg, codeFg, highlightQuery)
         }
         idx = m.range.last + 1
     }
-    if (idx < raw.length) appendPlainWithInlineTags(raw.substring(idx), codeBg, codeFg)
+    if (idx < raw.length) appendPlainWithInlineTags(raw.substring(idx), codeBg, codeFg, highlightQuery)
 }

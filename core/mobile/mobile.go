@@ -442,3 +442,113 @@ func CleanupOrphanBlobs(minAgeSec int, dryRun bool) (string, error) {
 	b, err := json.Marshal(res)
 	return string(b), err
 }
+
+// CreateReply creates a new thread reply attached to parentID.
+func CreateReply(parentID, content, attachmentsJSON string) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	var atts []model.Attachment
+	if attachmentsJSON != "" && attachmentsJSON != "[]" {
+		if err := json.Unmarshal([]byte(attachmentsJSON), &atts); err != nil {
+			return "", err
+		}
+	}
+	note, err := e.Store.CreateReply(parentID, content, atts)
+	if err != nil {
+		return "", err
+	}
+	e.Peer.NotifyChanged()
+	b, err := json.Marshal(note)
+	return string(b), err
+}
+
+// ListReplies returns chronological active replies for parentID as JSON array.
+func ListReplies(parentID string) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	replies, err := e.Store.ListReplies(parentID)
+	if err != nil {
+		return "", err
+	}
+	if replies == nil {
+		replies = []model.Note{}
+	}
+	b, err := json.Marshal(replies)
+	return string(b), err
+}
+
+// PurgeNote permanently deletes a single soft-deleted note from SQLite.
+func PurgeNote(id string) error {
+	e, err := requireEngine()
+	if err != nil {
+		return err
+	}
+	return e.Store.PurgeNote(id)
+}
+
+// PurgeOldDeleted permanently removes soft-deleted notes older than olderThanDays (<=0 empties trash).
+func PurgeOldDeleted(olderThanDays int) (int, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return 0, err
+	}
+	return e.Store.PurgeOldDeleted(olderThanDays)
+}
+
+// RenameTag atomically renames or merges #oldPrefix (and subtags) to #newPrefix across all active notes.
+func RenameTag(oldPrefix, newPrefix string) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	res, err := e.Store.RenameTag(oldPrefix, newPrefix)
+	if err != nil {
+		return "", err
+	}
+	if res.UpdatedNotes > 0 {
+		e.Peer.NotifyChanged()
+	}
+	b, err := json.Marshal(res)
+	return string(b), err
+}
+
+// BackupDatabase creates a WAL-safe daily SQLite snapshot and keeps the newest keepDays snapshots.
+func BackupDatabase(keepDays int, force bool) (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	res, err := e.Store.BackupDatabase("", keepDays, force)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(res)
+	return string(b), err
+}
+
+// ListBackups returns JSON array of existing daily backup snapshots.
+func ListBackups() (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	items, err := e.Store.ListBackups("")
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(items)
+	return string(b), err
+}
+
+// GetLocalAddr returns this device's LAN IP:port (e.g. "192.168.5.111:8788") for QR-code pairing.
+func GetLocalAddr() (string, error) {
+	e, err := requireEngine()
+	if err != nil {
+		return "", err
+	}
+	return e.Peer.LocalLANAddr(), nil
+}

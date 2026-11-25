@@ -302,3 +302,74 @@ func WhimCleanupOrphanBlobs(minAgeSec C.int, dryRun C.int) *C.char {
 	}
 	return okJSON(res)
 }
+
+//export WhimCreateReply
+func WhimCreateReply(parentID, content, attachmentsJSON *C.char) *C.char {
+	res, err := mobile.CreateReply(C.GoString(parentID), C.GoString(content), C.GoString(attachmentsJSON))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimListReplies
+func WhimListReplies(parentID *C.char) *C.char {
+	res, err := mobile.ListReplies(C.GoString(parentID))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimPurgeNote
+func WhimPurgeNote(id *C.char) *C.char {
+	if err := mobile.PurgeNote(C.GoString(id)); err != nil {
+		return errJSON(err)
+	}
+	return okString("purged")
+}
+
+//export WhimPurgeOldDeleted
+func WhimPurgeOldDeleted(olderThanDays C.int) *C.char {
+	cnt, err := mobile.PurgeOldDeleted(int(olderThanDays))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okInt(cnt)
+}
+
+//export WhimRenameTag
+func WhimRenameTag(oldPrefix, newPrefix *C.char) *C.char {
+	res, err := mobile.RenameTag(C.GoString(oldPrefix), C.GoString(newPrefix))
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimBackupDatabase
+func WhimBackupDatabase(keepDays C.int, force C.int) *C.char {
+	res, err := mobile.BackupDatabase(int(keepDays), force != 0)
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimListBackups
+func WhimListBackups() *C.char {
+	res, err := mobile.ListBackups()
+	if err != nil {
+		return errJSON(err)
+	}
+	return okJSON(res)
+}
+
+//export WhimGetLocalAddr
+func WhimGetLocalAddr() *C.char {
+	addr, err := mobile.GetLocalAddr()
+	if err != nil {
+		return errJSON(err)
+	}
+	return okString(addr)
+}

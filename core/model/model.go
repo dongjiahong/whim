@@ -51,9 +51,11 @@ type Attachment struct {
 // Note is the core card entity in Whim.
 type Note struct {
 	ID          string       `json:"id"`
+	ParentID    string       `json:"parent_id,omitempty"`
 	Content     string       `json:"content"`
 	Tags        []string     `json:"tags,omitempty"`
 	Attachments []Attachment `json:"attachments,omitempty"`
+	ReplyCount  int          `json:"reply_count,omitempty"`
 	Pinned      bool         `json:"pinned"`
 	Archived    bool         `json:"archived"`
 	Deleted     bool         `json:"deleted"`
@@ -86,9 +88,39 @@ type ListFilter struct {
 	IncludeArchived bool        `json:"include_archived,omitempty"`
 	OnlyArchived    bool        `json:"only_archived,omitempty"`
 	OnlyPinned      bool        `json:"only_pinned,omitempty"`
+	OnlyDeleted     bool        `json:"only_deleted,omitempty"`
+	OnlyUntagged    bool        `json:"only_untagged,omitempty"`
+	OnlyWithImages  bool        `json:"only_with_images,omitempty"`
+	ParentID        string      `json:"parent_id,omitempty"`
+	IncludeReplies  bool        `json:"include_replies,omitempty"`
 	Limit           int         `json:"limit,omitempty"`
 	Offset          int         `json:"offset,omitempty"`
 	Cursor          *NoteCursor `json:"cursor,omitempty"`
+}
+
+// TagRenameResult reports how many notes were updated by a tag rename/merge operation.
+type TagRenameResult struct {
+	OldTag       string `json:"old_tag"`
+	NewTag       string `json:"new_tag"`
+	UpdatedNotes int    `json:"updated_notes"`
+}
+
+// BackupResult reports the outcome of a local SQLite backup run.
+type BackupResult struct {
+	BackupPath  string `json:"backup_path"`
+	BackupDir   string `json:"backup_dir"`
+	BackupCount int    `json:"backup_count"`
+	SizeBytes   int64  `json:"size_bytes"`
+	CreatedAt   int64  `json:"created_at"`
+	Skipped     bool   `json:"skipped"`
+}
+
+// BackupInfo describes a single daily backup file on disk.
+type BackupInfo struct {
+	Name      string `json:"name"`
+	Path      string `json:"path"`
+	SizeBytes int64  `json:"size_bytes"`
+	ModTime   int64  `json:"mod_time"`
 }
 
 // NotePage is a paginated slice of notes with a keyset cursor for the next page.

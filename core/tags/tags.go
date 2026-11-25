@@ -150,3 +150,50 @@ func BuildTree(counts map[string]int) []model.TagNode {
 	}
 	return out
 }
+
+// ReplacePrefix rewrites all occurrences of #oldPrefix and #oldPrefix/... in content
+// to #newPrefix (or #newPrefix/...). Returns the updated content and whether any change occurred.
+func ReplacePrefix(content, oldPrefix, newPrefix string) (string, bool) {
+	oldNorm := Normalize(oldPrefix)
+	newNorm := Normalize(newPrefix)
+	if oldNorm == "" || oldNorm == newNorm {
+		return content, false
+	}
+
+	runes := []rune(content)
+	var b strings.Builder
+	b.Grow(len(content))
+	changed := false
+	i := 0
+	for i < len(runes) {
+		if runes[i] == '#' && (i == 0 || isTagBoundary(runes[i-1])) &&
+			i+1 < len(runes) && runes[i+1] != '#' && !unicode.IsSpace(runes[i+1]) {
+			j := i + 1
+			for j < len(runes) && isTagChar(runes[j]) {
+				j++
+			}
+			raw := string(runes[i+1 : j])
+			clean := Normalize(raw)
+			if clean == oldNorm || strings.HasPrefix(clean, oldNorm+"/") {
+				suffix := strings.TrimPrefix(clean, oldNorm)
+				replaced := newNorm + suffix
+				if replaced != "" {
+					b.WriteRune('#')
+					b.WriteString(replaced)
+				}
+				changed = true
+				i = j
+				continue
+			}
+			b.WriteString(string(runes[i:j]))
+			i = j
+			continue
+		}
+		b.WriteRune(runes[i])
+		i++
+	}
+	if !changed {
+		return content, false
+	}
+	return b.String(), true
+}

@@ -139,6 +139,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(
 		return err
 	}
 	_, _ = s.db.Exec(`ALTER TABLE sync_peers ADD COLUMN pair_code TEXT NOT NULL DEFAULT ''`)
+	_, _ = s.db.Exec(`ALTER TABLE notes ADD COLUMN parent_id TEXT NOT NULL DEFAULT ''`)
+	_, _ = s.db.Exec(`CREATE INDEX IF NOT EXISTS idx_notes_parent ON notes(parent_id, deleted, created_at)`)
 	s.ensureTrigramFTS()
 	return nil
 }
@@ -409,8 +411,13 @@ func (s *Store) CleanupOrphanBlobs(minAgeSec int, dryRun bool) (*model.StorageCl
 	return res, nil
 }
 
-// CreateNote creates a new note with optional pre-saved attachments.
+// CreateNote creates a new top-level note with optional pre-saved attachments.
 func (s *Store) CreateNote(content string, attachments []model.Attachment) (*model.Note, error) {
+	return s.CreateReply("", content, attachments)
+}
+
+// CreateReply creates a new note attached to parentID (empty string for a top-level note).
+func (s *Store) CreateReply(parentID, content string, attachments []model.Attachment) (*model.Note, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -425,6 +432,7 @@ func (s *Store) CreateNote(content string, attachments []model.Attachment) (*mod
 	}
 	note := &model.Note{
 		ID:        id,
+		ParentID:  strings.TrimSpace(parentID),
 		Content:   content,
 		Tags:      tags.Extract(content),
 		CreatedAt: now,
@@ -618,9 +626,9 @@ func (s *Store) getNoteLocked(id string) (*model.Note, error) {
 	var pinned, archived, deleted int
 	var stampsRaw string
 	err := s.db.QueryRow(
-		`SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json FROM notes WHERE id = ?`,
+		`SELECT id, parent_id, content, pinned, archived, deleted, created_at, updated_at, stamps_json FROM notes WHERE id = ?`,
 		id,
-	).Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw)
+	).Scan(&n.ID, &n.ParentID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -653,15 +661,24 @@ func (s *Store) ListNotesPage(f model.ListFilter) (*model.NotePage, error) {
 
 	var where []string
 	var args []any
-	where = append(where, "n.deleted = 0")
-
-	if f.OnlyArchived {
-		where = append(where, "n.archived = 1")
-	} else if !f.IncludeArchived {
-		where = append(where, "n.archived = 0")
+	if f.OnlyDeleted {
+		where = append(where, "n.deleted = 1")
+	} else {
+		where = append(where, "n.deleted = 0")
+		if f.OnlyArchived {
+			where = append(where, "n.archived = 1")
+		} else if !f.IncludeArchived {
+			where = append(where, "n.archived = 0")
+		}
 	}
 	if f.OnlyPinned {
 		where = append(where, "n.pinned = 1")
+	}
+	if pid := strings.TrimSpace(f.ParentID); pid != "" {
+		where = append(where, "n.parent_id = ?")
+		args = append(args, pid)
+	} else if !f.IncludeReplies && !f.OnlyDeleted {
+		where = append(where, "n.parent_id = ''")
 	}
 	if f.DateFromMs > 0 {
 		where = append(where, "n.created_at >= ?")
@@ -675,8 +692,14 @@ func (s *Store) ListNotesPage(f model.ListFilter) (*model.NotePage, error) {
 		where = append(where, "EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND (nt.tag_path = ? OR nt.tag_path LIKE ?))")
 		args = append(args, tp, tp+"/%")
 	}
+	if f.OnlyUntagged {
+		where = append(where, "NOT EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id)")
+	}
+	if f.OnlyWithImages {
+		where = append(where, "EXISTS (SELECT 1 FROM note_attachments na WHERE na.note_id = n.id AND na.deleted = 0)")
+	}
 	if q := strings.TrimSpace(f.Query); q != "" {
-		if s.ftsTrigramReady && utf8.RuneCountInString(q) >= 3 {
+		if !f.OnlyDeleted && s.ftsTrigramReady && utf8.RuneCountInString(q) >= 3 {
 			where = append(where, "EXISTS (SELECT 1 FROM notes_fts f WHERE f.note_id = n.id AND f.content MATCH ?)")
 			args = append(args, quoteFTSPhrase(q))
 		} else {
@@ -685,7 +708,7 @@ func (s *Store) ListNotesPage(f model.ListFilter) (*model.NotePage, error) {
 		}
 	}
 
-	useCursor := f.Cursor != nil && f.Cursor.ID != ""
+	useCursor := f.Cursor != nil && f.Cursor.ID != "" && !f.OnlyDeleted && strings.TrimSpace(f.ParentID) == ""
 	if useCursor {
 		cp := boolInt(f.Cursor.Pinned)
 		where = append(where, "(n.pinned < ? OR (n.pinned = ? AND (n.created_at < ? OR (n.created_at = ? AND n.id < ?))))")
@@ -703,12 +726,19 @@ func (s *Store) ListNotesPage(f model.ListFilter) (*model.NotePage, error) {
 		offset = 0
 	}
 
+	orderClause := "ORDER BY n.pinned DESC, n.created_at DESC, n.id DESC"
+	if f.OnlyDeleted {
+		orderClause = "ORDER BY n.updated_at DESC, n.id DESC"
+	} else if strings.TrimSpace(f.ParentID) != "" {
+		orderClause = "ORDER BY n.created_at ASC, n.id ASC"
+	}
+
 	query := fmt.Sprintf(`
-		SELECT n.id, n.content, n.pinned, n.archived, n.deleted, n.created_at, n.updated_at, n.stamps_json
+		SELECT n.id, n.parent_id, n.content, n.pinned, n.archived, n.deleted, n.created_at, n.updated_at, n.stamps_json
 		FROM notes n
 		WHERE %s
-		ORDER BY n.pinned DESC, n.created_at DESC, n.id DESC
-		LIMIT ? OFFSET ?`, strings.Join(where, " AND "))
+		%s
+		LIMIT ? OFFSET ?`, strings.Join(where, " AND "), orderClause)
 	args = append(args, limit+1, offset)
 
 	rows, err := s.db.Query(query, args...)
@@ -722,7 +752,7 @@ func (s *Store) ListNotesPage(f model.ListFilter) (*model.NotePage, error) {
 		var n model.Note
 		var pinned, archived, deleted int
 		var stampsRaw string
-		if err := rows.Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
+		if err := rows.Scan(&n.ID, &n.ParentID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
 			return nil, err
 		}
 		n.Pinned = pinned != 0
@@ -742,12 +772,12 @@ func (s *Store) ListNotesPage(f model.ListFilter) (*model.NotePage, error) {
 		notes = notes[:limit]
 	}
 
-	if err := s.attachBatchLocked(notes); err != nil {
+	if err := s.attachBatchLocked(notes, f.OnlyDeleted); err != nil {
 		return nil, err
 	}
 
 	var nextCursor *model.NoteCursor
-	if hasMore && len(notes) > 0 {
+	if hasMore && len(notes) > 0 && !f.OnlyDeleted && strings.TrimSpace(f.ParentID) == "" {
 		last := notes[len(notes)-1]
 		nextCursor = &model.NoteCursor{
 			Pinned:    last.Pinned,
@@ -776,7 +806,7 @@ func (s *Store) GetStats(days int) (*model.Stats, error) {
 		DailyCounts: make(map[string]int),
 	}
 
-	if err := s.db.QueryRow(`SELECT COUNT(1) FROM notes WHERE deleted = 0 AND archived = 0`).Scan(&stats.TotalNotes); err != nil {
+	if err := s.db.QueryRow(`SELECT COUNT(1) FROM notes WHERE deleted = 0 AND archived = 0 AND parent_id = ''`).Scan(&stats.TotalNotes); err != nil {
 		return nil, err
 	}
 	if err := s.db.QueryRow(`
@@ -788,7 +818,7 @@ func (s *Store) GetStats(days int) (*model.Stats, error) {
 	}
 
 	var earliest sql.NullInt64
-	if err := s.db.QueryRow(`SELECT MIN(created_at) FROM notes WHERE deleted = 0 AND archived = 0 AND created_at > 0`).Scan(&earliest); err != nil {
+	if err := s.db.QueryRow(`SELECT MIN(created_at) FROM notes WHERE deleted = 0 AND archived = 0 AND parent_id = '' AND created_at > 0`).Scan(&earliest); err != nil {
 		return nil, err
 	}
 	if earliest.Valid && earliest.Int64 > 0 {
@@ -804,7 +834,7 @@ func (s *Store) GetStats(days int) (*model.Stats, error) {
 
 	now := time.Now()
 	cutoff := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location()).AddDate(0, 0, -(days - 1))
-	rows, err := s.db.Query(`SELECT created_at FROM notes WHERE deleted = 0 AND archived = 0 AND created_at >= ?`, cutoff.UnixMilli())
+	rows, err := s.db.Query(`SELECT created_at FROM notes WHERE deleted = 0 AND archived = 0 AND parent_id = '' AND created_at >= ?`, cutoff.UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -834,7 +864,7 @@ func (s *Store) ListRandomNotes(query string, limit int) ([]model.Note, error) {
 
 	var where []string
 	var args []any
-	where = append(where, "deleted = 0", "archived = 0")
+	where = append(where, "deleted = 0", "archived = 0", "parent_id = ''")
 	if q := strings.TrimSpace(query); q != "" {
 		if s.ftsTrigramReady && utf8.RuneCountInString(q) >= 3 {
 			where = append(where, "EXISTS (SELECT 1 FROM notes_fts f WHERE f.note_id = notes.id AND f.content MATCH ?)")
@@ -847,7 +877,7 @@ func (s *Store) ListRandomNotes(query string, limit int) ([]model.Note, error) {
 	args = append(args, limit)
 
 	sqlStr := fmt.Sprintf(`
-		SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
+		SELECT id, parent_id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
 		FROM notes
 		WHERE %s
 		ORDER BY RANDOM()
@@ -864,7 +894,7 @@ func (s *Store) ListRandomNotes(query string, limit int) ([]model.Note, error) {
 		var n model.Note
 		var pinned, archived, deleted int
 		var stampsRaw string
-		if err := rows.Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
+		if err := rows.Scan(&n.ID, &n.ParentID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
 			return nil, err
 		}
 		n.Pinned = pinned != 0
@@ -877,13 +907,13 @@ func (s *Store) ListRandomNotes(query string, limit int) ([]model.Note, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
-	if err := s.attachBatchLocked(notes); err != nil {
+	if err := s.attachBatchLocked(notes, false); err != nil {
 		return nil, err
 	}
 	return notes, nil
 }
 
-func (s *Store) attachBatchLocked(notes []model.Note) error {
+func (s *Store) attachBatchLocked(notes []model.Note, includeDeletedAtts bool) error {
 	if len(notes) == 0 {
 		return nil
 	}
@@ -896,22 +926,25 @@ func (s *Store) attachBatchLocked(notes []model.Note) error {
 		idxByID[notes[i].ID] = i
 	}
 
+	delCond := "deleted = 0 AND "
+	if includeDeletedAtts {
+		delCond = ""
+	}
 	q := fmt.Sprintf(`
 		SELECT id, note_id, sha256, mime, width, height, size_bytes, sort_order, deleted, updated_at
 		FROM note_attachments
-		WHERE deleted = 0 AND note_id IN (%s)
-		ORDER BY note_id ASC, sort_order ASC, id ASC`, strings.Join(placeholders, ","))
+		WHERE %snote_id IN (%s)
+		ORDER BY note_id ASC, sort_order ASC, id ASC`, delCond, strings.Join(placeholders, ","))
 
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
 		return err
 	}
-	defer rows.Close()
-
 	for rows.Next() {
 		var a model.Attachment
 		var del int
 		if err := rows.Scan(&a.ID, &a.NoteID, &a.SHA256, &a.MIME, &a.Width, &a.Height, &a.SizeBytes, &a.SortOrder, &del, &a.UpdatedAt); err != nil {
+			rows.Close()
 			return err
 		}
 		a.Deleted = del != 0
@@ -922,7 +955,34 @@ func (s *Store) attachBatchLocked(notes []model.Note) error {
 			notes[idx].Attachments = append(notes[idx].Attachments, a)
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return err
+	}
+	rows.Close()
+
+	// Batch-count active replies per note
+	rq := fmt.Sprintf(`
+		SELECT parent_id, COUNT(1)
+		FROM notes
+		WHERE deleted = 0 AND parent_id IN (%s)
+		GROUP BY parent_id`, strings.Join(placeholders, ","))
+	rRows, err := s.db.Query(rq, args...)
+	if err != nil {
+		return err
+	}
+	defer rRows.Close()
+	for rRows.Next() {
+		var pid string
+		var cnt int
+		if err := rRows.Scan(&pid, &cnt); err != nil {
+			return err
+		}
+		if idx, ok := idxByID[pid]; ok {
+			notes[idx].ReplyCount = cnt
+		}
+	}
+	return rRows.Err()
 }
 
 // CountNotesInRange counts non-deleted notes created within [fromMs, toMs].
@@ -977,11 +1037,11 @@ func (s *Store) ListChangesSincePaged(sinceMs int64, afterID string, limit int) 
 	var (nRows *sql.Rows; err error)
 	if afterID == "" {
 		nRows, err = s.db.Query(`
-			SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
+			SELECT id, parent_id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
 			FROM notes WHERE updated_at >= ? ORDER BY updated_at ASC, id ASC LIMIT ?`, sinceMs, limit+1)
 	} else {
 		nRows, err = s.db.Query(`
-			SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
+			SELECT id, parent_id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
 			FROM notes WHERE updated_at > ? OR (updated_at = ? AND id > ?) ORDER BY updated_at ASC, id ASC LIMIT ?`,
 			sinceMs, sinceMs, afterID, limit+1)
 	}
@@ -995,7 +1055,7 @@ func (s *Store) ListChangesSincePaged(sinceMs int64, afterID string, limit int) 
 		var n model.Note
 		var pinned, archived, deleted int
 		var stampsRaw string
-		if err := nRows.Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
+		if err := nRows.Scan(&n.ID, &n.ParentID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
 			return nil, nil, 0, "", false, err
 		}
 		n.Pinned = pinned != 0
@@ -1081,7 +1141,7 @@ func (s *Store) ListChangesSince(sinceMs int64) ([]model.Note, []model.Attachmen
 	defer s.mu.RUnlock()
 
 	nRows, err := s.db.Query(`
-		SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
+		SELECT id, parent_id, content, pinned, archived, deleted, created_at, updated_at, stamps_json
 		FROM notes WHERE updated_at >= ? ORDER BY updated_at ASC`, sinceMs)
 	if err != nil {
 		return nil, nil, err
@@ -1093,7 +1153,7 @@ func (s *Store) ListChangesSince(sinceMs int64) ([]model.Note, []model.Attachmen
 		var n model.Note
 		var pinned, archived, deleted int
 		var stampsRaw string
-		if err := nRows.Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
+		if err := nRows.Scan(&n.ID, &n.ParentID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw); err != nil {
 			return nil, nil, err
 		}
 		n.Pinned = pinned != 0
@@ -1201,6 +1261,11 @@ func (s *Store) MergeRemote(remoteNotes []model.Note, remoteAtts []model.Attachm
 func mergeNoteFields(local, remote model.Note) (model.Note, bool) {
 	out := local
 	changed := false
+
+	if out.ParentID == "" && remote.ParentID != "" {
+		out.ParentID = remote.ParentID
+		changed = true
+	}
 
 	if remote.CreatedAt > 0 && (out.CreatedAt == 0 || remote.CreatedAt < out.CreatedAt) {
 		out.CreatedAt = remote.CreatedAt
@@ -1311,9 +1376,9 @@ func (s *Store) getNoteTx(tx *sql.Tx, id string) (*model.Note, error) {
 	var pinned, archived, deleted int
 	var stampsRaw string
 	err := tx.QueryRow(
-		`SELECT id, content, pinned, archived, deleted, created_at, updated_at, stamps_json FROM notes WHERE id = ?`,
+		`SELECT id, parent_id, content, pinned, archived, deleted, created_at, updated_at, stamps_json FROM notes WHERE id = ?`,
 		id,
-	).Scan(&n.ID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw)
+	).Scan(&n.ID, &n.ParentID, &n.Content, &pinned, &archived, &deleted, &n.CreatedAt, &n.UpdatedAt, &stampsRaw)
 	if err != nil {
 		return nil, err
 	}
@@ -1330,9 +1395,10 @@ func (s *Store) upsertNoteTx(tx *sql.Tx, n *model.Note) error {
 		return err
 	}
 	_, err = tx.Exec(`
-		INSERT INTO notes(id, content, pinned, archived, deleted, created_at, updated_at, stamps_json)
-		VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO notes(id, parent_id, content, pinned, archived, deleted, created_at, updated_at, stamps_json)
+		VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
+			parent_id   = CASE WHEN notes.parent_id = '' THEN excluded.parent_id ELSE notes.parent_id END,
 			content     = excluded.content,
 			pinned      = excluded.pinned,
 			archived    = excluded.archived,
@@ -1340,7 +1406,7 @@ func (s *Store) upsertNoteTx(tx *sql.Tx, n *model.Note) error {
 			created_at  = excluded.created_at,
 			updated_at  = excluded.updated_at,
 			stamps_json = excluded.stamps_json`,
-		n.ID, n.Content, boolInt(n.Pinned), boolInt(n.Archived), boolInt(n.Deleted),
+		n.ID, n.ParentID, n.Content, boolInt(n.Pinned), boolInt(n.Archived), boolInt(n.Deleted),
 		n.CreatedAt, n.UpdatedAt, string(stampsBytes))
 	if err != nil {
 		return err

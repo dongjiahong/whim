@@ -17,6 +17,7 @@ swiftc -O -whole-module-optimization -parse-as-library \
   -lwhimcore \
   -framework AppKit \
   -framework SwiftUI \
+  -framework CoreImage \
   -framework Carbon \
   -framework UserNotifications \
   -framework Security \
@@ -24,6 +25,10 @@ swiftc -O -whole-module-optimization -parse-as-library \
   -lresolv \
   "$MAC_DIR/Sources/Whim/CoreBridge.swift" \
   "$MAC_DIR/Sources/Whim/DesignTokens.swift" \
+  "$MAC_DIR/Sources/Whim/QRCodeHelper.swift" \
+  "$MAC_DIR/Sources/Whim/ImageLightboxView.swift" \
+  "$MAC_DIR/Sources/Whim/NoteThreadSheet.swift" \
+  "$MAC_DIR/Sources/Whim/TagRenameSheet.swift" \
   "$MAC_DIR/Sources/Whim/InlineRichEditor.swift" \
   "$MAC_DIR/Sources/Whim/MarkdownBlockView.swift" \
   "$MAC_DIR/Sources/Whim/Updater.swift" \

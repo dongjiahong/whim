@@ -33,13 +33,14 @@ private enum MarkdownRenderCache {
         options: [.anchorsMatchLines]
     )
 
-    static func chunks(for text: String, scheme: ColorScheme) -> [MarkdownChunk] {
+    static func chunks(for text: String, scheme: ColorScheme, highlightQuery: String, taskOffset: Int) -> [MarkdownChunk] {
         let isDark = scheme == .dark
-        let key = "\(isDark ? "d" : "l")|\(text)" as NSString
+        let trimmedQ = highlightQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = "\(isDark ? "d" : "l")|\(taskOffset)|\(trimmedQ)|\(text)" as NSString
         if let hit = chunkCache.object(forKey: key) {
             return hit.chunks
         }
-        let parsed = buildChunks(text: text, scheme: scheme)
+        let parsed = buildChunks(text: text, scheme: scheme, highlightQuery: trimmedQ, taskOffset: taskOffset)
         chunkCache.setObject(MarkdownBlockBox(parsed), forKey: key)
         return parsed
     }
@@ -106,12 +107,27 @@ private enum MarkdownRenderCache {
         }
     }
 
+    private static func applySearchHighlight(to attr: inout AttributedString, query: String, scheme: ColorScheme) {
+        guard !query.isEmpty else { return }
+        let plain = String(attr.characters)
+        var searchStart = plain.startIndex
+        let bg = scheme == .dark ? Color(hex: 0xF59E0B).opacity(0.36) : Color(hex: 0xF59E0B).opacity(0.30)
+        while searchStart < plain.endIndex,
+              let range = plain.range(of: query, options: .caseInsensitive, range: searchStart..<plain.endIndex) {
+            if let attrRange = Range(range, in: attr) {
+                attr[attrRange].backgroundColor = bg
+            }
+            searchStart = range.upperBound
+        }
+    }
+
     private static func inlineAttributed(
         _ raw: String,
         size: CGFloat = 14,
         weight: Font.Weight = .regular,
         color: Color,
         scheme: ColorScheme,
+        highlightQuery: String,
         strikethrough: Bool = false
     ) -> AttributedString {
         var attr: AttributedString
@@ -127,13 +143,15 @@ private enum MarkdownRenderCache {
             attr.strikethroughStyle = .single
         }
         applyInlineTags(to: &attr, scheme: scheme)
+        applySearchHighlight(to: &attr, query: highlightQuery, scheme: scheme)
         return attr
     }
 
-    private static func buildChunks(text: String, scheme: ColorScheme) -> [MarkdownChunk] {
+    private static func buildChunks(text: String, scheme: ColorScheme, highlightQuery: String, taskOffset: Int) -> [MarkdownChunk] {
         let rawLines = text.components(separatedBy: "\n")
         var out: [MarkdownChunk] = []
         var chunkId = 0
+        var taskIdx = taskOffset
 
         let primary = FlomoPalette.textPrimary(scheme)
         let secondary = FlomoPalette.textSecondary(scheme)
@@ -197,41 +215,48 @@ private enum MarkdownRenderCache {
                 rule.foregroundColor = muted.opacity(0.45)
                 appendLine(rule)
             } else if trimmed.hasPrefix("#### ") {
-                appendLine(inlineAttributed(String(trimmed.dropFirst(5)), size: 14.5, weight: .semibold, color: primary, scheme: scheme))
+                appendLine(inlineAttributed(String(trimmed.dropFirst(5)), size: 14.5, weight: .semibold, color: primary, scheme: scheme, highlightQuery: highlightQuery))
             } else if trimmed.hasPrefix("### ") {
-                appendLine(inlineAttributed(String(trimmed.dropFirst(4)), size: 15, weight: .semibold, color: primary, scheme: scheme))
+                appendLine(inlineAttributed(String(trimmed.dropFirst(4)), size: 15, weight: .semibold, color: primary, scheme: scheme, highlightQuery: highlightQuery))
             } else if trimmed.hasPrefix("## ") {
-                appendLine(inlineAttributed(String(trimmed.dropFirst(3)), size: 16.5, weight: .bold, color: primary, scheme: scheme))
+                appendLine(inlineAttributed(String(trimmed.dropFirst(3)), size: 16.5, weight: .bold, color: primary, scheme: scheme, highlightQuery: highlightQuery))
             } else if trimmed.hasPrefix("# ") {
-                appendLine(inlineAttributed(String(trimmed.dropFirst(2)), size: 18, weight: .bold, color: primary, scheme: scheme))
+                appendLine(inlineAttributed(String(trimmed.dropFirst(2)), size: 18, weight: .bold, color: primary, scheme: scheme, highlightQuery: highlightQuery))
             } else if trimmed.hasPrefix("- [ ] ") || trimmed.hasPrefix("- [x] ") || trimmed.hasPrefix("- [X] ") {
                 let done = !trimmed.hasPrefix("- [ ] ")
-                var row = AttributedString("\(indentStr)\(done ? "☑" : "☐") ")
-                row.font = .system(size: 14)
-                row.foregroundColor = done ? accent : muted
-                row.append(inlineAttributed(String(trimmed.dropFirst(6)), color: done ? secondary : primary, scheme: scheme, strikethrough: done))
+                let currentTaskIdx = taskIdx
+                taskIdx += 1
+                var row = AttributedString(indentStr)
+                var box = AttributedString(done ? "☑ " : "☐ ")
+                box.font = .system(size: 14.5)
+                box.foregroundColor = done ? accent : muted
+                if let url = URL(string: "whim-task://toggle/\(currentTaskIdx)") {
+                    box.link = url
+                }
+                row.append(box)
+                row.append(inlineAttributed(String(trimmed.dropFirst(6)), color: done ? secondary : primary, scheme: scheme, highlightQuery: highlightQuery, strikethrough: done))
                 appendLine(row)
             } else if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") {
                 var row = AttributedString("\(indentStr)\(bulletSymbol(for: level)) ")
                 row.font = .system(size: 14, weight: .bold)
                 row.foregroundColor = secondary
-                row.append(inlineAttributed(String(trimmed.dropFirst(2)), color: primary, scheme: scheme))
+                row.append(inlineAttributed(String(trimmed.dropFirst(2)), color: primary, scheme: scheme, highlightQuery: highlightQuery))
                 appendLine(row)
             } else if let (num, bodyText) = parseOrderedList(trimmed) {
                 var row = AttributedString("\(indentStr)\(num). ")
                 row.font = .system(size: 13.5).monospacedDigit()
                 row.foregroundColor = secondary
-                row.append(inlineAttributed(bodyText, color: primary, scheme: scheme))
+                row.append(inlineAttributed(bodyText, color: primary, scheme: scheme, highlightQuery: highlightQuery))
                 appendLine(row)
             } else if trimmed.hasPrefix("> ") {
                 var row = AttributedString("\(indentStr)▎ ")
                 row.font = .system(size: 14, weight: .semibold)
                 row.foregroundColor = accent.opacity(0.8)
-                row.append(inlineAttributed(String(trimmed.dropFirst(2)), color: secondary, scheme: scheme))
+                row.append(inlineAttributed(String(trimmed.dropFirst(2)), color: secondary, scheme: scheme, highlightQuery: highlightQuery))
                 appendLine(row)
             } else {
                 var row = indentStr.isEmpty ? AttributedString() : AttributedString(indentStr)
-                row.append(inlineAttributed(trimmed, color: primary, scheme: scheme))
+                row.append(inlineAttributed(trimmed, color: primary, scheme: scheme, highlightQuery: highlightQuery))
                 appendLine(row)
             }
         }
@@ -245,19 +270,70 @@ private enum MarkdownRenderCache {
     }
 }
 
-/// High-performance Markdown renderer: keeps `#tag/subtag` inline at its exact original position
-/// with blue tag highlight and click-to-filter support.
+/// Counts how many markdown task items (`- [ ] ` / `- [x] `) exist in a text block.
+func countMarkdownTasks(in text: String) -> Int {
+    var count = 0
+    var inCode = false
+    for line in text.components(separatedBy: "\n") {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("```") {
+            inCode.toggle()
+            continue
+        }
+        if !inCode && (trimmed.hasPrefix("- [ ] ") || trimmed.hasPrefix("- [x] ") || trimmed.hasPrefix("- [X] ")) {
+            count += 1
+        }
+    }
+    return count
+}
+
+/// Toggles the N-th markdown task checkbox in full note content and returns the updated markdown.
+func toggleMarkdownTask(in content: String, index targetIndex: Int) -> String? {
+    var lines = content.components(separatedBy: "\n")
+    var idx = 0
+    var inCode = false
+    for i in lines.indices {
+        let trimmed = lines[i].trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("```") {
+            inCode.toggle()
+            continue
+        }
+        if inCode { continue }
+        if trimmed.hasPrefix("- [ ] ") || trimmed.hasPrefix("- [x] ") || trimmed.hasPrefix("- [X] ") {
+            if idx == targetIndex {
+                if let range = lines[i].range(of: "- [ ] ") {
+                    lines[i].replaceSubrange(range, with: "- [x] ")
+                } else if let range = lines[i].range(of: "- [x] ") {
+                    lines[i].replaceSubrange(range, with: "- [ ] ")
+                } else if let range = lines[i].range(of: "- [X] ") {
+                    lines[i].replaceSubrange(range, with: "- [ ] ")
+                }
+                return lines.joined(separator: "\n")
+            }
+            idx += 1
+        }
+    }
+    return nil
+}
+
+/// High-performance Markdown renderer: keeps `#tag/subtag` inline with click-to-filter,
+/// supports interactive task checkboxes and search keyword highlighting.
 struct MarkdownBlockView: View, Equatable {
     @Environment(\.colorScheme) private var scheme
     let text: String
+    var highlightQuery: String = ""
+    var taskOffset: Int = 0
     var onTapTag: ((String) -> Void)? = nil
+    var onToggleTask: ((Int) -> Void)? = nil
 
     static func == (lhs: MarkdownBlockView, rhs: MarkdownBlockView) -> Bool {
-        lhs.text == rhs.text
+        lhs.text == rhs.text &&
+        lhs.highlightQuery == rhs.highlightQuery &&
+        lhs.taskOffset == rhs.taskOffset
     }
 
     var body: some View {
-        let chunks = MarkdownRenderCache.chunks(for: text, scheme: scheme)
+        let chunks = MarkdownRenderCache.chunks(for: text, scheme: scheme, highlightQuery: highlightQuery, taskOffset: taskOffset)
         VStack(alignment: .leading, spacing: 6) {
             ForEach(chunks) { chunk in
                 switch chunk {
@@ -272,6 +348,13 @@ struct MarkdownBlockView: View, Equatable {
                                 let decoded = rawPath.removingPercentEncoding ?? rawPath
                                 if !decoded.isEmpty {
                                     onTapTag?(decoded)
+                                }
+                                return .handled
+                            }
+                            if url.scheme == "whim-task" {
+                                let rawIdx = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                                if let idx = Int(rawIdx) {
+                                    onToggleTask?(idx)
                                 }
                                 return .handled
                             }

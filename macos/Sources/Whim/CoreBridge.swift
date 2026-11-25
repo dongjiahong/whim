@@ -28,9 +28,11 @@ struct WhimAttachment: Codable, Identifiable, Equatable {
 
 struct WhimNote: Codable, Identifiable, Equatable {
     let id: String
+    let parentId: String?
     let content: String
     let tags: [String]?
     let attachments: [WhimAttachment]?
+    let replyCount: Int?
     let pinned: Bool
     let archived: Bool
     let deleted: Bool
@@ -39,6 +41,8 @@ struct WhimNote: Codable, Identifiable, Equatable {
 
     enum CodingKeys: String, CodingKey {
         case id, content, tags, attachments, pinned, archived, deleted
+        case parentId = "parent_id"
+        case replyCount = "reply_count"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
     }
@@ -261,6 +265,50 @@ struct StorageCleanupResult: Codable {
     }
 }
 
+struct TagRenameResult: Codable {
+    let oldTag: String
+    let newTag: String
+    let updatedNotes: Int
+
+    enum CodingKeys: String, CodingKey {
+        case oldTag = "old_tag"
+        case newTag = "new_tag"
+        case updatedNotes = "updated_notes"
+    }
+}
+
+struct BackupResult: Codable {
+    let backupPath: String
+    let backupDir: String
+    let backupCount: Int
+    let sizeBytes: Int64
+    let createdAt: Int64
+    let skipped: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case backupPath = "backup_path"
+        case backupDir = "backup_dir"
+        case backupCount = "backup_count"
+        case sizeBytes = "size_bytes"
+        case createdAt = "created_at"
+        case skipped
+    }
+}
+
+struct BackupInfo: Codable, Identifiable, Equatable {
+    var id: String { path }
+    let name: String
+    let path: String
+    let sizeBytes: Int64
+    let modTime: Int64
+
+    enum CodingKeys: String, CodingKey {
+        case name, path
+        case sizeBytes = "size_bytes"
+        case modTime = "mod_time"
+    }
+}
+
 private struct Envelope<T: Decodable>: Decodable {
     let ok: Bool
     let data: T?
@@ -386,6 +434,10 @@ final class CoreBridge {
         dateToMs: Int64 = 0,
         includeArchived: Bool = false,
         onlyArchived: Bool = false,
+        onlyDeleted: Bool = false,
+        onlyUntagged: Bool = false,
+        onlyWithImages: Bool = false,
+        parentId: String = "",
         limit: Int = 50,
         cursor: WhimNoteCursor? = nil
     ) throws -> WhimNotePage {
@@ -394,8 +446,12 @@ final class CoreBridge {
             "tag_prefix": tagPrefix,
             "include_archived": includeArchived,
             "only_archived": onlyArchived,
+            "only_deleted": onlyDeleted,
+            "only_untagged": onlyUntagged,
+            "only_with_images": onlyWithImages,
             "limit": limit
         ]
+        if !parentId.isEmpty { filter["parent_id"] = parentId }
         if dateFromMs > 0 { filter["date_from_ms"] = dateFromMs }
         if dateToMs > 0 { filter["date_to_ms"] = dateToMs }
         if let cursor {
@@ -502,5 +558,64 @@ final class CoreBridge {
 
     func cleanupOrphanBlobs(minAgeSec: Int32 = 0, dryRun: Bool = false) throws -> StorageCleanupResult {
         try decodeCString(WhimCleanupOrphanBlobs(minAgeSec, dryRun ? 1 : 0), as: StorageCleanupResult.self)
+    }
+
+    func createReply(parentId: String, content: String, attachments: [WhimAttachment] = []) throws -> WhimNote {
+        let attData = try JSONEncoder().encode(attachments)
+        let attStr = String(data: attData, encoding: .utf8) ?? "[]"
+        return try parentId.withCString { cParent in
+            try content.withCString { cContent in
+                try attStr.withCString { cAtt in
+                    try decodeCString(
+                        WhimCreateReply(
+                            UnsafeMutablePointer(mutating: cParent),
+                            UnsafeMutablePointer(mutating: cContent),
+                            UnsafeMutablePointer(mutating: cAtt)
+                        ),
+                        as: WhimNote.self
+                    )
+                }
+            }
+        }
+    }
+
+    func listReplies(parentId: String) throws -> [WhimNote] {
+        try parentId.withCString { cParent in
+            try decodeCString(WhimListReplies(UnsafeMutablePointer(mutating: cParent)), as: [WhimNote].self)
+        }
+    }
+
+    func purgeNote(id: String) throws {
+        _ = try id.withCString { cId in
+            try decodeCString(WhimPurgeNote(UnsafeMutablePointer(mutating: cId)), as: String.self)
+        }
+    }
+
+    @discardableResult
+    func purgeOldDeleted(olderThanDays: Int32 = 0) throws -> Int {
+        try decodeCString(WhimPurgeOldDeleted(olderThanDays), as: Int.self)
+    }
+
+    func renameTag(oldPrefix: String, newPrefix: String) throws -> TagRenameResult {
+        try oldPrefix.withCString { cOld in
+            try newPrefix.withCString { cNew in
+                try decodeCString(
+                    WhimRenameTag(UnsafeMutablePointer(mutating: cOld), UnsafeMutablePointer(mutating: cNew)),
+                    as: TagRenameResult.self
+                )
+            }
+        }
+    }
+
+    func backupDatabase(keepDays: Int32 = 7, force: Bool = false) throws -> BackupResult {
+        try decodeCString(WhimBackupDatabase(keepDays, force ? 1 : 0), as: BackupResult.self)
+    }
+
+    func listBackups() throws -> [BackupInfo] {
+        try decodeCString(WhimListBackups(), as: [BackupInfo].self)
+    }
+
+    func getLocalAddr() throws -> String {
+        try decodeCString(WhimGetLocalAddr(), as: String.self)
     }
 }

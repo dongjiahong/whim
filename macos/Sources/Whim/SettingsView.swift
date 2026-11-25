@@ -336,6 +336,64 @@ struct SettingsModalView: View {
                 }
             }
 
+            // Daily Automatic Local Backup Card
+            settingsCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    HStack(alignment: .top) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("每日自动备份")
+                                .font(.system(size: 14, weight: .semibold))
+                                .foregroundColor(FlomoPalette.textPrimary(scheme))
+                            Text("启动时自动创建 WAL 安全快照，滚动保留最近 7 天")
+                                .font(.system(size: 12))
+                                .foregroundColor(FlomoPalette.textSecondary(scheme))
+                        }
+                        Spacer()
+                        Text("已存 \(vm.backups.count) 份")
+                            .font(.system(size: 12, weight: .semibold).monospacedDigit())
+                            .foregroundColor(FlomoPalette.accent(scheme))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 3)
+                            .background(Capsule().fill(FlomoPalette.accentSoft(scheme)))
+                    }
+
+                    if let latest = vm.backups.first {
+                        HStack(spacing: 8) {
+                            Image(systemName: "checkmark.shield.fill")
+                                .font(.system(size: 12))
+                                .foregroundColor(FlomoPalette.accent(scheme))
+                            Text("最近备份：\(latest.name)（\(formatBytes(latest.sizeBytes))）")
+                                .font(.system(size: 11.5, design: .monospaced))
+                                .foregroundColor(FlomoPalette.textSecondary(scheme))
+                        }
+                    }
+
+                    HStack(spacing: 10) {
+                        WhimSecondaryButton(
+                            title: vm.isBackingUp ? "备份中..." : "立即备份",
+                            icon: "externaldrive.badge.plus",
+                            compact: true
+                        ) {
+                            vm.runBackup(force: true)
+                        }
+                        .disabled(vm.isBackingUp)
+
+                        WhimSecondaryButton(title: "打开备份目录", icon: "folder", compact: true) {
+                            let dir = whimDataDirectory().appendingPathComponent("backups", isDirectory: true)
+                            try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+                            NSWorkspace.shared.open(dir)
+                        }
+                        Spacer()
+                    }
+
+                    if !vm.backupStatusMsg.isEmpty {
+                        Text(vm.backupStatusMsg)
+                            .font(.system(size: 11.5))
+                            .foregroundColor(FlomoPalette.accent(scheme))
+                    }
+                }
+            }
+
             // Dev Sample Data
             settingsCard {
                 HStack(spacing: 12) {
@@ -701,50 +759,73 @@ struct SettingsModalView: View {
                         }
                     }
 
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(vm.pairCode, forType: .string)
-                        copiedLocalCode = true
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { copiedLocalCode = false }
-                    } label: {
-                        VStack(spacing: 8) {
-                            HStack(spacing: 8) {
-                                ForEach(0..<6, id: \.self) { idx in
-                                    let ch = idx < digits.count ? String(digits[idx]) : "-"
-                                    Text(ch)
-                                        .font(.system(size: 24, weight: .bold, design: .monospaced))
-                                        .foregroundColor(FlomoPalette.textPrimary(scheme))
-                                        .frame(width: 40, height: 46)
-                                        .background(
-                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                                .fill(FlomoPalette.canvas(scheme))
-                                        )
-                                        .overlay(
-                                            RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                                .stroke(
-                                                    copiedLocalCode ? FlomoPalette.accent(scheme) : FlomoPalette.borderStrong(scheme),
-                                                    lineWidth: copiedLocalCode ? 1.5 : 1
-                                                )
-                                        )
-                                    if idx == 2 {
-                                        Spacer().frame(width: 8)
+                    HStack(spacing: 16) {
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(vm.pairCode, forType: .string)
+                            copiedLocalCode = true
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { copiedLocalCode = false }
+                        } label: {
+                            VStack(spacing: 8) {
+                                HStack(spacing: 6) {
+                                    ForEach(0..<6, id: \.self) { idx in
+                                        let ch = idx < digits.count ? String(digits[idx]) : "-"
+                                        Text(ch)
+                                            .font(.system(size: 22, weight: .bold, design: .monospaced))
+                                            .foregroundColor(FlomoPalette.textPrimary(scheme))
+                                            .frame(width: 34, height: 44)
+                                            .background(
+                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                    .fill(FlomoPalette.canvas(scheme))
+                                            )
+                                            .overlay(
+                                                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                                    .stroke(
+                                                        copiedLocalCode ? FlomoPalette.accent(scheme) : FlomoPalette.borderStrong(scheme),
+                                                        lineWidth: copiedLocalCode ? 1.5 : 1
+                                                    )
+                                            )
+                                        if idx == 2 {
+                                            Spacer().frame(width: 4)
+                                        }
                                     }
                                 }
-                            }
 
-                            HStack(spacing: 5) {
-                                Image(systemName: copiedLocalCode ? "checkmark.circle.fill" : "doc.on.doc")
-                                    .font(.system(size: 11.5))
-                                Text(copiedLocalCode ? "已复制到剪贴板" : "点击复制本机 6 位配对码")
-                                    .font(.system(size: 12, weight: .medium))
+                                HStack(spacing: 5) {
+                                    Image(systemName: copiedLocalCode ? "checkmark.circle.fill" : "doc.on.doc")
+                                        .font(.system(size: 11.5))
+                                    Text(copiedLocalCode ? "已复制到剪贴板" : "点击复制配对码")
+                                        .font(.system(size: 11.5, weight: .medium))
+                                }
+                                .foregroundColor(copiedLocalCode ? FlomoPalette.accent(scheme) : FlomoPalette.tagText(scheme))
+
+                                if !vm.localAddr.isEmpty {
+                                    Text(vm.localAddr)
+                                        .font(.system(size: 10.5, design: .monospaced))
+                                        .foregroundColor(FlomoPalette.textMuted(scheme))
+                                }
                             }
-                            .foregroundColor(copiedLocalCode ? FlomoPalette.accent(scheme) : FlomoPalette.tagText(scheme))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 8)
+                            .whimClickable(cornerRadius: 10, hoverFill: true)
                         }
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 8)
-                        .whimClickable(cornerRadius: 10, hoverFill: true)
+                        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 10))
+
+                        if !vm.localAddr.isEmpty && digits.count == 6,
+                           let qrImg = QRCodeHelper.generate(from: "whim://pair?addr=\(vm.localAddr)&code=\(vm.pairCode)", size: 160) {
+                            VStack(spacing: 5) {
+                                Image(nsImage: qrImg)
+                                    .interpolation(.none)
+                                    .resizable()
+                                    .frame(width: 96, height: 96)
+                                    .padding(6)
+                                    .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white))
+                                Text("手机扫码配对")
+                                    .font(.system(size: 10.5))
+                                    .foregroundColor(FlomoPalette.textMuted(scheme))
+                            }
+                        }
                     }
-                    .buttonStyle(WhimTactileButtonStyle(cornerRadius: 10))
                 }
             }
 

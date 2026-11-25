@@ -7,6 +7,7 @@ enum SidebarTab: Equatable {
     case review
     case random
     case archived
+    case trash
     case day(String) // YYYY-MM-DD from heatmap click
     case tag(String)
 }
@@ -92,6 +93,13 @@ final class WhimStoreVM: ObservableObject {
     @Published var ignoredPeerIDs: Set<String> = Set(UserDefaults.standard.stringArray(forKey: "whim.sync.ignoredPeers") ?? [])
     @Published var reviewReminders: [ReviewReminder] = WhimStoreVM.loadStoredReminders()
     @Published var reviewNotificationStatus: String = ""
+    @Published var filterUntagged: Bool = false
+    @Published var filterWithImages: Bool = false
+    @Published var filterDateRangeDays: Int = 0
+    @Published var localAddr: String = ""
+    @Published var backups: [BackupInfo] = []
+    @Published var backupStatusMsg: String = ""
+    @Published var isBackingUp: Bool = false
 
     private static let remindersStorageKey = "whim.review.reminders.v2"
 
@@ -146,6 +154,7 @@ final class WhimStoreVM: ObservableObject {
             try CoreBridge.shared.initialize()
             let port = try CoreBridge.shared.startPeerServer(port: 8788)
             pairCode = (try? CoreBridge.shared.getPairCode()) ?? ""
+            localAddr = (try? CoreBridge.shared.getLocalAddr()) ?? ""
             syncMessage = "局域网监听 :\(port)"
             seedSampleNotesIfEmpty()
             reload()
@@ -153,6 +162,7 @@ final class WhimStoreVM: ObservableObject {
             startAutoSyncTimer()
             startSyncHealthMonitor()
             syncNow()
+            runBackup(force: false)
         } catch {
             syncMessage = "初始化失败: \(error.localizedDescription)"
         }
@@ -198,6 +208,9 @@ final class WhimStoreVM: ObservableObject {
         let query = searchQuery
         let revDate = reviewDate
         let limit = pageSize
+        let untagged = filterUntagged
+        let withImages = filterWithImages
+        let rangeDays = filterDateRangeDays
         nextCursor = nil
         hasMore = false
         isLoadingMore = false
@@ -206,6 +219,10 @@ final class WhimStoreVM: ObservableObject {
             reshuffleRandom()
             return
         }
+
+        let rangeFromMs: Int64 = rangeDays > 0
+            ? Int64(Calendar.current.date(byAdding: .day, value: -rangeDays, to: Date())!.timeIntervalSince1970 * 1000)
+            : 0
 
         let dayRange: (Int64, Int64)? = { () -> (Int64, Int64)? in
             switch tab {
@@ -228,7 +245,13 @@ final class WhimStoreVM: ObservableObject {
                 let page: WhimNotePage
                 switch tab {
                 case .all:
-                    page = try CoreBridge.shared.listNotesPage(query: query, limit: limit)
+                    page = try CoreBridge.shared.listNotesPage(
+                        query: query,
+                        dateFromMs: rangeFromMs,
+                        onlyUntagged: untagged,
+                        onlyWithImages: withImages,
+                        limit: limit
+                    )
                 case .review, .day:
                     if let (fromMs, toMs) = dayRange {
                         page = try CoreBridge.shared.listNotesPage(
@@ -242,9 +265,28 @@ final class WhimStoreVM: ObservableObject {
                         page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
                     }
                 case .archived:
-                    page = try CoreBridge.shared.listNotesPage(query: query, onlyArchived: true, limit: limit)
+                    page = try CoreBridge.shared.listNotesPage(
+                        query: query,
+                        dateFromMs: rangeFromMs,
+                        onlyArchived: true,
+                        onlyUntagged: untagged,
+                        onlyWithImages: withImages,
+                        limit: limit
+                    )
+                case .trash:
+                    page = try CoreBridge.shared.listNotesPage(
+                        query: query,
+                        onlyDeleted: true,
+                        limit: 200
+                    )
                 case .tag(let path):
-                    page = try CoreBridge.shared.listNotesPage(query: query, tagPrefix: path, limit: limit)
+                    page = try CoreBridge.shared.listNotesPage(
+                        query: query,
+                        tagPrefix: path,
+                        dateFromMs: rangeFromMs,
+                        onlyWithImages: withImages,
+                        limit: limit
+                    )
                 case .random:
                     page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
                 }
@@ -264,13 +306,19 @@ final class WhimStoreVM: ObservableObject {
     }
 
     func loadMore() {
-        guard hasMore, !isLoadingMore, let cursor = nextCursor, activeTab != .random else { return }
+        guard hasMore, !isLoadingMore, let cursor = nextCursor, activeTab != .random, activeTab != .trash else { return }
         isLoadingMore = true
         let gen = filterRequestGen
         let tab = activeTab
         let query = searchQuery
         let revDate = reviewDate
         let limit = pageSize
+        let untagged = filterUntagged
+        let withImages = filterWithImages
+        let rangeDays = filterDateRangeDays
+        let rangeFromMs: Int64 = rangeDays > 0
+            ? Int64(Calendar.current.date(byAdding: .day, value: -rangeDays, to: Date())!.timeIntervalSince1970 * 1000)
+            : 0
 
         let dayRange: (Int64, Int64)? = { () -> (Int64, Int64)? in
             switch tab {
@@ -293,7 +341,14 @@ final class WhimStoreVM: ObservableObject {
                 let page: WhimNotePage
                 switch tab {
                 case .all:
-                    page = try CoreBridge.shared.listNotesPage(query: query, limit: limit, cursor: cursor)
+                    page = try CoreBridge.shared.listNotesPage(
+                        query: query,
+                        dateFromMs: rangeFromMs,
+                        onlyUntagged: untagged,
+                        onlyWithImages: withImages,
+                        limit: limit,
+                        cursor: cursor
+                    )
                 case .review, .day:
                     if let (fromMs, toMs) = dayRange {
                         page = try CoreBridge.shared.listNotesPage(
@@ -308,9 +363,26 @@ final class WhimStoreVM: ObservableObject {
                         page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
                     }
                 case .archived:
-                    page = try CoreBridge.shared.listNotesPage(query: query, onlyArchived: true, limit: limit, cursor: cursor)
+                    page = try CoreBridge.shared.listNotesPage(
+                        query: query,
+                        dateFromMs: rangeFromMs,
+                        onlyArchived: true,
+                        onlyUntagged: untagged,
+                        onlyWithImages: withImages,
+                        limit: limit,
+                        cursor: cursor
+                    )
+                case .trash:
+                    page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
                 case .tag(let path):
-                    page = try CoreBridge.shared.listNotesPage(query: query, tagPrefix: path, limit: limit, cursor: cursor)
+                    page = try CoreBridge.shared.listNotesPage(
+                        query: query,
+                        tagPrefix: path,
+                        dateFromMs: rangeFromMs,
+                        onlyWithImages: withImages,
+                        limit: limit,
+                        cursor: cursor
+                    )
                 case .random:
                     page = WhimNotePage(notes: [], hasMore: false, nextCursor: nil)
                 }
@@ -425,6 +497,103 @@ final class WhimStoreVM: ObservableObject {
         _ = try? CoreBridge.shared.updateNote(id: id, deleted: false)
         reload()
         syncNow()
+    }
+
+    var hasQuickFilters: Bool {
+        filterUntagged || filterWithImages || filterDateRangeDays > 0
+    }
+
+    func resetQuickFilters() {
+        filterUntagged = false
+        filterWithImages = false
+        filterDateRangeDays = 0
+        applyFilter()
+    }
+
+    func toggleTaskCheckbox(_ note: WhimNote, taskIndex: Int) {
+        guard let updated = toggleMarkdownTask(in: note.content, index: taskIndex) else { return }
+        editNote(id: note.id, content: updated, attachments: note.attachments ?? [])
+    }
+
+    func restoreNote(_ note: WhimNote) {
+        _ = try? CoreBridge.shared.updateNote(id: note.id, deleted: false)
+        reload()
+        syncNow()
+    }
+
+    func purgeNote(_ note: WhimNote) {
+        try? CoreBridge.shared.purgeNote(id: note.id)
+        reload()
+    }
+
+    func emptyTrash() {
+        _ = try? CoreBridge.shared.purgeOldDeleted(olderThanDays: 0)
+        reload()
+    }
+
+    func renameTag(oldPrefix: String, newPrefix: String) {
+        ioQueue.async { [weak self] in
+            let res = try? CoreBridge.shared.renameTag(oldPrefix: oldPrefix, newPrefix: newPrefix)
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if let res {
+                    if case .tag(let current) = self.activeTab, current == res.oldTag || current.hasPrefix(res.oldTag + "/") {
+                        let suffix = String(current.dropFirst(res.oldTag.count))
+                        self.activeTab = .tag(res.newTag + suffix)
+                    }
+                    self.syncMessage = "已将 #\(res.oldTag) 迁移为 #\(res.newTag)（更新 \(res.updatedNotes) 条笔记）"
+                    self.reload()
+                    if res.updatedNotes > 0 { self.syncNow() }
+                }
+            }
+        }
+    }
+
+    func loadReplies(parentId: String, completion: @escaping ([WhimNote]) -> Void) {
+        ioQueue.async {
+            let items = (try? CoreBridge.shared.listReplies(parentId: parentId)) ?? []
+            DispatchQueue.main.async { completion(items) }
+        }
+    }
+
+    func createReply(parentId: String, content: String, completion: @escaping (WhimNote?) -> Void) {
+        ioQueue.async { [weak self] in
+            let created = try? CoreBridge.shared.createReply(parentId: parentId, content: content)
+            DispatchQueue.main.async { [weak self] in
+                if created != nil {
+                    self?.reload()
+                    self?.syncNow()
+                }
+                completion(created)
+            }
+        }
+    }
+
+    func runBackup(force: Bool) {
+        guard !isBackingUp else { return }
+        isBackingUp = true
+        if force { backupStatusMsg = "正在创建本地备份..." }
+        ioQueue.async { [weak self] in
+            let res = try? CoreBridge.shared.backupDatabase(keepDays: 7, force: force)
+            let list = (try? CoreBridge.shared.listBackups()) ?? []
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.isBackingUp = false
+                self.backups = list
+                if force, let res {
+                    self.backupStatusMsg = "备份完成：\(URL(fileURLWithPath: res.backupPath).lastPathComponent)"
+                }
+            }
+        }
+    }
+
+    func refreshBackups() {
+        ioQueue.async { [weak self] in
+            let list = (try? CoreBridge.shared.listBackups()) ?? []
+            DispatchQueue.main.async { [weak self] in
+                self?.backups = list
+            }
+        }
     }
 
     private func startAutoSyncTimer() {
@@ -1268,7 +1437,10 @@ struct MainContentView: View {
     @ObservedObject private var updater = GitHubUpdater.shared
     @State private var showSettingsSheet: Bool = false
     @State private var settingsInitialSection: SettingsSection = .general
-    @State private var previewImagePath: String? = nil
+    @State private var lightboxState: ImageLightboxState? = nil
+    @State private var threadParentNote: WhimNote? = nil
+    @State private var renamingTagPath: String? = nil
+    @State private var showEmptyTrashConfirm: Bool = false
     @State private var editingNoteId: String? = nil
     @State private var mainWindowPinned: Bool = false
     @FocusState private var searchFocused: Bool
@@ -1336,6 +1508,10 @@ struct MainContentView: View {
                             vm.activeTab = .archived
                             vm.applyFilter()
                         }
+                        navRow(icon: "trash", title: "最近删除", active: vm.activeTab == .trash) {
+                            vm.activeTab = .trash
+                            vm.applyFilter()
+                        }
                     }
 
                     Text("全部标签")
@@ -1347,10 +1523,18 @@ struct MainContentView: View {
                     ScrollView(showsIndicators: false) {
                         VStack(alignment: .leading, spacing: 2) {
                             ForEach(vm.tagTree) { node in
-                                FlomoTagRow(node: node, depth: 0, activeTab: vm.activeTab) { path in
-                                    vm.activeTab = .tag(path)
-                                    vm.applyFilter()
-                                }
+                                FlomoTagRow(
+                                    node: node,
+                                    depth: 0,
+                                    activeTab: vm.activeTab,
+                                    onSelect: { path in
+                                        vm.activeTab = .tag(path)
+                                        vm.applyFilter()
+                                    },
+                                    onRenameTag: { path in
+                                        renamingTagPath = path
+                                    }
+                                )
                             }
                         }
                     }
@@ -1441,6 +1625,20 @@ struct MainContentView: View {
                             .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
                         }
 
+                        if vm.activeTab == .trash && !vm.displayedNotes.isEmpty {
+                            WhimSecondaryButton(title: "清空回收站", icon: "trash", destructive: true, compact: true) {
+                                showEmptyTrashConfirm = true
+                            }
+                            .alert("清空最近删除？", isPresented: $showEmptyTrashConfirm) {
+                                Button("取消", role: .cancel) {}
+                                Button("彻底清空", role: .destructive) {
+                                    vm.emptyTrash()
+                                }
+                            } message: {
+                                Text("回收站中的所有笔记将被永久删除，无法恢复。")
+                            }
+                        }
+
                         Spacer()
 
                         HStack(spacing: 6) {
@@ -1514,6 +1712,12 @@ struct MainContentView: View {
                     .padding(.top, 14)
                     .padding(.horizontal, 10)
 
+                    // Quick Filter Bar (All / Tag / Archived)
+                    if vm.activeTab == .all || vm.activeTab == .archived || { if case .tag = vm.activeTab { return true }; return false }() {
+                        quickFilterBar
+                            .padding(.horizontal, 10)
+                    }
+
                     if vm.activeTab == .review || vm.activeTab == .random {
                         VStack(spacing: 14) {
                             if vm.activeTab == .review {
@@ -1532,7 +1736,7 @@ struct MainContentView: View {
                                     vm.activeTab = .tag(path)
                                     vm.applyFilter()
                                 },
-                                onTapImage: { path in previewImagePath = path },
+                                onTapImages: { paths, idx in lightboxState = ImageLightboxState(paths: paths, initialIndex: idx) },
                                 onReshuffle: { vm.reshuffleRandom() }
                             )
                         }
@@ -1550,7 +1754,7 @@ struct MainContentView: View {
                                 .listRowBackground(Color.clear)
                                 .listRowInsets(EdgeInsets())
 
-                            if vm.activeTab != .archived {
+                            if vm.activeTab != .archived && vm.activeTab != .trash {
                                 FlomoComposerView(vm: vm)
                                     .listRowSeparator(.hidden)
                                     .listRowBackground(Color.clear)
@@ -1559,17 +1763,25 @@ struct MainContentView: View {
 
                             if vm.displayedNotes.isEmpty {
                                 VStack(spacing: 8) {
-                                    Text(vm.searchQuery.isEmpty ? "暂无记录" : "未找到匹配“\(vm.searchQuery)”的笔记")
+                                    Text(
+                                        vm.activeTab == .trash
+                                            ? "最近删除为空"
+                                            : (vm.searchQuery.isEmpty ? "暂无记录" : "未找到匹配“\(vm.searchQuery)”的笔记")
+                                    )
                                         .font(.system(size: 14))
                                         .foregroundColor(FlomoPalette.textMuted(scheme))
-                                    if vm.searchQuery.isEmpty {
+                                    if vm.activeTab == .trash {
+                                        Text("删除的笔记会保留在这里，可随时恢复或彻底清理")
+                                            .font(.system(size: 12))
+                                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                                    } else if vm.searchQuery.isEmpty && !vm.hasQuickFilters {
                                         Text("在上方输入框记下想法（支持 ⌘V 光标处贴图），或随时按 ⌘⇧J 呼出悬浮速记")
                                             .font(.system(size: 12))
                                             .foregroundColor(FlomoPalette.textMuted(scheme))
                                     } else {
-                                        Button("清除搜索") {
+                                        Button("清除搜索与筛选") {
                                             vm.searchQuery = ""
-                                            vm.applyFilter()
+                                            vm.resetQuickFilters()
                                         }
                                         .buttonStyle(.plain)
                                         .font(.system(size: 12.5))
@@ -1588,22 +1800,28 @@ struct MainContentView: View {
 
                                 ForEach(notes) { note in
                                     Group {
-                                        if editingNoteId == note.id {
+                                        if editingNoteId == note.id && vm.activeTab != .trash {
                                             FlomoComposerView(vm: vm, editingNote: note) {
                                                 editingNoteId = nil
                                             }
                                         } else {
                                             FlomoNoteCard(
                                                 note: note,
+                                                highlightQuery: vm.searchQuery,
+                                                isTrashMode: vm.activeTab == .trash,
                                                 onTapTag: { path in
                                                     vm.activeTab = .tag(path)
                                                     vm.applyFilter()
                                                 },
-                                                onTapImage: { path in previewImagePath = path },
+                                                onTapImages: { paths, idx in lightboxState = ImageLightboxState(paths: paths, initialIndex: idx) },
+                                                onToggleTask: { taskIdx in vm.toggleTaskCheckbox(note, taskIndex: taskIdx) },
+                                                onOpenThread: { threadParentNote = note },
                                                 onEdit: { editingNoteId = note.id },
                                                 onPin: { vm.togglePin(note) },
                                                 onArchive: { vm.toggleArchive(note) },
-                                                onDelete: { vm.deleteNote(note) }
+                                                onDelete: { vm.deleteNote(note) },
+                                                onRestore: { vm.restoreNote(note) },
+                                                onPurge: { vm.purgeNote(note) }
                                             )
                                         }
                                     }
@@ -1701,27 +1919,36 @@ struct MainContentView: View {
         .onAppear {
             GitHubUpdater.shared.silentCheckOnLaunch()
         }
-        .sheet(isPresented: Binding(get: { previewImagePath != nil }, set: { if !$0 { previewImagePath = nil } })) {
-            if let path = previewImagePath, let img = NSImage(contentsOfFile: path) {
-                VStack(spacing: 12) {
-                    Image(nsImage: img)
-                        .resizable()
-                        .scaledToFit()
-                        .frame(minWidth: 420, maxWidth: 960, minHeight: 280, maxHeight: 720)
-                        .padding(.horizontal, 16)
-                        .padding(.top, 16)
-                    HStack(spacing: 14) {
-                        Button("复制图片") {
-                            let pb = NSPasteboard.general
-                            pb.clearContents()
-                            pb.writeObjects([img])
-                        }
-                        Button("关闭") { previewImagePath = nil }
-                            .keyboardShortcut(.cancelAction)
-                    }
-                    .padding(.bottom, 14)
-                }
-                .background(FlomoPalette.canvas(scheme))
+        .sheet(item: $lightboxState) { state in
+            ImageLightboxView(paths: state.paths, initialIndex: state.initialIndex) {
+                lightboxState = nil
+            }
+        }
+        .sheet(item: $threadParentNote) { parent in
+            NoteThreadSheet(
+                vm: vm,
+                parentNote: parent,
+                onTapTag: { path in
+                    threadParentNote = nil
+                    vm.activeTab = .tag(path)
+                    vm.applyFilter()
+                },
+                onTapImages: { paths, idx in
+                    lightboxState = ImageLightboxState(paths: paths, initialIndex: idx)
+                },
+                onClose: { threadParentNote = nil }
+            )
+        }
+        .sheet(isPresented: Binding(get: { renamingTagPath != nil }, set: { if !$0 { renamingTagPath = nil } })) {
+            if let tagPath = renamingTagPath {
+                TagRenameSheet(
+                    oldTag: tagPath,
+                    onConfirm: { newPath in
+                        renamingTagPath = nil
+                        vm.renameTag(oldPrefix: tagPath, newPrefix: newPath)
+                    },
+                    onCancel: { renamingTagPath = nil }
+                )
             }
         }
         .sheet(isPresented: $showSettingsSheet) {
@@ -1864,12 +2091,71 @@ struct MainContentView: View {
         }
     }
 
+    private var quickFilterBar: some View {
+        let isTagTab: Bool = { if case .tag = vm.activeTab { return true }; return false }()
+        return HStack(spacing: 8) {
+            if !isTagTab {
+                filterPill("无标签", active: vm.filterUntagged) {
+                    vm.filterUntagged.toggle()
+                    vm.applyFilter()
+                }
+            }
+            filterPill("含图片", active: vm.filterWithImages) {
+                vm.filterWithImages.toggle()
+                vm.applyFilter()
+            }
+            filterPill("近 7 天", active: vm.filterDateRangeDays == 7) {
+                vm.filterDateRangeDays = vm.filterDateRangeDays == 7 ? 0 : 7
+                vm.applyFilter()
+            }
+            filterPill("近 30 天", active: vm.filterDateRangeDays == 30) {
+                vm.filterDateRangeDays = vm.filterDateRangeDays == 30 ? 0 : 30
+                vm.applyFilter()
+            }
+            if vm.hasQuickFilters {
+                Button {
+                    vm.resetQuickFilters()
+                } label: {
+                    Text("重置")
+                        .font(.system(size: 11.5, weight: .medium))
+                        .foregroundColor(FlomoPalette.tagText(scheme))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                }
+                .buttonStyle(.plain)
+            }
+            Spacer()
+        }
+    }
+
+    private func filterPill(_ title: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 11.5, weight: active ? .semibold : .regular))
+                .foregroundColor(active ? .white : FlomoPalette.textSecondary(scheme))
+                .padding(.horizontal, 10)
+                .padding(.vertical, 4.5)
+                .background(
+                    Capsule()
+                        .fill(active ? FlomoPalette.accent(scheme) : FlomoPalette.card(scheme))
+                )
+                .overlay(
+                    Capsule()
+                        .stroke(active ? Color.clear : FlomoPalette.border(scheme), lineWidth: 0.8)
+                )
+                .contentShape(Capsule())
+        }
+        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 12))
+        .whimClickable(cornerRadius: 12, hoverFill: false)
+    }
+
     private var currentTitle: String {
         switch vm.activeTab {
         case .all: return "全部笔记"
         case .review: return "每日回顾"
         case .random: return "随机漫步"
         case .archived: return "已归档"
+        case .trash: return "最近删除"
         case .day(let d): return "日期 · \(d)"
         case .tag(let path): return "#\(path)"
         }
@@ -1944,6 +2230,7 @@ private struct FlomoTagRow: View {
     let depth: Int
     let activeTab: SidebarTab
     let onSelect: (String) -> Void
+    var onRenameTag: ((String) -> Void)? = nil
 
     @State private var expanded: Bool = true
     @State private var isHovered: Bool = false
@@ -1997,6 +2284,11 @@ private struct FlomoTagRow: View {
                     .fill(isSelected ? FlomoPalette.accent(scheme) : (isHovered ? FlomoPalette.hoverFill(scheme) : .clear))
             )
             .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .contextMenu {
+                Button("重命名 / 合并标签...") {
+                    onRenameTag?(node.fullPath)
+                }
+            }
             .onHover { hovering in
                 isHovered = hovering
                 if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
@@ -2007,7 +2299,7 @@ private struct FlomoTagRow: View {
 
             if expanded, let children = node.children {
                 ForEach(children) { child in
-                    FlomoTagRow(node: child, depth: depth + 1, activeTab: activeTab, onSelect: onSelect)
+                    FlomoTagRow(node: child, depth: depth + 1, activeTab: activeTab, onSelect: onSelect, onRenameTag: onRenameTag)
                 }
             }
         }
@@ -2169,14 +2461,17 @@ private struct FlomoNoteCardBody: View, Equatable {
     let updatedAt: Int64
     let content: String
     let attachments: [WhimAttachment]
+    var highlightQuery: String = ""
     let onTapTag: (String) -> Void
-    let onTapImage: (String) -> Void
+    let onTapImages: ([String], Int) -> Void
+    var onToggleTask: ((Int) -> Void)? = nil
 
     static func == (lhs: FlomoNoteCardBody, rhs: FlomoNoteCardBody) -> Bool {
         lhs.noteId == rhs.noteId &&
         lhs.updatedAt == rhs.updatedAt &&
         lhs.content == rhs.content &&
-        lhs.attachments == rhs.attachments
+        lhs.attachments == rhs.attachments &&
+        lhs.highlightQuery == rhs.highlightQuery
     }
 
     var body: some View {
@@ -2187,14 +2482,42 @@ private struct FlomoNoteCardBody: View, Equatable {
             attachments: attachments,
             stripTags: []
         )
-        VStack(alignment: .leading, spacing: 10) {
-            ForEach(blocks) { block in
-                switch block {
+        let allImagePaths: [String] = blocks.compactMap {
+            if case .image(_, _, let p) = $0 { return p }
+            return nil
+        }
+        let indexedBlocks: [(block: NoteContentBlock, taskOffset: Int, imageIdx: Int)] = {
+            var tOff = 0
+            var imgIdx = 0
+            var res: [(NoteContentBlock, Int, Int)] = []
+            for b in blocks {
+                switch b {
                 case .text(_, let val):
-                    MarkdownBlockView(text: val, onTapTag: onTapTag)
-                        .equatable()
+                    res.append((b, tOff, imgIdx))
+                    tOff += countMarkdownTasks(in: val)
+                case .image:
+                    res.append((b, tOff, imgIdx))
+                    imgIdx += 1
+                }
+            }
+            return res
+        }()
+        VStack(alignment: .leading, spacing: 10) {
+            ForEach(Array(indexedBlocks.enumerated()), id: \.offset) { _, entry in
+                switch entry.block {
+                case .text(_, let val):
+                    MarkdownBlockView(
+                        text: val,
+                        highlightQuery: highlightQuery,
+                        taskOffset: entry.taskOffset,
+                        onTapTag: onTapTag,
+                        onToggleTask: onToggleTask
+                    )
+                    .equatable()
                 case .image(_, _, let path):
-                    AsyncCardImage(path: path, onTap: onTapImage)
+                    AsyncCardImage(path: path) { _ in
+                        onTapImages(allImagePaths.isEmpty ? [path] : allImagePaths, entry.imageIdx)
+                    }
                 }
             }
         }
@@ -2205,12 +2528,18 @@ private struct FlomoNoteCardBody: View, Equatable {
 private struct FlomoNoteCard: View {
     @Environment(\.colorScheme) private var scheme
     let note: WhimNote
+    var highlightQuery: String = ""
+    var isTrashMode: Bool = false
     let onTapTag: (String) -> Void
-    let onTapImage: (String) -> Void
+    let onTapImages: ([String], Int) -> Void
+    var onToggleTask: ((Int) -> Void)? = nil
+    var onOpenThread: (() -> Void)? = nil
     let onEdit: () -> Void
     let onPin: () -> Void
     let onArchive: () -> Void
     let onDelete: () -> Void
+    var onRestore: (() -> Void)? = nil
+    var onPurge: (() -> Void)? = nil
 
     @State private var expanded: Bool = false
     @State private var naturalHeight: CGFloat = 0
@@ -2234,22 +2563,34 @@ private struct FlomoNoteCard: View {
 
     var body: some View {
         let isCollapsed = needsCollapse && !expanded
+        let replyCount = note.replyCount ?? 0
         VStack(alignment: .leading, spacing: 10) {
-            // Meta header row (fixed positions, zero hover layout jitter)
+            // Meta header row
             HStack(spacing: 6) {
-                Text(note.pinned ? "置顶 · \(formattedTime)" : formattedTime)
+                Text(note.pinned && !isTrashMode ? "置顶 · \(formattedTime)" : formattedTime)
                     .font(.system(size: 12).monospacedDigit())
                     .foregroundColor(FlomoPalette.textSecondary(scheme))
                 Spacer()
-                CardHeaderActions(
-                    pinned: note.pinned,
-                    archived: note.archived,
-                    content: note.content,
-                    onEdit: onEdit,
-                    onPin: onPin,
-                    onArchive: onArchive,
-                    onDelete: onDelete
-                )
+                if isTrashMode {
+                    HStack(spacing: 8) {
+                        WhimSecondaryButton(title: "恢复", icon: "arrow.uturn.backward", compact: true) {
+                            onRestore?()
+                        }
+                        WhimSecondaryButton(title: "彻底删除", destructive: true, compact: true) {
+                            onPurge?()
+                        }
+                    }
+                } else {
+                    CardHeaderActions(
+                        pinned: note.pinned,
+                        archived: note.archived,
+                        content: note.content,
+                        onEdit: onEdit,
+                        onPin: onPin,
+                        onArchive: onArchive,
+                        onDelete: onDelete
+                    )
+                }
             }
 
             FlomoNoteCardBody(
@@ -2257,8 +2598,10 @@ private struct FlomoNoteCard: View {
                 updatedAt: note.updatedAt,
                 content: note.content,
                 attachments: note.attachments ?? [],
+                highlightQuery: highlightQuery,
                 onTapTag: onTapTag,
-                onTapImage: onTapImage
+                onTapImages: onTapImages,
+                onToggleTask: isTrashMode ? nil : onToggleTask
             )
             .equatable()
             .fixedSize(horizontal: false, vertical: true)
@@ -2291,13 +2634,34 @@ private struct FlomoNoteCard: View {
                 }
             }
 
-            if needsCollapse {
-                Button(expanded ? "收起" : "展开全文") {
-                    expanded.toggle()
+            HStack(spacing: 12) {
+                if needsCollapse {
+                    Button(expanded ? "收起" : "展开全文") {
+                        expanded.toggle()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12.5, weight: .medium))
+                    .foregroundColor(FlomoPalette.tagText(scheme))
                 }
-                .buttonStyle(.plain)
-                .font(.system(size: 12.5, weight: .medium))
-                .foregroundColor(FlomoPalette.tagText(scheme))
+                Spacer()
+                if !isTrashMode, let onOpenThread {
+                    Button(action: onOpenThread) {
+                        HStack(spacing: 4) {
+                            Image(systemName: replyCount > 0 ? "text.bubble.fill" : "text.bubble")
+                                .font(.system(size: 11))
+                            Text(replyCount > 0 ? "\(replyCount) 条追记" : "追记")
+                                .font(.system(size: 11.5, weight: replyCount > 0 ? .medium : .regular))
+                        }
+                        .foregroundColor(replyCount > 0 ? FlomoPalette.accent(scheme) : FlomoPalette.textMuted(scheme))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3.5)
+                        .background(
+                            Capsule().fill(replyCount > 0 ? FlomoPalette.accentSoft(scheme) : Color.clear)
+                        )
+                        .whimClickable(cornerRadius: 10, hoverFill: replyCount == 0)
+                    }
+                    .buttonStyle(WhimTactileButtonStyle(cornerRadius: 10))
+                }
             }
         }
         .padding(16)
@@ -2309,16 +2673,28 @@ private struct FlomoNoteCard: View {
             RoundedRectangle(cornerRadius: 10, style: .continuous)
                 .stroke(FlomoPalette.border(scheme), lineWidth: 0.5)
         )
+        .onTapGesture(count: 2) {
+            if !isTrashMode { onEdit() }
+        }
         .contextMenu {
-            Button("编辑", action: onEdit)
-            Button(note.pinned ? "取消置顶" : "置顶笔记", action: onPin)
-            Button(note.archived ? "取消归档" : "归档", action: onArchive)
-            Button("复制正文") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(note.content, forType: .string)
+            if isTrashMode {
+                Button("恢复笔记") { onRestore?() }
+                Divider()
+                Button("彻底删除", role: .destructive) { onPurge?() }
+            } else {
+                Button("编辑", action: onEdit)
+                if let onOpenThread {
+                    Button("添加 / 查看追记", action: onOpenThread)
+                }
+                Button(note.pinned ? "取消置顶" : "置顶笔记", action: onPin)
+                Button(note.archived ? "取消归档" : "归档", action: onArchive)
+                Button("复制正文") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(note.content, forType: .string)
+                }
+                Divider()
+                Button("删除", role: .destructive, action: onDelete)
             }
-            Divider()
-            Button("删除", role: .destructive, action: onDelete)
         }
     }
 }
@@ -2334,7 +2710,7 @@ private struct FlomoCardDeckView: View {
     @Binding var editingNoteId: String?
     let searchFocused: Bool
     let onTapTag: (String) -> Void
-    let onTapImage: (String) -> Void
+    let onTapImages: ([String], Int) -> Void
     let onReshuffle: () -> Void
 
     @State private var currentIndex: Int = 0
@@ -2552,7 +2928,8 @@ private struct FlomoCardDeckView: View {
                         content: note.content,
                         attachments: note.attachments ?? [],
                         onTapTag: onTapTag,
-                        onTapImage: onTapImage
+                        onTapImages: onTapImages,
+                        onToggleTask: { taskIdx in vm.toggleTaskCheckbox(note, taskIndex: taskIdx) }
                     )
                     .equatable()
                     .padding(.trailing, 4)

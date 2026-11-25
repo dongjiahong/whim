@@ -2942,9 +2942,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         panel.makeKeyAndOrderFront(nil)
     }
 
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        showMainWindow()
+        return true
+    }
+
     @objc func showMainWindow() {
+        if mainWindow == nil {
+            setupMainWindow()
+        }
+        if NSApp.isHidden {
+            NSApp.unhide(nil)
+        }
         NSApp.activate(ignoringOtherApps: true)
-        mainWindow?.makeKeyAndOrderFront(nil)
+        if let win = mainWindow {
+            if win.isMiniaturized {
+                win.deminiaturize(nil)
+            }
+            win.makeKeyAndOrderFront(nil)
+            win.orderFrontRegardless()
+        }
     }
 
     @objc func triggerSync() { vm.syncNow() }

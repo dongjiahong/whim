@@ -41,7 +41,7 @@
 - **无损开放导出**：一键导出按日分组的 Markdown 文件与完整图片附件，随时迁移无锁定。
 
 ### 7. 原生接入 AI 工作流（Local MCP Server）
-- 内置独立本地 stdio MCP Server（`whim-mcp`），可直接接入 **Claude Desktop / Cursor / Gemini CLI**，在不把个人笔记上传至第三方云端的前提下，让 AI 协助检索闪念、梳理标签、总结周报与归档整理。
+- 内置独立本地 stdio MCP Server（`whim-mcp`），可直接接入 **OpenCode / Claude Desktop / Cursor / Gemini CLI**，在不把个人笔记上传至第三方云端的前提下，让 AI 协助检索闪念、按标签/排除标签筛选（如排除 `#AI`）、读写追记、更新总结与归档整理。
 
 ---
 
@@ -104,7 +104,24 @@ make mcp
 
 ### 配置本地 MCP Server
 
-在 Claude Desktop、Cursor 或 Gemini CLI 的 MCP 配置中加入：
+`whim-mcp` 目前提供 10 个本地工具：`whim_list_notes`（支持按日期、标签前缀及 `exclude_tag_prefix` 排除前缀筛选，例如排除 `AI` 避免重复汇总历史 AI 总结）、`whim_get_note`（含追记）、`whim_search_notes`、`whim_list_tags`、`whim_create_note`、`whim_update_note`、`whim_list_replies`、`whim_add_reply`、`whim_update_tags` 与 `whim_export_markdown`。
+
+在 **OpenCode**（`~/.config/opencode/opencode.json`）中加入：
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "whim": {
+      "type": "local",
+      "command": ["/path/to/whim/dist/whim-mcp"],
+      "enabled": true
+    }
+  }
+}
+```
+
+在 **Claude Desktop、Cursor 或 Gemini CLI** 的 MCP 配置中加入：
 
 ```json
 {
@@ -120,7 +137,7 @@ make mcp
 
 ```bash
 # 同步双端版本号、跑全量测试、打 tag 并推送触发 GitHub Actions 自动发布
-make release v=0.2.1
+make release v=0.2.2
 ```
 
 GitHub Actions 会自动构建并发布 `Whim-macOS.zip`、`whim-mcp-macos-arm64.tar.gz` 与 `Whim-Android.apk` 到 GitHub Releases，双端在「关于与更新」页面即可一键检查并覆盖升级（保留全部本地数据）。

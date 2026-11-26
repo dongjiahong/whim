@@ -512,16 +512,18 @@ private fun FlomoMobileApp(
     DisposableEffect(Unit) {
         MobileTagDispatch.onTap = { path -> activeTab = MobileTab.Tag(path) }
         MobileTaskDispatch.onToggle = { noteId, taskIdx ->
-            val target = displayedNotes.firstOrNull { it.id == noteId } ?: return@onToggle
-            val nextContent = toggleMarkdownTask(target.content, taskIdx)
-            if (nextContent != target.content) {
-                scope.launch {
-                    runCatching {
-                        WhimCoreBridge.updateNote(id = target.id, content = nextContent)
+            val target = displayedNotes.firstOrNull { it.id == noteId }
+            if (target != null) {
+                val nextContent = toggleMarkdownTask(target.content, taskIdx)
+                if (nextContent != target.content) {
+                    scope.launch {
+                        runCatching {
+                            WhimCoreBridge.updateNote(id = target.id, content = nextContent)
+                        }
+                        reload()
+                        runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
+                        SyncWorker.enqueueImmediate(context)
                     }
-                    reload()
-                    runCatching { WhimCoreBridge.syncOnce(timeoutSec = 3) }
-                    SyncWorker.enqueueImmediate(context)
                 }
             }
         }

@@ -81,21 +81,22 @@ type NoteCursor struct {
 
 // ListFilter controls note queries.
 type ListFilter struct {
-	Query           string      `json:"query,omitempty"`
-	TagPrefix       string      `json:"tag_prefix,omitempty"`
-	DateFromMs      int64       `json:"date_from_ms,omitempty"`
-	DateToMs        int64       `json:"date_to_ms,omitempty"`
-	IncludeArchived bool        `json:"include_archived,omitempty"`
-	OnlyArchived    bool        `json:"only_archived,omitempty"`
-	OnlyPinned      bool        `json:"only_pinned,omitempty"`
-	OnlyDeleted     bool        `json:"only_deleted,omitempty"`
-	OnlyUntagged    bool        `json:"only_untagged,omitempty"`
-	OnlyWithImages  bool        `json:"only_with_images,omitempty"`
-	ParentID        string      `json:"parent_id,omitempty"`
-	IncludeReplies  bool        `json:"include_replies,omitempty"`
-	Limit           int         `json:"limit,omitempty"`
-	Offset          int         `json:"offset,omitempty"`
-	Cursor          *NoteCursor `json:"cursor,omitempty"`
+	Query              string      `json:"query,omitempty"`
+	TagPrefix          string      `json:"tag_prefix,omitempty"`
+	ExcludeTagPrefixes []string    `json:"exclude_tag_prefixes,omitempty"`
+	DateFromMs         int64       `json:"date_from_ms,omitempty"`
+	DateToMs           int64       `json:"date_to_ms,omitempty"`
+	IncludeArchived    bool        `json:"include_archived,omitempty"`
+	OnlyArchived       bool        `json:"only_archived,omitempty"`
+	OnlyPinned         bool        `json:"only_pinned,omitempty"`
+	OnlyDeleted        bool        `json:"only_deleted,omitempty"`
+	OnlyUntagged       bool        `json:"only_untagged,omitempty"`
+	OnlyWithImages     bool        `json:"only_with_images,omitempty"`
+	ParentID           string      `json:"parent_id,omitempty"`
+	IncludeReplies     bool        `json:"include_replies,omitempty"`
+	Limit              int         `json:"limit,omitempty"`
+	Offset             int         `json:"offset,omitempty"`
+	Cursor             *NoteCursor `json:"cursor,omitempty"`
 }
 
 // TagRenameResult reports how many notes were updated by a tag rename/merge operation.

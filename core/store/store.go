@@ -692,6 +692,12 @@ func (s *Store) ListNotesPage(f model.ListFilter) (*model.NotePage, error) {
 		where = append(where, "EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND (nt.tag_path = ? OR nt.tag_path LIKE ?))")
 		args = append(args, tp, tp+"/%")
 	}
+	for _, rawEx := range f.ExcludeTagPrefixes {
+		if ex := tags.Normalize(rawEx); ex != "" {
+			where = append(where, "NOT EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id AND (nt.tag_path = ? OR nt.tag_path LIKE ?))")
+			args = append(args, ex, ex+"/%")
+		}
+	}
 	if f.OnlyUntagged {
 		where = append(where, "NOT EXISTS (SELECT 1 FROM note_tags nt WHERE nt.note_id = n.id)")
 	}

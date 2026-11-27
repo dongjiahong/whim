@@ -471,6 +471,7 @@ final class WhimNSTextView: NSTextView {
         }
         highlightTags()
         onContentChanged?()
+        ensureCaretVisible()
         return true
     }
 
@@ -502,10 +503,12 @@ final class WhimNSTextView: NSTextView {
                 setSelectedRange(NSRange(location: lineRange.location, length: 0))
                 highlightTags()
                 onContentChanged?()
+                ensureCaretVisible()
                 return true
             } else {
                 insertPlainTextAtCursor("\n" + nextPrefix)
                 highlightTags()
+                ensureCaretVisible()
                 return true
             }
         }
@@ -558,6 +561,7 @@ final class WhimNSTextView: NSTextView {
         super.pasteAsPlainText(sender)
         highlightTags()
         onContentChanged?()
+        ensureCaretVisible()
     }
 
     @discardableResult
@@ -616,6 +620,7 @@ final class WhimNSTextView: NSTextView {
         let newLoc = sel.location + attr.length
         setSelectedRange(NSRange(location: newLoc, length: 0))
         typingAttributes = defaultTypingAttrs()
+        ensureCaretVisible()
     }
 
     func insertPlainTextAtCursor(_ snippet: String) {
@@ -625,6 +630,7 @@ final class WhimNSTextView: NSTextView {
         setSelectedRange(NSRange(location: sel.location + attr.length, length: 0))
         typingAttributes = defaultTypingAttrs()
         onContentChanged?()
+        ensureCaretVisible()
     }
 
     /// Serializes the rich attributed text (including inline image attachments) back to
@@ -686,19 +692,40 @@ final class WhimNSTextView: NSTextView {
     func applyTheme(isDark: Bool) {
         let changed = isDarkTheme != isDark
         isDarkTheme = isDark
+        let baseColor = isDark
+            ? NSColor(red: 0.90, green: 0.90, blue: 0.90, alpha: 1.0)
+            : NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0)
+        textColor = baseColor
         typingAttributes = defaultTypingAttrs()
-        if changed {
+        if changed, let storage = textStorage, storage.length > 0 {
+            let fullRange = NSRange(location: 0, length: storage.length)
+            storage.beginEditing()
+            storage.addAttribute(.foregroundColor, value: baseColor, range: fullRange)
+            storage.endEditing()
             highlightTags()
         }
     }
 
-    /// Highlights `#tag/subtag` tokens live in blue pill tint while typing (skips IME composition).
+    /// Keeps the active caret scrolled into view after IME commits, Return/newline, or programmatic edits.
+    func ensureCaretVisible() {
+        let target = selectedRange()
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            if let tc = self.textContainer, let lm = self.layoutManager {
+                lm.ensureLayout(for: tc)
+            }
+            let len = (self.string as NSString).length
+            let safeLoc = min(target.location, len)
+            let safeLen = min(target.length, max(0, len - safeLoc))
+            self.scrollRangeToVisible(NSRange(location: safeLoc, length: safeLen))
+        }
+    }
+
+    /// Highlights `#tag/subtag` tokens using NSLayoutManager temporary attributes so textStorage
+    /// is never dirtied across fullRange on IME commit / Return (preventing scroll-to-top jumps).
     func highlightTags() {
-        guard !hasMarkedText(), let storage = textStorage else { return }
+        guard !hasMarkedText(), let storage = textStorage, let lm = layoutManager else { return }
         let fullRange = NSRange(location: 0, length: storage.length)
-        let baseColor = isDarkTheme
-            ? NSColor(red: 0.90, green: 0.90, blue: 0.90, alpha: 1.0)
-            : NSColor(red: 0.12, green: 0.12, blue: 0.12, alpha: 1.0)
         let tagFg = isDarkTheme
             ? NSColor(red: 0.357, green: 0.608, blue: 1.0, alpha: 1.0)
             : NSColor(red: 0.184, green: 0.435, blue: 0.894, alpha: 1.0)
@@ -706,17 +733,15 @@ final class WhimNSTextView: NSTextView {
             ? NSColor(red: 0.118, green: 0.165, blue: 0.227, alpha: 1.0)
             : NSColor(red: 0.918, green: 0.949, blue: 1.0, alpha: 1.0)
 
-        storage.beginEditing()
-        storage.addAttribute(.foregroundColor, value: baseColor, range: fullRange)
-        storage.removeAttribute(.backgroundColor, range: fullRange)
+        lm.removeTemporaryAttribute(.foregroundColor, forCharacterRange: fullRange)
+        lm.removeTemporaryAttribute(.backgroundColor, forCharacterRange: fullRange)
         let str = storage.string
         let matches = Self.liveTagRegex.matches(in: str, options: [], range: fullRange)
         for m in matches {
             let tagRange = m.range(at: 2)
-            storage.addAttribute(.foregroundColor, value: tagFg, range: tagRange)
-            storage.addAttribute(.backgroundColor, value: tagBg, range: tagRange)
+            lm.addTemporaryAttribute(.foregroundColor, value: tagFg, forCharacterRange: tagRange)
+            lm.addTemporaryAttribute(.backgroundColor, value: tagBg, forCharacterRange: tagRange)
         }
-        storage.endEditing()
         typingAttributes = defaultTypingAttrs()
     }
 
@@ -791,7 +816,9 @@ final class InlineEditorController: ObservableObject {
             let attr = NSAttributedString(string: "#\(fullTag) ", attributes: tv.defaultTypingAttrs())
             storage.replaceCharacters(in: replaceRange, with: attr)
             tv.setSelectedRange(NSRange(location: startIdx + attr.length, length: 0))
+            tv.highlightTags()
             tv.onContentChanged?()
+            tv.ensureCaretVisible()
         }
     }
 }
@@ -829,10 +856,14 @@ struct InlineRichEditor: NSViewRepresentable {
         tv.isAutomaticDashSubstitutionEnabled = false
         tv.insertionPointColor = NSColor(red: 0.306, green: 0.490, blue: 0.369, alpha: 1.0)
         tv.textContainerInset = NSSize(width: 2, height: 4)
+        tv.minSize = NSSize(width: 0, height: 0)
+        tv.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.isVerticallyResizable = true
         tv.isHorizontallyResizable = false
         tv.autoresizingMask = [.width]
+        tv.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         tv.textContainer?.widthTracksTextView = true
+        tv.layoutManager?.allowsNonContiguousLayout = false
         tv.typingAttributes = tv.defaultTypingAttrs()
         tv.delegate = context.coordinator
 
@@ -858,6 +889,7 @@ struct InlineRichEditor: NSViewRepresentable {
         if autoFocus {
             DispatchQueue.main.async {
                 tv.window?.makeFirstResponder(tv)
+                tv.ensureCaretVisible()
             }
         }
         return scroll
@@ -883,6 +915,7 @@ struct InlineRichEditor: NSViewRepresentable {
             tv.highlightTags()
             let (md, atts) = tv.serializeMarkdown()
             parent.onTextChange(md, atts)
+            tv.ensureCaretVisible()
         }
     }
 }

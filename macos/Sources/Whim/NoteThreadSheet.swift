@@ -8,8 +8,11 @@ struct NoteThreadSheet: View {
     let onTapImages: ([String], Int) -> Void
     let onClose: () -> Void
 
+    @StateObject private var editor = InlineEditorController()
     @State private var replies: [WhimNote] = []
     @State private var draft: String = ""
+    @State private var attachments: [WhimAttachment] = []
+    @State private var isFocused: Bool = false
     @State private var isLoading: Bool = true
     @State private var isSubmitting: Bool = false
 
@@ -23,6 +26,10 @@ struct NoteThreadSheet: View {
         Self.timeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000.0))
     }
 
+    private var canSubmit: Bool {
+        !isSubmitting && (!draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !attachments.isEmpty)
+    }
+
     private func loadReplies() {
         isLoading = true
         vm.loadReplies(parentId: parentNote.id) { items in
@@ -32,14 +39,18 @@ struct NoteThreadSheet: View {
     }
 
     private func submitReply() {
-        let trimmed = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty, !isSubmitting else { return }
+        let (md, atts) = editor.serialize()
+        let trimmed = md.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard (!trimmed.isEmpty || !atts.isEmpty), !isSubmitting else { return }
         isSubmitting = true
-        vm.createReply(parentId: parentNote.id, content: trimmed) { created in
+        vm.createReply(parentId: parentNote.id, content: trimmed, attachments: atts) { created in
             self.isSubmitting = false
             if let created {
+                self.editor.clear()
                 self.draft = ""
+                self.attachments = []
                 self.replies.append(created)
+                self.editor.focus()
             }
         }
     }
@@ -76,12 +87,20 @@ struct NoteThreadSheet: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    // Parent Note Card
+                    // Parent Note Card (supports inline images just like feed cards)
                     VStack(alignment: .leading, spacing: 8) {
                         Text(formatMs(parentNote.createdAt))
                             .font(.system(size: 11.5).monospacedDigit())
                             .foregroundColor(FlomoPalette.textSecondary(scheme))
-                        MarkdownBlockView(text: parentNote.content, onTapTag: onTapTag)
+                        FlomoNoteCardBody(
+                            noteId: parentNote.id,
+                            updatedAt: parentNote.updatedAt,
+                            content: parentNote.content,
+                            attachments: parentNote.attachments ?? [],
+                            onTapTag: onTapTag,
+                            onTapImages: onTapImages
+                        )
+                        .equatable()
                     }
                     .padding(14)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -104,20 +123,29 @@ struct NoteThreadSheet: View {
                         }
                         .padding(.vertical, 12)
                     } else if replies.isEmpty {
-                        Text("还没有追记。在下方写下新的思考，按时间线串连成脉络。")
+                        Text("还没有追记。在下方写下新的思考或粘贴图片，按时间线串连成脉络。")
                             .font(.system(size: 12.5))
                             .foregroundColor(FlomoPalette.textMuted(scheme))
                             .padding(.vertical, 12)
                     } else {
                         VStack(alignment: .leading, spacing: 10) {
-                            ForEach(replies) { reply in
+                            ForEach(Array(replies.enumerated()), id: \.element.id) { idx, reply in
                                 HStack(alignment: .top, spacing: 10) {
                                     Rectangle()
                                         .fill(FlomoPalette.accent(scheme).opacity(0.45))
                                         .frame(width: 2)
                                         .cornerRadius(1)
                                     VStack(alignment: .leading, spacing: 6) {
-                                        HStack {
+                                        HStack(spacing: 6) {
+                                            Text("追记 #\(idx + 1)")
+                                                .font(.system(size: 10.5, weight: .semibold))
+                                                .foregroundColor(FlomoPalette.accent(scheme))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 1.5)
+                                                .background(
+                                                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                                        .fill(FlomoPalette.accentSoft(scheme))
+                                                )
                                             Text(formatMs(reply.createdAt))
                                                 .font(.system(size: 11.5).monospacedDigit())
                                                 .foregroundColor(FlomoPalette.textMuted(scheme))
@@ -135,7 +163,15 @@ struct NoteThreadSheet: View {
                                             .buttonStyle(WhimTactileButtonStyle(cornerRadius: 5))
                                             .help("删除这条追记")
                                         }
-                                        MarkdownBlockView(text: reply.content, onTapTag: onTapTag)
+                                        FlomoNoteCardBody(
+                                            noteId: reply.id,
+                                            updatedAt: reply.updatedAt,
+                                            content: reply.content,
+                                            attachments: reply.attachments ?? [],
+                                            onTapTag: onTapTag,
+                                            onTapImages: onTapImages
+                                        )
+                                        .equatable()
                                     }
                                     .padding(12)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -153,34 +189,67 @@ struct NoteThreadSheet: View {
 
             Divider().opacity(0.25)
 
-            // Bottom reply composer
+            // Bottom rich reply composer (supports inline Cmd+V images & Finder picker just like main composer)
             VStack(spacing: 8) {
-                TextEditor(text: $draft)
-                    .font(.system(size: 13.5))
-                    .foregroundColor(FlomoPalette.textPrimary(scheme))
-                    .scrollContentBackground(.hidden)
-                    .frame(height: 76)
-                    .padding(8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .fill(FlomoPalette.composer(scheme))
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 8, style: .continuous)
-                            .stroke(FlomoPalette.border(scheme), lineWidth: 1)
-                    )
-                    .overlay(alignment: .topLeading) {
-                        if draft.isEmpty {
-                            Text("补充一条追记...")
-                                .font(.system(size: 13.5))
-                                .foregroundColor(FlomoPalette.textMuted(scheme))
-                                .padding(.top, 10)
-                                .padding(.leading, 13)
-                                .allowsHitTesting(false)
-                        }
+                ZStack(alignment: .topLeading) {
+                    if draft.isEmpty {
+                        Text("补充一条追记...（直接 ⌘V 可在光标处插入图片）")
+                            .font(.system(size: 13.5))
+                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                            .padding(.top, 5)
+                            .padding(.leading, 6)
+                            .allowsHitTesting(false)
                     }
+                    InlineRichEditor(
+                        controller: editor,
+                        autoFocus: true,
+                        isDark: scheme == .dark,
+                        onTextChange: { md, atts in
+                            draft = md
+                            attachments = atts
+                        },
+                        onFocusChange: { focused in isFocused = focused },
+                        onSubmit: submitReply,
+                        onEscape: onClose
+                    )
+                    .frame(height: !attachments.isEmpty ? 160 : 92)
+                }
+                .padding(8)
+                .background(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .fill(FlomoPalette.composer(scheme))
+                )
+                .overlay(
+                    RoundedRectangle(cornerRadius: 8, style: .continuous)
+                        .stroke(isFocused ? FlomoPalette.accent(scheme) : FlomoPalette.border(scheme), lineWidth: isFocused ? 1.2 : 1)
+                )
 
-                HStack {
+                HStack(spacing: 8) {
+                    Button {
+                        editor.insertSnippet(draft.isEmpty || draft.hasSuffix(" ") || draft.hasSuffix("\n") ? "#" : " #")
+                        editor.focus()
+                    } label: {
+                        Image(systemName: "number")
+                            .font(.system(size: 14))
+                            .foregroundColor(FlomoPalette.textSecondary(scheme))
+                            .frame(width: 28, height: 26)
+                            .whimClickable(cornerRadius: 6, hoverFill: true)
+                    }
+                    .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
+                    .help("插入标签 (#)")
+
+                    Button {
+                        editor.pickImageFromFinder()
+                    } label: {
+                        Image(systemName: "photo")
+                            .font(.system(size: 14))
+                            .foregroundColor(FlomoPalette.textSecondary(scheme))
+                            .frame(width: 28, height: 26)
+                            .whimClickable(cornerRadius: 6, hoverFill: true)
+                    }
+                    .buttonStyle(WhimTactileButtonStyle(cornerRadius: 6))
+                    .help("从本地选择图片插入光标处（剪贴板图片直接 ⌘V）")
+
                     Text("⌘↩ 发送追记")
                         .font(.system(size: 11))
                         .foregroundColor(FlomoPalette.textMuted(scheme))
@@ -192,14 +261,13 @@ struct NoteThreadSheet: View {
                     ) {
                         submitReply()
                     }
-                    .disabled(draft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isSubmitting)
-                    .keyboardShortcut(.return, modifiers: .command)
+                    .disabled(!canSubmit)
                 }
             }
             .padding(14)
             .background(FlomoPalette.card(scheme))
         }
-        .frame(width: 560, height: 560)
+        .frame(width: 580, height: 600)
         .background(FlomoPalette.canvas(scheme))
         .onAppear { loadReplies() }
     }

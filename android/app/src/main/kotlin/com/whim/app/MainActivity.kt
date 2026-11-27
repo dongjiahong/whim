@@ -364,6 +364,7 @@ private fun FlomoMobileApp(
     var notifPermissionGranted by remember { mutableStateOf(DailyReviewReceiver.hasNotificationPermission(context)) }
     var lightboxImages by remember { mutableStateOf<Pair<List<String>, Int>?>(null) }
     var threadNote by remember { mutableStateOf<WhimNote?>(null) }
+    var repliesVersion by remember { mutableStateOf(0) }
     var renamingTag by remember { mutableStateOf<String?>(null) }
     var isRenamingTag by remember { mutableStateOf(false) }
     var filterUntagged by remember { mutableStateOf(false) }
@@ -504,6 +505,7 @@ private fun FlomoMobileApp(
     fun reload() {
         scope.launch {
             lastLoadedVersion = WhimCoreBridge.dataVersion()
+            repliesVersion++
             refreshMetadata()
             loadFirstPage()
         }
@@ -1342,6 +1344,7 @@ private fun FlomoMobileApp(
                                     note = note,
                                     isTrash = activeTab == MobileTab.Trash,
                                     highlightQuery = searchQuery,
+                                    repliesVersion = repliesVersion,
                                     modifier = Modifier.animateItem(),
                                     onTapTag = { path -> activeTab = MobileTab.Tag(path) },
                                     onTapImage = { paths, idx -> lightboxImages = paths to idx },
@@ -1537,8 +1540,10 @@ private fun FlomoMobileApp(
     threadNote?.let { parent ->
         NoteThreadSheet(
             parentNote = parent,
+            onTapImage = { paths, idx -> lightboxImages = paths to idx },
             onDismiss = { threadNote = null },
             onThreadChanged = {
+                repliesVersion++
                 reload()
                 SyncWorker.enqueueImmediate(context)
             }
@@ -1723,7 +1728,7 @@ private fun DrawerTagTree(
 
 private val cardTimeFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
 
-private object MobileImageBoundsCache {
+internal object MobileImageBoundsCache {
     private val ratioCache = LruCache<String, Float>(320)
 
     fun aspectRatio(path: String): Float {
@@ -1741,13 +1746,13 @@ private object MobileImageBoundsCache {
 }
 
 @Immutable
-private sealed class MobileMdChunk {
+internal sealed class MobileMdChunk {
     data class RichText(val text: AnnotatedString) : MobileMdChunk()
     data class CodeBlock(val lang: String, val code: String) : MobileMdChunk()
 }
 
 @Immutable
-private sealed class MobileCardBlock {
+internal sealed class MobileCardBlock {
     data class TextBlock(val chunks: List<MobileMdChunk>) : MobileCardBlock()
     data class ImageBlock(val path: String) : MobileCardBlock()
 }
@@ -1763,14 +1768,14 @@ private object MobileTaskDispatch {
 }
 
 @Immutable
-private data class ParsedMobileCard(
+internal data class ParsedMobileCard(
     val timeStr: String,
     val blocks: List<MobileCardBlock>,
     val trailing: List<WhimAttachment>,
     val allImagePaths: List<String>
 )
 
-private object MobileCardParseCache {
+internal object MobileCardParseCache {
     private val cache = LruCache<String, ParsedMobileCard>(320)
 
     fun getOrParse(
@@ -2023,6 +2028,7 @@ private fun FlomoMobileNoteCard(
     note: WhimNote,
     isTrash: Boolean = false,
     highlightQuery: String = "",
+    repliesVersion: Int = 0,
     modifier: Modifier = Modifier,
     onTapTag: (String) -> Unit,
     onTapImage: (List<String>, Int) -> Unit,
@@ -2041,7 +2047,19 @@ private fun FlomoMobileNoteCard(
     var menuExpanded by remember { mutableStateOf(false) }
     var textExpanded by remember(note.id) { mutableStateOf(false) }
     var contentOverflow by remember(note.id, note.updatedAt) { mutableStateOf(false) }
+    var inlineReplies by remember(note.id) { mutableStateOf<List<WhimNote>>(emptyList()) }
+    var loadingReplies by remember(note.id) { mutableStateOf(false) }
     val maxCollapsedPx = with(LocalDensity.current) { 340.dp.roundToPx() }
+
+    LaunchedEffect(textExpanded, note.replyCount, repliesVersion, isTrash) {
+        if (textExpanded && !isTrash && note.replyCount > 0) {
+            loadingReplies = true
+            inlineReplies = runCatching { WhimCoreBridge.listReplies(note.id) }.getOrDefault(emptyList())
+            loadingReplies = false
+        } else if (note.replyCount == 0) {
+            inlineReplies = emptyList()
+        }
+    }
 
     val parsed = remember(note.id, note.updatedAt, c.textPrimary, highlightQuery) {
         MobileCardParseCache.getOrParse(
@@ -2242,15 +2260,163 @@ private fun FlomoMobileNoteCard(
             }
         }
 
-        if (contentOverflow || (!isTrash && note.replyCount > 0)) {
+        // Inline replies section displayed directly inside the card when expanded
+        val hasReplies = !isTrash && note.replyCount > 0
+        if (textExpanded && hasReplies) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(c.accent.copy(alpha = 0.16f))
+                            .padding(horizontal = 8.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            Icons.Rounded.ChatBubbleOutline,
+                            contentDescription = null,
+                            tint = c.accent,
+                            modifier = Modifier.size(11.dp)
+                        )
+                        Text(
+                            "追记 · ${note.replyCount} 条",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = c.accent
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(0.8.dp)
+                            .background(c.border.copy(alpha = 0.7f))
+                    )
+                }
+
+                if (loadingReplies && inlineReplies.isEmpty()) {
+                    Text("正在加载追记...", style = t.meta, color = c.textMuted)
+                } else {
+                    inlineReplies.forEachIndexed { idx, reply ->
+                        val replyParsed = remember(reply.id, reply.updatedAt, c.textPrimary, highlightQuery, reply.attachments.size) {
+                            MobileCardParseCache.getOrParse(
+                                note = reply,
+                                primary = c.textPrimary,
+                                secondary = c.textSecondary,
+                                muted = c.textMuted,
+                                accent = c.accent,
+                                codeBg = c.tagBg,
+                                codeFg = c.tagText,
+                                highlightQuery = highlightQuery
+                            )
+                        }
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(8.dp))
+                                .background(c.canvas.copy(alpha = 0.65f))
+                                .border(0.6.dp, c.border.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                                .padding(horizontal = 10.dp, vertical = 9.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .width(2.5.dp)
+                                    .height(18.dp)
+                                    .clip(RoundedCornerShape(2.dp))
+                                    .background(c.accent.copy(alpha = 0.7f))
+                            )
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                verticalArrangement = Arrangement.spacedBy(6.dp)
+                            ) {
+                                Row(
+                                    verticalAlignment = Alignment.CenterVertically,
+                                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                ) {
+                                    Box(
+                                        modifier = Modifier
+                                            .clip(RoundedCornerShape(4.dp))
+                                            .background(c.accent.copy(alpha = 0.16f))
+                                            .padding(horizontal = 6.dp, vertical = 1.5.dp)
+                                    ) {
+                                        Text(
+                                            "追记 #${idx + 1}",
+                                            fontSize = 10.5.sp,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = c.accent
+                                        )
+                                    }
+                                    Text(
+                                        text = replyParsed.timeStr,
+                                        style = t.meta,
+                                        color = c.textMuted
+                                    )
+                                }
+                                replyParsed.blocks.forEach { block ->
+                                    when (block) {
+                                        is MobileCardBlock.TextBlock -> MobileMarkdownChunksView(chunks = block.chunks)
+                                        is MobileCardBlock.ImageBlock -> {
+                                            val ratio = remember(block.path) { MobileImageBoundsCache.aspectRatio(block.path) }
+                                            val req = remember(block.path) {
+                                                ImageRequest.Builder(context)
+                                                    .data(File(block.path))
+                                                    .size(960, 960)
+                                                    .precision(Precision.INEXACT)
+                                                    .crossfade(160)
+                                                    .build()
+                                            }
+                                            AsyncImage(
+                                                model = req,
+                                                contentDescription = "追记图片",
+                                                contentScale = ContentScale.Fit,
+                                                modifier = Modifier
+                                                    .fillMaxWidth()
+                                                    .heightIn(max = 240.dp)
+                                                    .aspectRatio(ratio)
+                                                    .clip(RoundedCornerShape(7.dp))
+                                                    .background(c.card)
+                                                    .clickable {
+                                                        val imgIdx = replyParsed.allImagePaths.indexOf(block.path).coerceAtLeast(0)
+                                                        onTapImage(replyParsed.allImagePaths, imgIdx)
+                                                    }
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        val canExpand = contentOverflow || hasReplies
+        val expandLabel = when {
+            textExpanded -> if (contentOverflow) "收起" else "收起追记"
+            contentOverflow && hasReplies -> "展开全文 · 含 ${note.replyCount} 条追记"
+            contentOverflow -> "展开全文"
+            else -> "展开 ${note.replyCount} 条追记"
+        }
+
+        if (canExpand || !isTrash) {
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                if (contentOverflow) {
+                if (canExpand) {
                     Text(
-                        text = if (textExpanded) "收起" else "展开全文",
+                        text = expandLabel,
                         style = t.meta,
                         fontWeight = FontWeight.Medium,
                         color = c.tagText,
@@ -2259,11 +2425,11 @@ private fun FlomoMobileNoteCard(
                 } else {
                     Spacer(Modifier.width(1.dp))
                 }
-                if (!isTrash && note.replyCount > 0) {
+                if (!isTrash) {
                     Row(
                         modifier = Modifier
                             .clip(RoundedCornerShape(6.dp))
-                            .background(c.canvas)
+                            .background(if (hasReplies) c.canvas else Color.Transparent)
                             .clickable(onClick = onOpenThread)
                             .padding(horizontal = 8.dp, vertical = 4.dp),
                         verticalAlignment = Alignment.CenterVertically,
@@ -2272,14 +2438,14 @@ private fun FlomoMobileNoteCard(
                         Icon(
                             Icons.Rounded.ChatBubbleOutline,
                             contentDescription = "追记",
-                            tint = c.accent,
+                            tint = if (hasReplies) c.accent else c.textMuted,
                             modifier = Modifier.size(12.dp)
                         )
                         Text(
-                            "${note.replyCount} 条追记",
+                            if (hasReplies) "写追记 (${note.replyCount})" else "追记",
                             style = t.meta,
-                            color = c.accent,
-                            fontWeight = FontWeight.Medium
+                            color = if (hasReplies) c.accent else c.textMuted,
+                            fontWeight = if (hasReplies) FontWeight.Medium else FontWeight.Normal
                         )
                     }
                 }
@@ -2611,7 +2777,7 @@ private fun MobileCardDeck(
 }
 
 @Composable
-private fun MobileMarkdownChunksView(chunks: List<MobileMdChunk>) {
+internal fun MobileMarkdownChunksView(chunks: List<MobileMdChunk>) {
     val c = WhimTheme.colors
     val t = WhimTheme.typography
 

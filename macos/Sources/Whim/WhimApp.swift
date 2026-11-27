@@ -100,6 +100,7 @@ final class WhimStoreVM: ObservableObject {
     @Published var backups: [BackupInfo] = []
     @Published var backupStatusMsg: String = ""
     @Published var isBackingUp: Bool = false
+    @Published var repliesVersion: Int = 0
 
     private static let remindersStorageKey = "whim.review.reminders.v2"
 
@@ -479,6 +480,7 @@ final class WhimStoreVM: ObservableObject {
 
     func deleteNote(_ note: WhimNote) {
         _ = try? CoreBridge.shared.updateNote(id: note.id, deleted: true)
+        repliesVersion += 1
         reload()
         syncNow()
         lastDeletedNoteId = note.id
@@ -552,15 +554,17 @@ final class WhimStoreVM: ObservableObject {
     func loadReplies(parentId: String, completion: @escaping ([WhimNote]) -> Void) {
         ioQueue.async {
             let items = (try? CoreBridge.shared.listReplies(parentId: parentId)) ?? []
+            ThumbnailCache.shared.prefetch(notes: items)
             DispatchQueue.main.async { completion(items) }
         }
     }
 
-    func createReply(parentId: String, content: String, completion: @escaping (WhimNote?) -> Void) {
+    func createReply(parentId: String, content: String, attachments: [WhimAttachment] = [], completion: @escaping (WhimNote?) -> Void) {
         ioQueue.async { [weak self] in
-            let created = try? CoreBridge.shared.createReply(parentId: parentId, content: content)
+            let created = try? CoreBridge.shared.createReply(parentId: parentId, content: content, attachments: attachments)
             DispatchQueue.main.async { [weak self] in
                 if created != nil {
+                    self?.repliesVersion += 1
                     self?.reload()
                     self?.syncNow()
                 }
@@ -1809,6 +1813,8 @@ struct MainContentView: View {
                                                 note: note,
                                                 highlightQuery: vm.searchQuery,
                                                 isTrashMode: vm.activeTab == .trash,
+                                                repliesVersion: vm.repliesVersion,
+                                                onLoadReplies: { completion in vm.loadReplies(parentId: note.id, completion: completion) },
                                                 onTapTag: { path in
                                                     vm.activeTab = .tag(path)
                                                     vm.applyFilter()
@@ -2455,7 +2461,7 @@ private struct CardHeaderActions: View {
     }
 }
 
-private struct FlomoNoteCardBody: View, Equatable {
+struct FlomoNoteCardBody: View, Equatable {
     @Environment(\.colorScheme) private var scheme
     let noteId: String
     let updatedAt: Int64
@@ -2530,6 +2536,8 @@ private struct FlomoNoteCard: View {
     let note: WhimNote
     var highlightQuery: String = ""
     var isTrashMode: Bool = false
+    var repliesVersion: Int = 0
+    var onLoadReplies: ((@escaping ([WhimNote]) -> Void) -> Void)? = nil
     let onTapTag: (String) -> Void
     let onTapImages: ([String], Int) -> Void
     var onToggleTask: ((Int) -> Void)? = nil
@@ -2543,6 +2551,8 @@ private struct FlomoNoteCard: View {
 
     @State private var expanded: Bool = false
     @State private var naturalHeight: CGFloat = 0
+    @State private var inlineReplies: [WhimNote] = []
+    @State private var loadingReplies: Bool = false
 
     private static let maxCollapsedHeight: CGFloat = 340
 
@@ -2552,18 +2562,48 @@ private struct FlomoNoteCard: View {
         return f
     }()
 
+    private func formatMs(_ ms: Int64) -> String {
+        Self.cardTimeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000.0))
+    }
+
     private var formattedTime: String {
-        let d = Date(timeIntervalSince1970: TimeInterval(note.createdAt) / 1000.0)
-        return Self.cardTimeFmt.string(from: d)
+        formatMs(note.createdAt)
     }
 
     private var needsCollapse: Bool {
         naturalHeight > Self.maxCollapsedHeight + 16
     }
 
+    private func loadInlineRepliesIfNeeded() {
+        let count = note.replyCount ?? 0
+        guard expanded, !isTrashMode, count > 0, let onLoadReplies else {
+            if count == 0 { inlineReplies = [] }
+            return
+        }
+        loadingReplies = true
+        onLoadReplies { items in
+            self.inlineReplies = items
+            self.loadingReplies = false
+        }
+    }
+
     var body: some View {
         let isCollapsed = needsCollapse && !expanded
         let replyCount = note.replyCount ?? 0
+        let hasReplies = !isTrashMode && replyCount > 0
+        let canExpand = needsCollapse || hasReplies
+        let expandTitle: String = {
+            if expanded {
+                return needsCollapse ? "收起" : "收起追记"
+            }
+            if needsCollapse && hasReplies {
+                return "展开全文 · 含 \(replyCount) 条追记"
+            }
+            if needsCollapse {
+                return "展开全文"
+            }
+            return "展开 \(replyCount) 条追记"
+        }()
         VStack(alignment: .leading, spacing: 10) {
             // Meta header row
             HStack(spacing: 6) {
@@ -2634,9 +2674,91 @@ private struct FlomoNoteCard: View {
                 }
             }
 
+            // Inline replies section shown directly inside the card when expanded
+            if expanded && hasReplies {
+                VStack(alignment: .leading, spacing: 10) {
+                    HStack(spacing: 8) {
+                        HStack(spacing: 4) {
+                            Image(systemName: "text.bubble.fill")
+                                .font(.system(size: 10))
+                            Text("追记 · \(replyCount) 条")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundColor(FlomoPalette.accent(scheme))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule().fill(FlomoPalette.accentSoft(scheme))
+                        )
+                        Rectangle()
+                            .fill(FlomoPalette.border(scheme).opacity(0.7))
+                            .frame(height: 1)
+                    }
+                    .padding(.top, 4)
+
+                    if loadingReplies && inlineReplies.isEmpty {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("正在加载追记...")
+                                .font(.system(size: 11.5))
+                                .foregroundColor(FlomoPalette.textMuted(scheme))
+                        }
+                        .padding(.vertical, 4)
+                    } else {
+                        VStack(alignment: .leading, spacing: 8) {
+                            ForEach(Array(inlineReplies.enumerated()), id: \.element.id) { idx, reply in
+                                HStack(alignment: .top, spacing: 10) {
+                                    RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                                        .fill(FlomoPalette.accent(scheme).opacity(0.65))
+                                        .frame(width: 2.5)
+                                    VStack(alignment: .leading, spacing: 6) {
+                                        HStack(spacing: 6) {
+                                            Text("追记 #\(idx + 1)")
+                                                .font(.system(size: 10.5, weight: .semibold))
+                                                .foregroundColor(FlomoPalette.accent(scheme))
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 1.5)
+                                                .background(
+                                                    RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                                        .fill(FlomoPalette.accentSoft(scheme))
+                                                )
+                                            Text(formatMs(reply.createdAt))
+                                                .font(.system(size: 11).monospacedDigit())
+                                                .foregroundColor(FlomoPalette.textMuted(scheme))
+                                            Spacer()
+                                        }
+                                        FlomoNoteCardBody(
+                                            noteId: reply.id,
+                                            updatedAt: reply.updatedAt,
+                                            content: reply.content,
+                                            attachments: reply.attachments ?? [],
+                                            highlightQuery: highlightQuery,
+                                            onTapTag: onTapTag,
+                                            onTapImages: onTapImages
+                                        )
+                                        .equatable()
+                                    }
+                                    .padding(10)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    .background(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .fill(FlomoPalette.canvas(scheme).opacity(0.55))
+                                    )
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                                            .stroke(FlomoPalette.border(scheme).opacity(0.55), lineWidth: 0.5)
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                .transition(.opacity)
+            }
+
             HStack(spacing: 12) {
-                if needsCollapse {
-                    Button(expanded ? "收起" : "展开全文") {
+                if canExpand {
+                    Button(expandTitle) {
                         expanded.toggle()
                     }
                     .buttonStyle(.plain)
@@ -2649,7 +2771,7 @@ private struct FlomoNoteCard: View {
                         HStack(spacing: 4) {
                             Image(systemName: replyCount > 0 ? "text.bubble.fill" : "text.bubble")
                                 .font(.system(size: 11))
-                            Text(replyCount > 0 ? "\(replyCount) 条追记" : "追记")
+                            Text(replyCount > 0 ? "写追记 (\(replyCount))" : "追记")
                                 .font(.system(size: 11.5, weight: replyCount > 0 ? .medium : .regular))
                         }
                         .foregroundColor(replyCount > 0 ? FlomoPalette.accent(scheme) : FlomoPalette.textMuted(scheme))
@@ -2662,6 +2784,19 @@ private struct FlomoNoteCard: View {
                     }
                     .buttonStyle(WhimTactileButtonStyle(cornerRadius: 10))
                 }
+            }
+        }
+        .onChange(of: expanded) { _, isExp in
+            if isExp { loadInlineRepliesIfNeeded() }
+        }
+        .onChange(of: repliesVersion) { _, _ in
+            if expanded { loadInlineRepliesIfNeeded() }
+        }
+        .onChange(of: note.replyCount) { _, newCount in
+            if (newCount ?? 0) == 0 {
+                inlineReplies = []
+            } else if expanded {
+                loadInlineRepliesIfNeeded()
             }
         }
         .padding(16)

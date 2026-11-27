@@ -12,8 +12,11 @@ import android.net.NetworkCapabilities
 import android.net.NetworkRequest
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.LruCache
+import android.widget.Toast
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
@@ -716,6 +719,34 @@ private fun FlomoMobileApp(
                 }
             } else {
                 delay(2500L)
+            }
+        }
+    }
+
+    var lastBackPressMs by remember { mutableStateOf(0L) }
+    BackHandler(enabled = !showSettingsScreen) {
+        when {
+            drawerState.isOpen -> scope.launch { drawerState.close() }
+            showSearch || searchQuery.isNotEmpty() -> {
+                searchQuery = ""
+                showSearch = false
+            }
+            filterUntagged || filterWithImages || filterRangeDays > 0 -> {
+                filterUntagged = false
+                filterWithImages = false
+                filterRangeDays = 0
+            }
+            activeTab != MobileTab.All -> {
+                activeTab = MobileTab.All
+            }
+            else -> {
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastBackPressMs < 2000L) {
+                    (context as? ComponentActivity)?.finish()
+                } else {
+                    lastBackPressMs = now
+                    Toast.makeText(context, "再按一次退出 Whim", Toast.LENGTH_SHORT).show()
+                }
             }
         }
     }

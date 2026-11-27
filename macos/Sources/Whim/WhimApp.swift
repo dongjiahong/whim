@@ -101,6 +101,7 @@ final class WhimStoreVM: ObservableObject {
     @Published var backupStatusMsg: String = ""
     @Published var isBackingUp: Bool = false
     @Published var repliesVersion: Int = 0
+    @Published var topPinnedNote: WhimNote? = nil
 
     private static let remindersStorageKey = "whim.review.reminders.v2"
 
@@ -171,7 +172,21 @@ final class WhimStoreVM: ObservableObject {
 
     func reload() {
         refreshMetadata()
+        refreshTopPinnedNote()
         applyFilter()
+    }
+
+    func refreshTopPinnedNote() {
+        ioQueue.async { [weak self] in
+            let page = try? CoreBridge.shared.listNotesPage(limit: 1)
+            let firstPinned = page?.notes.first(where: { $0.pinned && !$0.deleted && !$0.archived })
+            if let note = firstPinned {
+                ThumbnailCache.shared.prefetch(notes: [note])
+            }
+            DispatchQueue.main.async { [weak self] in
+                self?.topPinnedNote = firstPinned
+            }
+        }
     }
 
     func refreshMetadata() {
@@ -3322,6 +3337,7 @@ struct FloatingQuickCaptureView: View {
 final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCenterDelegate {
     let vm = WhimStoreVM()
     var statusItem: NSStatusItem?
+    var statusPopover: NSPopover?
     var quickPanel: QuickCapturePanel?
     var mainWindow: NSWindow?
 
@@ -3397,17 +3413,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate, UNUserNotificationCent
         NSApp.mainMenu = mainMenu
     }
 
+    private func makeMenuBarSquirrelIcon() -> NSImage? {
+        if let url = Bundle.main.url(forResource: "MenuBarIcon@2x", withExtension: "png"),
+           let img = NSImage(contentsOf: url) {
+            img.size = NSSize(width: 19, height: 19)
+            img.isTemplate = true
+            return img
+        }
+        return NSImage(systemSymbolName: "sparkle", accessibilityDescription: "Whim")
+    }
+
     private func setupMenuBar() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.image = NSImage(systemSymbolName: "sparkle", accessibilityDescription: "Whim")
-        let menu = NSMenu()
-        menu.addItem(withTitle: "新建闪念 (⌘⇧J)", action: #selector(toggleQuickCapture), keyEquivalent: "")
-        menu.addItem(withTitle: "打开主窗口", action: #selector(showMainWindow), keyEquivalent: "")
-        menu.addItem(withTitle: "立即同步", action: #selector(triggerSync), keyEquivalent: "")
-        menu.addItem(.separator())
-        menu.addItem(withTitle: "退出 Whim", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        item.menu = menu
+        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        if let btn = item.button {
+            btn.image = makeMenuBarSquirrelIcon()
+            btn.imagePosition = .imageOnly
+            btn.toolTip = "Whim"
+            btn.target = self
+            btn.action = #selector(toggleStatusPopover(_:))
+        }
         statusItem = item
+    }
+
+    private func closeStatusPopover() {
+        statusPopover?.performClose(nil)
+    }
+
+    @objc func toggleStatusPopover(_ sender: Any?) {
+        guard let button = statusItem?.button else { return }
+        if let popover = statusPopover, popover.isShown {
+            popover.performClose(sender)
+            return
+        }
+        vm.refreshTopPinnedNote()
+        let popover = statusPopover ?? {
+            let p = NSPopover()
+            p.behavior = .transient
+            p.animates = true
+            statusPopover = p
+            return p
+        }()
+        let savedTheme = AppThemeMode(rawValue: UserDefaults.standard.string(forKey: "whim.themeMode") ?? "system") ?? .system
+        let rootView = StatusBarPopoverView(
+            vm: vm,
+            onNewNote: { [weak self] in
+                self?.closeStatusPopover()
+                self?.toggleQuickCapture()
+            },
+            onOpenMainWindow: { [weak self] in
+                self?.closeStatusPopover()
+                self?.showMainWindow()
+            },
+            onSelectTag: { [weak self] path in
+                guard let self else { return }
+                self.closeStatusPopover()
+                self.vm.activeTab = .tag(path)
+                self.vm.applyFilter()
+                self.showMainWindow()
+            },
+            onSyncNow: { [weak self] in
+                self?.vm.syncNow()
+            },
+            onQuit: {
+                NSApplication.shared.terminate(nil)
+            }
+        )
+        .preferredColorScheme(savedTheme.colorScheme)
+        let host = NSHostingController(rootView: rootView)
+        host.sizingOptions = .preferredContentSize
+        popover.contentViewController = host
+        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        popover.contentViewController?.view.window?.makeKey()
     }
 
     private func setupMainWindow() {

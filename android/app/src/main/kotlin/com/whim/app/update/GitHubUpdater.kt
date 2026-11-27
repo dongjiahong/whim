@@ -39,7 +39,7 @@ data class UpdateCheckResult(
 
 object GitHubUpdater {
     const val REPO = "dongjiahong/whim"
-    const val CURRENT_VERSION = "0.2.2"
+    const val CURRENT_VERSION = "0.2.3"
 
     private const val PREFS_NAME = "whim_update_prefs"
     private const val KEY_LAST_CHECK_MS = "last_auto_check_ms"

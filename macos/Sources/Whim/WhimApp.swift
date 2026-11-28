@@ -1756,6 +1756,7 @@ struct MainContentView: View {
                                     vm.applyFilter()
                                 },
                                 onTapImages: { paths, idx in lightboxState = ImageLightboxState(paths: paths, initialIndex: idx) },
+                                onOpenThread: { note in threadParentNote = note },
                                 onReshuffle: { vm.reshuffleRandom() }
                             )
                         }
@@ -2388,11 +2389,21 @@ private struct AsyncCardImage: View {
                     .resizable()
                     .frame(width: displaySize.width, height: displaySize.height)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(FlomoPalette.border(scheme), lineWidth: 0.8)
+                    )
+                    .padding(.vertical, 3)
                     .onTapGesture { onTap(path) }
             } else {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(FlomoPalette.canvas(scheme))
                     .frame(width: displaySize.width, height: displaySize.height)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 8, style: .continuous)
+                            .stroke(FlomoPalette.border(scheme), lineWidth: 0.8)
+                    )
+                    .padding(.vertical, 3)
                     .onAppear {
                         ThumbnailCache.shared.loadImage(forPath: path) { loaded in
                             if let loaded {
@@ -2410,6 +2421,7 @@ private struct CardHeaderActions: View {
     let pinned: Bool
     let archived: Bool
     let content: String
+    var onOpenThread: (() -> Void)? = nil
     let onEdit: () -> Void
     let onPin: () -> Void
     let onArchive: () -> Void
@@ -2443,6 +2455,9 @@ private struct CardHeaderActions: View {
 
             Menu {
                 Button("编辑", action: onEdit)
+                if let onOpenThread {
+                    Button("添加 / 查看追记", action: onOpenThread)
+                }
                 Button(pinned ? "取消置顶" : "置顶笔记", action: onPin)
                 Button(archived ? "取消归档" : "归档", action: onArchive)
                 Button("复制正文") {
@@ -2851,6 +2866,246 @@ private struct FlomoNoteCard: View {
 
 // MARK: - Stacked Swipeable Card Gallery (Daily Review & Random Walk)
 
+private struct DeckCardItemView: View {
+    @Environment(\.colorScheme) private var scheme
+    @ObservedObject var vm: WhimStoreVM
+    let note: WhimNote
+    let isTop: Bool
+    @Binding var editingNoteId: String?
+    let onTapTag: (String) -> Void
+    let onTapImages: ([String], Int) -> Void
+    let onOpenThread: (WhimNote) -> Void
+
+    @State private var inlineReplies: [WhimNote] = []
+    @State private var loadingReplies: Bool = false
+
+    private static let cardTimeFmt: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f
+    }()
+
+    private func formattedTime(_ ms: Int64) -> String {
+        Self.cardTimeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000.0))
+    }
+
+    private func loadRepliesIfNeeded() {
+        let count = note.replyCount ?? 0
+        guard isTop, count > 0 else {
+            if count == 0 { inlineReplies = [] }
+            return
+        }
+        loadingReplies = true
+        vm.loadReplies(parentId: note.id) { items in
+            self.inlineReplies = items
+            self.loadingReplies = false
+        }
+    }
+
+    var body: some View {
+        let replyCount = note.replyCount ?? 0
+        let hasReplies = replyCount > 0
+
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 8) {
+                Text(note.pinned ? "置顶 · \(formattedTime(note.createdAt))" : formattedTime(note.createdAt))
+                    .font(.system(size: 12.5).monospacedDigit())
+                    .foregroundColor(FlomoPalette.textSecondary(scheme))
+
+                if hasReplies {
+                    Button { onOpenThread(note) } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "text.bubble.fill")
+                                .font(.system(size: 10))
+                            Text("含 \(replyCount) 条追记")
+                                .font(.system(size: 11, weight: .semibold))
+                        }
+                        .foregroundColor(FlomoPalette.accent(scheme))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(
+                            Capsule().fill(FlomoPalette.accentSoft(scheme))
+                        )
+                        .overlay(
+                            Capsule().stroke(FlomoPalette.accent(scheme).opacity(0.35), lineWidth: 0.8)
+                        )
+                        .whimClickable(cornerRadius: 10, hoverFill: false)
+                    }
+                    .buttonStyle(WhimTactileButtonStyle(cornerRadius: 10))
+                    .disabled(!isTop)
+                }
+
+                Spacer()
+
+                if isTop {
+                    CardHeaderActions(
+                        pinned: note.pinned,
+                        archived: note.archived,
+                        content: note.content,
+                        onOpenThread: { onOpenThread(note) },
+                        onEdit: { editingNoteId = note.id },
+                        onPin: { vm.togglePin(note) },
+                        onArchive: { vm.toggleArchive(note) },
+                        onDelete: { vm.deleteNote(note) }
+                    )
+                }
+            }
+
+            Divider().opacity(0.25)
+
+            if editingNoteId == note.id && isTop {
+                FlomoComposerView(vm: vm, editingNote: note) {
+                    editingNoteId = nil
+                }
+            } else {
+                ScrollView(showsIndicators: true) {
+                    VStack(alignment: .leading, spacing: 14) {
+                        FlomoNoteCardBody(
+                            noteId: note.id,
+                            updatedAt: note.updatedAt,
+                            content: note.content,
+                            attachments: note.attachments ?? [],
+                            onTapTag: onTapTag,
+                            onTapImages: onTapImages,
+                            onToggleTask: { taskIdx in vm.toggleTaskCheckbox(note, taskIndex: taskIdx) }
+                        )
+                        .equatable()
+
+                        if hasReplies {
+                            VStack(alignment: .leading, spacing: 10) {
+                                HStack(spacing: 8) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "text.bubble.fill")
+                                            .font(.system(size: 10))
+                                        Text("追记 · \(replyCount) 条")
+                                            .font(.system(size: 11, weight: .semibold))
+                                    }
+                                    .foregroundColor(FlomoPalette.accent(scheme))
+                                    .padding(.horizontal, 8)
+                                    .padding(.vertical, 3)
+                                    .background(
+                                        Capsule().fill(FlomoPalette.accentSoft(scheme))
+                                    )
+                                    .overlay(
+                                        Capsule().stroke(FlomoPalette.accent(scheme).opacity(0.35), lineWidth: 0.8)
+                                    )
+                                    Rectangle()
+                                        .fill(FlomoPalette.accent(scheme).opacity(0.26))
+                                        .frame(height: 1)
+                                }
+                                .padding(.top, 4)
+
+                                if loadingReplies && inlineReplies.isEmpty {
+                                    HStack(spacing: 6) {
+                                        ProgressView().controlSize(.small)
+                                        Text("正在加载追记...")
+                                            .font(.system(size: 11.5))
+                                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                                    }
+                                    .padding(.vertical, 4)
+                                } else {
+                                    VStack(alignment: .leading, spacing: 8) {
+                                        ForEach(Array(inlineReplies.enumerated()), id: \.element.id) { idx, reply in
+                                            HStack(alignment: .top, spacing: 10) {
+                                                RoundedRectangle(cornerRadius: 1.5, style: .continuous)
+                                                    .fill(FlomoPalette.accent(scheme).opacity(0.75))
+                                                    .frame(width: 3)
+                                                VStack(alignment: .leading, spacing: 6) {
+                                                    HStack(spacing: 6) {
+                                                        Text("追记 #\(idx + 1)")
+                                                            .font(.system(size: 10.5, weight: .semibold))
+                                                            .foregroundColor(FlomoPalette.accent(scheme))
+                                                            .padding(.horizontal, 6)
+                                                            .padding(.vertical, 1.5)
+                                                            .background(
+                                                                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                                                                    .fill(FlomoPalette.accentSoft(scheme))
+                                                            )
+                                                        Text(formattedTime(reply.createdAt))
+                                                            .font(.system(size: 11).monospacedDigit())
+                                                            .foregroundColor(FlomoPalette.textMuted(scheme))
+                                                        Spacer()
+                                                    }
+                                                    FlomoNoteCardBody(
+                                                        noteId: reply.id,
+                                                        updatedAt: reply.updatedAt,
+                                                        content: reply.content,
+                                                        attachments: reply.attachments ?? [],
+                                                        onTapTag: onTapTag,
+                                                        onTapImages: onTapImages
+                                                    )
+                                                    .equatable()
+                                                }
+                                                .padding(11)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+                                                .background(
+                                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                                        .fill(FlomoPalette.canvas(scheme).opacity(0.65))
+                                                )
+                                                .overlay(
+                                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                                        .stroke(FlomoPalette.accent(scheme).opacity(0.22), lineWidth: 0.7)
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    .padding(.trailing, 4)
+                }
+
+                if isTop {
+                    Divider().opacity(0.25)
+                    HStack(spacing: 10) {
+                        if hasReplies {
+                            Text("共 \(replyCount) 条追记 · 向下滚动查看")
+                                .font(.system(size: 11.5))
+                                .foregroundColor(FlomoPalette.textMuted(scheme))
+                        }
+                        Spacer()
+                        Button { onOpenThread(note) } label: {
+                            HStack(spacing: 4) {
+                                Image(systemName: hasReplies ? "text.bubble.fill" : "text.bubble")
+                                    .font(.system(size: 11))
+                                Text(hasReplies ? "写追记 (\(replyCount))" : "添加追记")
+                                    .font(.system(size: 11.5, weight: .medium))
+                            }
+                            .foregroundColor(hasReplies ? FlomoPalette.accent(scheme) : FlomoPalette.textSecondary(scheme))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 4.5)
+                            .background(
+                                Capsule().fill(hasReplies ? FlomoPalette.accentSoft(scheme) : FlomoPalette.canvas(scheme))
+                            )
+                            .overlay(
+                                Capsule().stroke(hasReplies ? FlomoPalette.accent(scheme).opacity(0.32) : FlomoPalette.border(scheme), lineWidth: 0.8)
+                            )
+                            .whimClickable(cornerRadius: 12, hoverFill: !hasReplies)
+                        }
+                        .buttonStyle(WhimTactileButtonStyle(cornerRadius: 12))
+                    }
+                }
+            }
+        }
+        .padding(20)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(FlomoPalette.card(scheme))
+                .shadow(color: Color.black.opacity(scheme == .dark ? 0.35 : 0.08), radius: 14, y: 6)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(FlomoPalette.border(scheme), lineWidth: 0.8)
+        )
+        .onAppear { loadRepliesIfNeeded() }
+        .onChange(of: isTop) { _, top in if top { loadRepliesIfNeeded() } }
+        .onChange(of: vm.repliesVersion) { _, _ in loadRepliesIfNeeded() }
+        .onChange(of: note.replyCount) { _, _ in loadRepliesIfNeeded() }
+    }
+}
+
 private struct FlomoCardDeckView: View {
     @Environment(\.colorScheme) private var scheme
     @ObservedObject var vm: WhimStoreVM
@@ -2861,17 +3116,12 @@ private struct FlomoCardDeckView: View {
     let searchFocused: Bool
     let onTapTag: (String) -> Void
     let onTapImages: ([String], Int) -> Void
+    let onOpenThread: (WhimNote) -> Void
     let onReshuffle: () -> Void
 
     @State private var currentIndex: Int = 0
     @State private var dragOffset: CGSize = .zero
     @State private var isAnimatingOut: Bool = false
-
-    private static let cardTimeFmt: DateFormatter = {
-        let f = DateFormatter()
-        f.dateFormat = "yyyy-MM-dd HH:mm"
-        return f
-    }()
 
     private var shortcutsEnabled: Bool {
         editingNoteId == nil && !searchFocused
@@ -2938,32 +3188,41 @@ private struct FlomoCardDeckView: View {
                         let yOffset: CGFloat = isTop ? 0 : (CGFloat(depth) * 16.0 - CGFloat(dragProgress) * 16.0)
                         let opacity: Double = isTop ? 1.0 : max(0.45, 1.0 - Double(depth) * 0.22 + dragProgress * 0.22)
 
-                        deckCard(note: note, isTop: isTop)
-                            .scaleEffect(scale)
-                            .offset(x: isTop ? dragOffset.width : 0, y: yOffset)
-                            .rotationEffect(.degrees(isTop ? Double(dragOffset.width / 28.0) : 0))
-                            .opacity(opacity)
-                            .zIndex(Double(notes.count - idx))
-                            .allowsHitTesting(isTop)
-                            .gesture(
-                                isTop && editingNoteId != note.id ?
-                                DragGesture(minimumDistance: 16)
-                                    .onChanged { val in
-                                        if abs(val.translation.width) > abs(val.translation.height) * 1.1 {
-                                            dragOffset = CGSize(width: val.translation.width, height: 0)
+                        DeckCardItemView(
+                            vm: vm,
+                            note: note,
+                            isTop: isTop,
+                            editingNoteId: $editingNoteId,
+                            onTapTag: onTapTag,
+                            onTapImages: onTapImages,
+                            onOpenThread: onOpenThread
+                        )
+                        .id(note.id)
+                        .scaleEffect(scale)
+                        .offset(x: isTop ? dragOffset.width : 0, y: yOffset)
+                        .rotationEffect(.degrees(isTop ? Double(dragOffset.width / 28.0) : 0))
+                        .opacity(opacity)
+                        .zIndex(Double(notes.count - idx))
+                        .allowsHitTesting(isTop)
+                        .gesture(
+                            isTop && editingNoteId != note.id ?
+                            DragGesture(minimumDistance: 16)
+                                .onChanged { val in
+                                    if abs(val.translation.width) > abs(val.translation.height) * 1.1 {
+                                        dragOffset = CGSize(width: val.translation.width, height: 0)
+                                    }
+                                }
+                                .onEnded { val in
+                                    if abs(val.translation.width) > 95 && abs(val.translation.width) > abs(val.translation.height) {
+                                        swipeOut(direction: val.translation.width >= 0 ? 1 : -1)
+                                    } else {
+                                        withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
+                                            dragOffset = .zero
                                         }
                                     }
-                                    .onEnded { val in
-                                        if abs(val.translation.width) > 95 && abs(val.translation.width) > abs(val.translation.height) {
-                                            swipeOut(direction: val.translation.width >= 0 ? 1 : -1)
-                                        } else {
-                                            withAnimation(.spring(response: 0.28, dampingFraction: 0.82)) {
-                                                dragOffset = .zero
-                                            }
-                                        }
-                                    }
-                                : nil
-                            )
+                                }
+                            : nil
+                        )
                     }
                 }
                 .frame(maxWidth: 660, maxHeight: .infinity)
@@ -3016,10 +3275,6 @@ private struct FlomoCardDeckView: View {
         )
     }
 
-    private func formattedTime(_ ms: Int64) -> String {
-        Self.cardTimeFmt.string(from: Date(timeIntervalSince1970: TimeInterval(ms) / 1000.0))
-    }
-
     private func goPrev() {
         guard currentIndex > 0, !isAnimatingOut else { return }
         withAnimation(.spring(response: 0.3, dampingFraction: 0.85)) {
@@ -3039,64 +3294,6 @@ private struct FlomoCardDeckView: View {
             dragOffset = .zero
             isAnimatingOut = false
         }
-    }
-
-    @ViewBuilder
-    private func deckCard(note: WhimNote, isTop: Bool) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 8) {
-                Text(note.pinned ? "置顶 · \(formattedTime(note.createdAt))" : formattedTime(note.createdAt))
-                    .font(.system(size: 12.5).monospacedDigit())
-                    .foregroundColor(FlomoPalette.textSecondary(scheme))
-
-                Spacer()
-
-                if isTop {
-                    CardHeaderActions(
-                        pinned: note.pinned,
-                        archived: note.archived,
-                        content: note.content,
-                        onEdit: { editingNoteId = note.id },
-                        onPin: { vm.togglePin(note) },
-                        onArchive: { vm.toggleArchive(note) },
-                        onDelete: { vm.deleteNote(note) }
-                    )
-                }
-            }
-
-            Divider().opacity(0.25)
-
-            if editingNoteId == note.id && isTop {
-                FlomoComposerView(vm: vm, editingNote: note) {
-                    editingNoteId = nil
-                }
-            } else {
-                ScrollView(showsIndicators: true) {
-                    FlomoNoteCardBody(
-                        noteId: note.id,
-                        updatedAt: note.updatedAt,
-                        content: note.content,
-                        attachments: note.attachments ?? [],
-                        onTapTag: onTapTag,
-                        onTapImages: onTapImages,
-                        onToggleTask: { taskIdx in vm.toggleTaskCheckbox(note, taskIndex: taskIdx) }
-                    )
-                    .equatable()
-                    .padding(.trailing, 4)
-                }
-            }
-        }
-        .padding(20)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .background(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .fill(FlomoPalette.card(scheme))
-                .shadow(color: Color.black.opacity(scheme == .dark ? 0.35 : 0.08), radius: 14, y: 6)
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 14, style: .continuous)
-                .stroke(FlomoPalette.border(scheme), lineWidth: 0.8)
-        )
     }
 }
 

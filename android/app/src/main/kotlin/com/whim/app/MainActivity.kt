@@ -44,6 +44,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -95,6 +96,7 @@ import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -1275,7 +1277,9 @@ private fun FlomoMobileApp(
                         isRandomMode = activeTab == MobileTab.Random,
                         resetKey = "$activeTab|$reviewOffsetDays|$randomSeed|${displayedNotes.firstOrNull()?.id.orEmpty()}|${displayedNotes.size}",
                         highlightQuery = searchQuery,
+                        repliesVersion = repliesVersion,
                         onTapImage = { paths, idx -> lightboxImages = paths to idx },
+                        onOpenThread = { note -> threadNote = note },
                         onEdit = { note -> onEditNote(note) },
                         onTogglePin = { note ->
                             scope.launch {
@@ -2486,12 +2490,500 @@ private fun FlomoMobileNoteCard(
 }
 
 @Composable
+private fun MobileDeckFramedImage(
+    path: String,
+    allImagePaths: List<String>,
+    contentDescription: String,
+    maxHeightDp: Int = 280,
+    onTapImage: (List<String>, Int) -> Unit
+) {
+    val c = WhimTheme.colors
+    val context = LocalContext.current
+    val ratio = remember(path) { MobileImageBoundsCache.aspectRatio(path) }
+    val req = remember(path) {
+        ImageRequest.Builder(context)
+            .data(File(path))
+            .size(960, 960)
+            .precision(Precision.INEXACT)
+            .crossfade(160)
+            .build()
+    }
+    val imgIdx = remember(path, allImagePaths) { allImagePaths.indexOf(path).coerceAtLeast(0) }
+    val totalImages = allImagePaths.size
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(vertical = 2.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .background(c.canvas)
+            .border(1.dp, c.textMuted.copy(alpha = 0.26f), RoundedCornerShape(10.dp))
+            .clickable { onTapImage(allImagePaths, imgIdx) }
+    ) {
+        AsyncImage(
+            model = req,
+            contentDescription = contentDescription,
+            contentScale = ContentScale.Fit,
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = maxHeightDp.dp)
+                .aspectRatio(ratio)
+        )
+        if (totalImages > 1) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(8.dp)
+                    .clip(CircleShape)
+                    .background(Color.Black.copy(alpha = 0.58f))
+                    .padding(horizontal = 8.dp, vertical = 2.5.dp)
+            ) {
+                Text(
+                    text = "${imgIdx + 1} / $totalImages",
+                    fontSize = 10.5.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = Color.White
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MobileDeckCard(
+    note: WhimNote,
+    isTop: Boolean,
+    scale: Float,
+    offsetYDp: androidx.compose.ui.unit.Dp,
+    cardAlpha: Float,
+    dragXValue: Float,
+    highlightQuery: String,
+    repliesVersion: Int,
+    onTapImage: (List<String>, Int) -> Unit,
+    onOpenThread: (WhimNote) -> Unit,
+    onEdit: (WhimNote) -> Unit,
+    onTogglePin: (WhimNote) -> Unit,
+    onToggleArchive: (WhimNote) -> Unit,
+    onCopy: (WhimNote) -> Unit,
+    onDelete: (WhimNote) -> Unit,
+    dragModifier: Modifier
+) {
+    val c = WhimTheme.colors
+    val t = WhimTheme.typography
+    val context = LocalContext.current
+    val density = LocalDensity.current
+    val parsed = remember(note.id, note.updatedAt, c.textPrimary, highlightQuery, note.attachments.size) {
+        MobileCardParseCache.getOrParse(
+            note = note,
+            primary = c.textPrimary,
+            secondary = c.textSecondary,
+            muted = c.textMuted,
+            accent = c.accent,
+            codeBg = c.tagBg,
+            codeFg = c.tagText,
+            highlightQuery = highlightQuery
+        )
+    }
+    var menuExpanded by remember(note.id) { mutableStateOf(false) }
+    var inlineReplies by remember(note.id) { mutableStateOf<List<WhimNote>>(emptyList()) }
+    var loadingReplies by remember(note.id) { mutableStateOf(false) }
+    val hasReplies = note.replyCount > 0
+
+    LaunchedEffect(isTop, note.id, note.replyCount, repliesVersion) {
+        if (isTop && note.replyCount > 0) {
+            loadingReplies = true
+            inlineReplies = runCatching { WhimCoreBridge.listReplies(note.id) }.getOrDefault(emptyList())
+            loadingReplies = false
+        } else if (note.replyCount == 0) {
+            inlineReplies = emptyList()
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                translationX = if (isTop) dragXValue else 0f
+                translationY = with(density) { offsetYDp.toPx() }
+                rotationZ = if (isTop) (dragXValue / 34f).coerceIn(-12f, 12f) else 0f
+                alpha = cardAlpha
+            }
+            .clip(RoundedCornerShape(14.dp))
+            .background(c.card)
+            .border(0.8.dp, c.border, RoundedCornerShape(14.dp))
+            .then(dragModifier)
+            .padding(16.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Row(
+                modifier = Modifier.weight(1f),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = if (note.pinned) "置顶 · ${parsed.timeStr}" else parsed.timeStr,
+                    style = t.meta,
+                    color = c.textSecondary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (hasReplies) {
+                    Row(
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(c.accent.copy(alpha = 0.16f))
+                            .border(0.8.dp, c.accent.copy(alpha = 0.35f), CircleShape)
+                            .clickable(enabled = isTop) { onOpenThread(note) }
+                            .padding(horizontal = 8.dp, vertical = 2.5.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            Icons.Rounded.ChatBubbleOutline,
+                            contentDescription = null,
+                            tint = c.accent,
+                            modifier = Modifier.size(11.dp)
+                        )
+                        Text(
+                            text = "含 ${note.replyCount} 条追记",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = c.accent,
+                            maxLines = 1
+                        )
+                    }
+                }
+            }
+            if (isTop) {
+                Box {
+                    Icon(
+                        Icons.Rounded.MoreHoriz,
+                        contentDescription = "更多",
+                        tint = c.textMuted,
+                        modifier = Modifier
+                            .size(20.dp)
+                            .clickable { menuExpanded = true }
+                    )
+                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
+                        DropdownMenuItem(text = { Text("编辑") }, onClick = { menuExpanded = false; onEdit(note) })
+                        DropdownMenuItem(
+                            text = { Text(if (hasReplies) "追记 (${note.replyCount})" else "添加追记") },
+                            onClick = { menuExpanded = false; onOpenThread(note) }
+                        )
+                        DropdownMenuItem(text = { Text(if (note.pinned) "取消置顶" else "置顶") }, onClick = { menuExpanded = false; onTogglePin(note) })
+                        DropdownMenuItem(text = { Text(if (note.archived) "取消归档" else "归档") }, onClick = { menuExpanded = false; onToggleArchive(note) })
+                        DropdownMenuItem(text = { Text("复制内容") }, onClick = { menuExpanded = false; onCopy(note) })
+                        DropdownMenuItem(text = { Text("删除") }, onClick = { menuExpanded = false; onDelete(note) })
+                    }
+                }
+            }
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(0.8.dp)
+                .background(c.border)
+        )
+
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f)
+                .verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            parsed.blocks.forEach { block ->
+                when (block) {
+                    is MobileCardBlock.TextBlock -> MobileMarkdownChunksView(chunks = block.chunks)
+                    is MobileCardBlock.ImageBlock -> {
+                        MobileDeckFramedImage(
+                            path = block.path,
+                            allImagePaths = parsed.allImagePaths,
+                            contentDescription = "内联图片",
+                            maxHeightDp = 280,
+                            onTapImage = onTapImage
+                        )
+                    }
+                }
+            }
+
+            if (parsed.trailing.isNotEmpty()) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 2.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text(
+                            text = "附图 · ${parsed.trailing.size} 张",
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = c.textMuted
+                        )
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(0.8.dp)
+                                .background(c.border)
+                        )
+                    }
+                    LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        items(parsed.trailing, key = { it.sha256 }) { att ->
+                            val req = remember(att.localPath) {
+                                ImageRequest.Builder(context)
+                                    .data(File(att.localPath))
+                                    .size(320, 320)
+                                    .precision(Precision.INEXACT)
+                                    .crossfade(160)
+                                    .build()
+                            }
+                            AsyncImage(
+                                model = req,
+                                contentDescription = "图片附件",
+                                contentScale = ContentScale.Crop,
+                                modifier = Modifier
+                                    .size(104.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(c.canvas)
+                                    .border(1.dp, c.textMuted.copy(alpha = 0.26f), RoundedCornerShape(10.dp))
+                                    .clickable {
+                                        val imgIdx = parsed.allImagePaths.indexOf(att.localPath).coerceAtLeast(0)
+                                        onTapImage(parsed.allImagePaths, imgIdx)
+                                    }
+                            )
+                        }
+                    }
+                }
+            }
+
+            // Inline replies section clearly separated below the main note body
+            if (hasReplies) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(top = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .clip(CircleShape)
+                                .background(c.accent.copy(alpha = 0.18f))
+                                .border(0.8.dp, c.accent.copy(alpha = 0.35f), CircleShape)
+                                .padding(horizontal = 9.dp, vertical = 3.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            Icon(
+                                Icons.Rounded.ChatBubbleOutline,
+                                contentDescription = null,
+                                tint = c.accent,
+                                modifier = Modifier.size(11.dp)
+                            )
+                            Text(
+                                text = "追记 · ${note.replyCount} 条",
+                                fontSize = 11.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = c.accent
+                            )
+                        }
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(1.dp)
+                                .background(c.accent.copy(alpha = 0.25f))
+                        )
+                    }
+
+                    if (loadingReplies && inlineReplies.isEmpty()) {
+                        Text("正在加载追记...", style = t.meta, color = c.textMuted)
+                    } else {
+                        inlineReplies.forEachIndexed { idx, reply ->
+                            val replyParsed = remember(reply.id, reply.updatedAt, c.textPrimary, highlightQuery, reply.attachments.size) {
+                                MobileCardParseCache.getOrParse(
+                                    note = reply,
+                                    primary = c.textPrimary,
+                                    secondary = c.textSecondary,
+                                    muted = c.textMuted,
+                                    accent = c.accent,
+                                    codeBg = c.tagBg,
+                                    codeFg = c.tagText,
+                                    highlightQuery = highlightQuery
+                                )
+                            }
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(IntrinsicSize.Min)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(c.canvas.copy(alpha = 0.78f))
+                                    .border(0.8.dp, c.accent.copy(alpha = 0.24f), RoundedCornerShape(10.dp))
+                                    .padding(horizontal = 11.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.spacedBy(9.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .width(3.dp)
+                                        .fillMaxHeight()
+                                        .clip(RoundedCornerShape(2.dp))
+                                        .background(c.accent.copy(alpha = 0.78f))
+                                )
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                                    ) {
+                                        Box(
+                                            modifier = Modifier
+                                                .clip(RoundedCornerShape(4.dp))
+                                                .background(c.accent.copy(alpha = 0.16f))
+                                                .padding(horizontal = 6.dp, vertical = 1.5.dp)
+                                        ) {
+                                            Text(
+                                                text = "追记 #${idx + 1}",
+                                                fontSize = 10.5.sp,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = c.accent
+                                            )
+                                        }
+                                        Text(
+                                            text = replyParsed.timeStr,
+                                            style = t.meta,
+                                            color = c.textMuted
+                                        )
+                                    }
+                                    replyParsed.blocks.forEach { block ->
+                                        when (block) {
+                                            is MobileCardBlock.TextBlock -> MobileMarkdownChunksView(chunks = block.chunks)
+                                            is MobileCardBlock.ImageBlock -> {
+                                                MobileDeckFramedImage(
+                                                    path = block.path,
+                                                    allImagePaths = replyParsed.allImagePaths,
+                                                    contentDescription = "追记图片",
+                                                    maxHeightDp = 240,
+                                                    onTapImage = onTapImage
+                                                )
+                                            }
+                                        }
+                                    }
+                                    if (replyParsed.trailing.isNotEmpty()) {
+                                        LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                            items(replyParsed.trailing, key = { it.sha256 }) { att ->
+                                                val req = remember(att.localPath) {
+                                                    ImageRequest.Builder(context)
+                                                        .data(File(att.localPath))
+                                                        .size(320, 320)
+                                                        .precision(Precision.INEXACT)
+                                                        .crossfade(160)
+                                                        .build()
+                                                }
+                                                AsyncImage(
+                                                    model = req,
+                                                    contentDescription = "追记图片附件",
+                                                    contentScale = ContentScale.Crop,
+                                                    modifier = Modifier
+                                                        .size(88.dp)
+                                                        .clip(RoundedCornerShape(8.dp))
+                                                        .background(c.card)
+                                                        .border(1.dp, c.textMuted.copy(alpha = 0.24f), RoundedCornerShape(8.dp))
+                                                        .clickable {
+                                                            val imgIdx = replyParsed.allImagePaths.indexOf(att.localPath).coerceAtLeast(0)
+                                                            onTapImage(replyParsed.allImagePaths, imgIdx)
+                                                        }
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if (isTop) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(0.8.dp)
+                    .background(c.border)
+            )
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                if (hasReplies) {
+                    Text(
+                        text = "共 ${note.replyCount} 条追记 · 向下滑动查看",
+                        fontSize = 11.5.sp,
+                        color = c.textMuted
+                    )
+                } else {
+                    Spacer(Modifier.width(1.dp))
+                }
+                Row(
+                    modifier = Modifier
+                        .clip(CircleShape)
+                        .background(if (hasReplies) c.accent.copy(alpha = 0.14f) else c.canvas)
+                        .border(
+                            0.8.dp,
+                            if (hasReplies) c.accent.copy(alpha = 0.32f) else c.border,
+                            CircleShape
+                        )
+                        .clickable { onOpenThread(note) }
+                        .padding(horizontal = 10.dp, vertical = 4.5.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Icon(
+                        Icons.Rounded.ChatBubbleOutline,
+                        contentDescription = "追记",
+                        tint = if (hasReplies) c.accent else c.textSecondary,
+                        modifier = Modifier.size(12.dp)
+                    )
+                    Text(
+                        text = if (hasReplies) "写追记 (${note.replyCount})" else "添加追记",
+                        style = t.meta,
+                        color = if (hasReplies) c.accent else c.textSecondary,
+                        fontWeight = FontWeight.Medium
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun MobileCardDeck(
     notes: List<WhimNote>,
     isRandomMode: Boolean,
     resetKey: String,
     highlightQuery: String = "",
+    repliesVersion: Int = 0,
     onTapImage: (List<String>, Int) -> Unit,
+    onOpenThread: (WhimNote) -> Unit,
     onEdit: (WhimNote) -> Unit,
     onTogglePin: (WhimNote) -> Unit,
     onToggleArchive: (WhimNote) -> Unit,
@@ -2502,7 +2994,6 @@ private fun MobileCardDeck(
 ) {
     val c = WhimTheme.colors
     val t = WhimTheme.typography
-    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
     val swipeThresholdPx = with(density) { 96.dp.toPx() }
@@ -2612,159 +3103,49 @@ private fun MobileCardDeck(
                     val scale = if (isTop) 1f else (1f - depth * 0.045f + dragProgress * 0.045f)
                     val offsetYDp = if (isTop) 0.dp else ((depth * 14f - dragProgress * 14f).dp)
                     val cardAlpha = if (isTop) 1f else (1f - depth * 0.22f + dragProgress * 0.22f).coerceIn(0.45f, 1f)
-                    val parsed = remember(note.id, note.updatedAt, c.textPrimary, highlightQuery) {
-                        MobileCardParseCache.getOrParse(
-                            note = note,
-                            primary = c.textPrimary,
-                            secondary = c.textSecondary,
-                            muted = c.textMuted,
-                            accent = c.accent,
-                            codeBg = c.tagBg,
-                            codeFg = c.tagText,
-                            highlightQuery = highlightQuery
-                        )
+                    val dragMod = if (isTop) {
+                        Modifier.pointerInput(note.id, currentIndex) {
+                            detectHorizontalDragGestures(
+                                onHorizontalDrag = { _, dragAmount ->
+                                    if (!isAnimatingOut) {
+                                        scope.launch { dragX.snapTo(dragX.value + dragAmount) }
+                                    }
+                                },
+                                onDragEnd = {
+                                    if (abs(dragX.value) > swipeThresholdPx) {
+                                        swipeNext(if (dragX.value >= 0f) 1f else -1f)
+                                    } else {
+                                        scope.launch { dragX.animateTo(0f, tween(180)) }
+                                    }
+                                },
+                                onDragCancel = {
+                                    scope.launch { dragX.animateTo(0f, tween(180)) }
+                                }
+                            )
+                        }
+                    } else {
+                        Modifier
                     }
-                    var menuExpanded by remember(note.id) { mutableStateOf(false) }
 
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .graphicsLayer {
-                                scaleX = scale
-                                scaleY = scale
-                                translationX = if (isTop) dragX.value else 0f
-                                translationY = with(density) { offsetYDp.toPx() }
-                                rotationZ = if (isTop) (dragX.value / 34f).coerceIn(-12f, 12f) else 0f
-                                alpha = cardAlpha
-                            }
-                            .clip(RoundedCornerShape(14.dp))
-                            .background(c.card)
-                            .border(0.8.dp, c.border, RoundedCornerShape(14.dp))
-                            .then(
-                                if (isTop) {
-                                    Modifier.pointerInput(note.id, currentIndex) {
-                                        detectHorizontalDragGestures(
-                                            onHorizontalDrag = { _, dragAmount ->
-                                                if (!isAnimatingOut) {
-                                                    scope.launch { dragX.snapTo(dragX.value + dragAmount) }
-                                                }
-                                            },
-                                            onDragEnd = {
-                                                if (abs(dragX.value) > swipeThresholdPx) {
-                                                    swipeNext(if (dragX.value >= 0f) 1f else -1f)
-                                                } else {
-                                                    scope.launch { dragX.animateTo(0f, tween(180)) }
-                                                }
-                                            },
-                                            onDragCancel = {
-                                                scope.launch { dragX.animateTo(0f, tween(180)) }
-                                            }
-                                        )
-                                    }
-                                } else {
-                                    Modifier
-                                }
-                            )
-                            .padding(16.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceBetween,
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = if (note.pinned) "置顶 · ${parsed.timeStr}" else parsed.timeStr,
-                                style = t.meta,
-                                color = c.textSecondary
-                            )
-                            if (isTop) {
-                                Box {
-                                    Icon(
-                                        Icons.Rounded.MoreHoriz,
-                                        contentDescription = "更多",
-                                        tint = c.textMuted,
-                                        modifier = Modifier
-                                            .size(20.dp)
-                                            .clickable { menuExpanded = true }
-                                    )
-                                    DropdownMenu(expanded = menuExpanded, onDismissRequest = { menuExpanded = false }) {
-                                        DropdownMenuItem(text = { Text("编辑") }, onClick = { menuExpanded = false; onEdit(note) })
-                                        DropdownMenuItem(text = { Text(if (note.pinned) "取消置顶" else "置顶") }, onClick = { menuExpanded = false; onTogglePin(note) })
-                                        DropdownMenuItem(text = { Text(if (note.archived) "取消归档" else "归档") }, onClick = { menuExpanded = false; onToggleArchive(note) })
-                                        DropdownMenuItem(text = { Text("复制内容") }, onClick = { menuExpanded = false; onCopy(note) })
-                                        DropdownMenuItem(text = { Text("删除") }, onClick = { menuExpanded = false; onDelete(note) })
-                                    }
-                                }
-                            }
-                        }
-
-                        Column(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .weight(1f)
-                                .verticalScroll(rememberScrollState()),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            parsed.blocks.forEach { block ->
-                                when (block) {
-                                    is MobileCardBlock.TextBlock -> MobileMarkdownChunksView(chunks = block.chunks)
-                                    is MobileCardBlock.ImageBlock -> {
-                                        val ratio = remember(block.path) { MobileImageBoundsCache.aspectRatio(block.path) }
-                                        val req = remember(block.path) {
-                                            ImageRequest.Builder(context)
-                                                .data(File(block.path))
-                                                .size(960, 960)
-                                                .precision(Precision.INEXACT)
-                                                .crossfade(160)
-                                                .build()
-                                        }
-                                        AsyncImage(
-                                            model = req,
-                                            contentDescription = "内联图片",
-                                            contentScale = ContentScale.Fit,
-                                            modifier = Modifier
-                                                .fillMaxWidth()
-                                                .heightIn(max = 280.dp)
-                                                .aspectRatio(ratio)
-                                                .clip(RoundedCornerShape(8.dp))
-                                                .background(c.canvas)
-                                                .clickable {
-                                                    val idx = parsed.allImagePaths.indexOf(block.path).coerceAtLeast(0)
-                                                    onTapImage(parsed.allImagePaths, idx)
-                                                }
-                                        )
-                                    }
-                                }
-                            }
-                            if (parsed.trailing.isNotEmpty()) {
-                                LazyRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    items(parsed.trailing, key = { it.sha256 }) { att ->
-                                        val req = remember(att.localPath) {
-                                            ImageRequest.Builder(context)
-                                                .data(File(att.localPath))
-                                                .size(320, 320)
-                                                .precision(Precision.INEXACT)
-                                                .crossfade(160)
-                                                .build()
-                                        }
-                                        AsyncImage(
-                                            model = req,
-                                            contentDescription = "图片附件",
-                                            contentScale = ContentScale.Crop,
-                                            modifier = Modifier
-                                                .size(104.dp)
-                                                .clip(RoundedCornerShape(8.dp))
-                                                .background(c.canvas)
-                                                .clickable {
-                                                    val idx = parsed.allImagePaths.indexOf(att.localPath).coerceAtLeast(0)
-                                                    onTapImage(parsed.allImagePaths, idx)
-                                                }
-                                        )
-                                    }
-                                }
-                            }
-                        }
+                    key(note.id) {
+                        MobileDeckCard(
+                            note = note,
+                            isTop = isTop,
+                            scale = scale,
+                            offsetYDp = offsetYDp,
+                            cardAlpha = cardAlpha,
+                            dragXValue = dragX.value,
+                            highlightQuery = highlightQuery,
+                            repliesVersion = repliesVersion,
+                            onTapImage = onTapImage,
+                            onOpenThread = onOpenThread,
+                            onEdit = onEdit,
+                            onTogglePin = onTogglePin,
+                            onToggleArchive = onToggleArchive,
+                            onCopy = onCopy,
+                            onDelete = onDelete,
+                            dragModifier = dragMod
+                        )
                     }
                 }
             }
